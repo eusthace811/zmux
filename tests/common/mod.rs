@@ -22,10 +22,30 @@ pub fn text_of(f: &Frame) -> String {
 pub struct Daemon {
     child: std::process::Child,
     pub session: String,
+    /// When false, saved layout is cleared on start and drop so tests do not
+    /// inherit each other's state. Restart tests set it true deliberately.
+    preserve_state: bool,
 }
 
 impl Daemon {
+    /// Start with a clean slate: any saved layout for this name is discarded.
+    ///
+    /// Persistence is real, so a layout saved by an EARLIER RUN would be
+    /// restored and the test would start from someone else's state. Not
+    /// hypothetical: it turned every split test red once the saved layouts had
+    /// grown to several panes.
     pub fn start(session: &str) -> Self {
+        zmux::persist::remove(session);
+        Self::spawn(session, false)
+    }
+
+    /// Start WITHOUT clearing saved state, for tests that assert persistence
+    /// across a restart.
+    pub fn start_preserving_state(session: &str) -> Self {
+        Self::spawn(session, true)
+    }
+
+    fn spawn(session: &str, preserve_state: bool) -> Self {
         // A leftover daemon from a previous run would silently serve the test.
         if ipc::is_running(session) {
             if let Ok(mut s) = ipc::connect(session) {
@@ -48,7 +68,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(ipc::is_running(session), "daemon never started listening");
-        Self { child, session: session.into() }
+        Self { child, session: session.into(), preserve_state }
     }
 
     pub fn attach(&self, cols: u16, rows: u16) -> Client {
@@ -65,6 +85,8 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        let session = self.session.clone();
+        let preserve = self.preserve_state;
         // Ask nicely first so ConPTYs are torn down; killing orphans the shells.
         if ipc::is_running(&self.session) {
             if let Ok(mut s) = ipc::connect(&self.session) {
@@ -74,13 +96,21 @@ impl Drop for Daemon {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => {
+                    if !preserve {
+                        zmux::persist::remove(&session);
+                    }
+                    return;
+                }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 Err(_) => break,
             }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if !preserve {
+            zmux::persist::remove(&session);
+        }
     }
 }
 

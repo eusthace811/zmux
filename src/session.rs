@@ -68,6 +68,14 @@ pub struct Session {
 fn restore_layout(name: &str) -> Option<(Layout, HashMap<u32, String>)> {
     let snap = persist::load(name)?;
     let layout = Layout::from_saved(snap.root, snap.focus);
+    // A corrupt or absurd saved layout must not spawn a shell per leaf.
+    if layout.panes().len() > MAX_PANES {
+        eprintln!(
+            "[session] saved layout has {} panes (max {MAX_PANES}); starting fresh",
+            layout.panes().len()
+        );
+        return None;
+    }
     Some((layout, snap.cwds))
 }
 

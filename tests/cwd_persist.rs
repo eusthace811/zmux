@@ -107,7 +107,7 @@ fn layout_and_directories_survive_a_daemon_restart() {
     zmux::persist::remove(name);
 
     {
-        let d = Daemon::start(name);
+        let d = Daemon::start_preserving_state(name);
         let mut c = d.attach_ready(120, 30);
         c.input("cd /c/Windows\r");
         assert!(c.wait_for(20, |t| t.contains("Windows")).is_some());
@@ -119,8 +119,8 @@ fn layout_and_directories_survive_a_daemon_restart() {
     }
     std::thread::sleep(std::time::Duration::from_millis(600));
 
-    // Fresh daemon, same session name.
-    let d2 = Daemon::start(name);
+    // Fresh daemon, same session name, saved state intentionally intact.
+    let d2 = Daemon::start_preserving_state(name);
     let mut c2 = d2.attach_ready(120, 30);
     let screen = c2
         .wait_for(20, |t| t.contains("2 panes"))

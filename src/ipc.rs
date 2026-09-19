@@ -109,12 +109,26 @@ pub fn list_sessions() -> Vec<String> {
     out
 }
 
+/// Restrict the pipe to SYSTEM and the creating user.
+///
+/// `D:P(A;;GA;;;SY)(A;;GA;;;OW)` - a protected DACL (P, so it does not inherit
+/// anything permissive) granting all access to SYSTEM and to the object's
+/// OWNER, which is whoever created it. Same descriptor herdr uses
+/// (`ipc.rs:149`). The pipe carries keystrokes, so the default is not good
+/// enough on a shared or managed machine.
+const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;OW)";
+
 pub fn listen(session: &str) -> Result<interprocess::local_socket::Listener> {
+    use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::U16CString;
+
     let name = pipe_name(session);
     let ns = name.as_str().to_ns_name::<GenericNamespaced>()?;
-    // NOTE (DESIGN.md §3): herdr additionally applies an SDDL of
-    // D:P(A;;GA;;;SY)(A;;GA;;;OW) - SYSTEM + OBJECT OWNER. Windows named pipes
-    // already default to the creating user's token; tightening this explicitly
-    // is a Phase 2 task, tracked so it is not forgotten.
-    Ok(ListenerOptions::new().name(ns).create_sync()?)
+
+    let sddl = U16CString::from_str(PIPE_SDDL)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let sd = SecurityDescriptor::deserialize(&sddl).context("build pipe security descriptor")?;
+
+    Ok(ListenerOptions::new().name(ns).security_descriptor(sd).create_sync()?)
 }
