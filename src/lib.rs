@@ -6,4 +6,5 @@ pub mod ipc;
 pub mod protocol;
 pub mod pty;
 pub mod render;
+pub mod session;
 pub mod term;

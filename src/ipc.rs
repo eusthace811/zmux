@@ -85,6 +85,27 @@ pub fn is_running(session: &str) -> bool {
     connect(session).is_ok()
 }
 
+/// List live sessions by enumerating the named-pipe namespace.
+///
+/// Windows exposes `\\.\pipe\` as a readable directory, so this needs no
+/// registry of our own - a pipe exists exactly while its daemon does, which
+/// makes stale entries structurally impossible.
+pub fn list_sessions() -> Vec<String> {
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+    let prefix = format!("zmux-{user}-");
+    let Ok(dir) = std::fs::read_dir(r"\\.\pipe\") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = dir
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|n| n.strip_prefix(&prefix).map(str::to_string))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 pub fn listen(session: &str) -> Result<interprocess::local_socket::Listener> {
     let name = pipe_name(session);
     let ns = name.as_str().to_ns_name::<GenericNamespaced>()?;

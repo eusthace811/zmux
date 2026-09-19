@@ -19,6 +19,9 @@ pub enum ClientMsg {
     Input { data: Vec<u8> },
     Resize { cols: u16, rows: u16 },
     Detach,
+    // --- appended after v1 shipped. Append-only: never reorder the above. ---
+    /// Ask the daemon to terminate the session and exit.
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +33,9 @@ pub enum ServerMsg {
     Frame(Frame),
     PaneExited { code: i32 },
     Detached,
+    // --- appended after v1 shipped. Append-only. ---
+    /// Daemon is shutting down.
+    ShuttingDown,
 }
 
 /// One cell of the composited screen. Mirrors what a ratatui `Cell` carries,

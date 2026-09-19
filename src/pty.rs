@@ -55,10 +55,11 @@ pub enum PtyEvent {
     Exited(i32),
 }
 
+/// Owns one ConPTY. `Send + Sync` so every attached connection can write to it
+/// without taking ownership - the session outlives any single client.
 pub struct Pane {
-    master: Box<dyn MasterPty + Send>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub events: Receiver<PtyEvent>,
 }
 
 impl Pane {
@@ -70,7 +71,7 @@ impl Pane {
     /// emits `ESC[6n` during startup. Leave it unanswered and the shell never
     /// finishes initialising and teardown deadlocks. Reproduced on Windows 11
     /// build 26200 (DESIGN.md §2.5).
-    pub fn spawn<F>(cols: u16, rows: u16, mut on_output: F) -> Result<Self>
+    pub fn spawn<F>(cols: u16, rows: u16, mut on_output: F) -> Result<(Self, Receiver<PtyEvent>)>
     where
         F: FnMut(&[u8]) -> Vec<u8> + Send + 'static,
     {
@@ -132,7 +133,7 @@ impl Pane {
             let _ = exit_tx.send(PtyEvent::Exited(code));
         });
 
-        Ok(Self { master: pair.master, writer, events })
+        Ok((Self { master: Mutex::new(pair.master), writer }, events))
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
@@ -143,8 +144,8 @@ impl Pane {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        self.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        let m = self.master.lock().map_err(|_| anyhow::anyhow!("master poisoned"))?;
+        m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| anyhow::anyhow!("resize: {e}"))
     }
 }

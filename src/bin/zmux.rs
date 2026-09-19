@@ -57,8 +57,60 @@ fn spawn_daemon(session: &str) -> Result<()> {
     Ok(())
 }
 
+const USAGE: &str = "\
+zmux - tmux-style panes for Windows
+
+  zmux [session]          attach to a session, creating it if needed
+  zmux attach <session>   attach to an existing session (does not create)
+  zmux ls                 list live sessions
+  zmux kill <session>     terminate a session and its daemon
+  zmux --help
+
+In a session:  Ctrl-b d  detach";
+
 fn main() -> Result<()> {
-    let session = std::env::args().nth(1).unwrap_or_else(|| "default".into());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Some("ls") => {
+            let sessions = ipc::list_sessions();
+            if sessions.is_empty() {
+                println!("no live sessions");
+            } else {
+                for s in sessions {
+                    println!("{s}");
+                }
+            }
+            return Ok(());
+        }
+        Some("kill") => {
+            let Some(name) = args.get(1) else { bail!("usage: zmux kill <session>") };
+            if !ipc::is_running(name) {
+                bail!("no such session: {name}");
+            }
+            let mut s = ipc::connect(name)?;
+            ipc::write_msg(&mut s, &ClientMsg::Shutdown)?;
+            let _ = ipc::read_msg::<_, ServerMsg>(&mut s);
+            println!("killed {name}");
+            return Ok(());
+        }
+        Some("attach") => {
+            let Some(name) = args.get(1) else { bail!("usage: zmux attach <session>") };
+            if !ipc::is_running(name) {
+                bail!("no such session: {name}. `zmux {name}` would create it.");
+            }
+            return attach(name.clone());
+        }
+        _ => {}
+    }
+    let session = args.first().cloned().unwrap_or_else(|| "default".into());
+    attach(session)
+}
+
+fn attach(session: String) -> Result<()> {
 
     if !ipc::is_running(&session) {
         eprintln!("starting daemon...");
