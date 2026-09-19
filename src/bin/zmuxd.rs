@@ -16,7 +16,7 @@ use zmux::ipc;
 use zmux::layout::{Dir, Nav, PaneId};
 use zmux::protocol::{Cmd, ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use zmux::pty::PtyEvent;
-use zmux::session::Session;
+use zmux::session::{Outbound, Session};
 
 fn main() -> Result<()> {
     // Before anything that could trigger a LoadLibrary (see harden.rs).
@@ -228,7 +228,7 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
         session: session.name.clone(),
     })?;
 
-    let (id, outbox) = session.attach(cols, rows);
+    let (id, outbox, latest) = session.attach(cols, rows);
 
     // Full frame immediately on attach: a reattaching client has no history,
     // and deltas are meaningless without a base (DESIGN.md §4 Phase 2).
@@ -262,7 +262,22 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
     // this connection suffers; the session and other clients stay responsive.
     let mut wstream = stream.try_clone()?;
     let writer = std::thread::spawn(move || {
-        while let Ok(msg) = outbox.recv() {
+        while let Ok(item) = outbox.recv() {
+            let msg = match item {
+                // Take whatever is newest; intermediate frames are skipped
+                // rather than replayed, which is the point of coalescing.
+                Outbound::FrameReady => match latest.lock() {
+                    Ok(mut g) => match g.take() {
+                        Some(m) => m,
+                        None => continue,
+                    },
+                    Err(p) => match p.into_inner().take() {
+                        Some(m) => m,
+                        None => continue,
+                    },
+                },
+                Outbound::Control(m) => m,
+            };
             let stop = matches!(msg, ServerMsg::PaneExited { .. } | ServerMsg::ShuttingDown);
             if ipc::write_msg(&mut wstream, &msg).is_err() || stop {
                 return;

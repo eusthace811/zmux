@@ -183,3 +183,37 @@ fn a_hostile_peer_cannot_disturb_a_healthy_session() {
     );
     assert!(ipc::is_running(&d.session), "the daemon died on malformed input");
 }
+
+/// Rapid commands must not break the delta chain.
+///
+/// Frames are coalesced, so a burst can overwrite a frame before the writer
+/// takes it. If the daemon then sent a delta based on that never-delivered
+/// frame, the client would refuse it - and keep refusing every delta after,
+/// because nothing asks for a resync. Observed exactly that: the client froze
+/// at revision 11 while bases climbed past 19.
+#[test]
+fn a_burst_of_commands_does_not_break_the_delta_chain() {
+    let d = Daemon::start("zmux-test-burst");
+    let mut c = d.attach_ready(100, 24);
+
+    c.input("for i in $(seq 1 120); do echo BURST_$i; done\r");
+    assert!(c.wait_for(30, |t| t.contains("BURST_120")).is_some(), "output never finished");
+
+    // No pauses: this is what makes frames coalesce.
+    for _ in 0..12 {
+        c.cmd(Cmd::ScrollPageUp);
+    }
+    assert!(
+        c.wait_for(20, |t| t.contains("SCROLL") && t.contains("BURST_5")).is_some(),
+        "the client fell behind and never recovered - the delta chain broke"
+    );
+
+    // And it still tracks live output afterwards, proving the chain is intact
+    // rather than merely having caught up once.
+    c.cmd(Cmd::ScrollToBottom);
+    c.input("echo CHAIN_OK\r");
+    assert!(
+        c.wait_for(20, |t| t.contains("CHAIN_OK") && !t.contains("SCROLL")).is_some(),
+        "client stopped tracking output after the burst"
+    );
+}

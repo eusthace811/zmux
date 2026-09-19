@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–5 complete. 81 tests passing, clippy clean.
+Phases 0–5 complete. 82 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -105,11 +105,20 @@ sustained output, attach/detach churn, many splits, and malformed input.
 - **Pre-24H2 `ClosePseudoConsole`** can block; teardown is bounded and gives up
   rather than hanging, so a pane may be abandoned rather than reaped.
 - **A client that handshakes and then stops reading wedges itself** - the pipe
-  fills with frames it never drains. The daemon drops it and stays healthy,
-  which is what matters, but that client will not recover.
+  fills with frames it never drains. The daemon stays healthy, which is what
+  matters, but that client will not recover.
 - **No server identity check on connect.** The DACL restricts who can use the
   pipe and the name is SID-keyed, but a local process could still pre-create
   the name. `FILE_FLAG_FIRST_PIPE_INSTANCE` would close this; `interprocess`
   does not expose it.
 - **Session names are sanitised lossily**, so `a/b` and `a_b` collide.
 - **Queues are bounded by message count, not bytes.**
+
+## One more thing that will bite you
+
+**Coalescing and deltas interact.** Frames are coalesced per client: a burst
+replaces an undelivered frame rather than queueing. A delta based on a frame
+the client never received is refused - and keeps being refused, because
+nothing requests a resync. `publish()` therefore sends a FULL frame whenever
+it overwrites an occupied slot. Remove that check and rapid input freezes the
+display at whatever revision it last managed to apply.

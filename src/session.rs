@@ -29,17 +29,32 @@ pub struct PaneState {
     pub pty: Arc<Pane>,
 }
 
-/// Bounded so a client that stops draining cannot grow the daemon's memory
-/// without limit. When the queue is full the client is dropped: a peer that is
-/// this far behind is not usefully attached any more.
-const CLIENT_QUEUE: usize = 64;
+/// Control messages only. Frames do not queue - see `Outbound`.
+const CLIENT_QUEUE: usize = 32;
 
 /// Bounded for the same reason as the per-pane queue.
 const EVENT_QUEUE: usize = 512;
 
+/// What a connection's writer thread is told to do.
+///
+/// Frames are COALESCED rather than queued: only the newest matters, so the
+/// session keeps one slot per client and the channel carries a wake-up marker.
+/// The previous design queued 64 frames and dropped any client that fell
+/// behind - about one second at 16ms pacing, which a momentarily busy client
+/// exceeds easily. That disconnected healthy clients and silently discarded
+/// the commands they had already sent.
+pub enum Outbound {
+    /// A newer frame is waiting in the client's slot.
+    FrameReady,
+    /// Never coalesced; losing one of these loses the protocol.
+    Control(ServerMsg),
+}
+
 struct Client {
     id: u64,
-    tx: SyncSender<ServerMsg>,
+    tx: SyncSender<Outbound>,
+    /// Newest frame not yet written. Replaced, never accumulated.
+    latest: Arc<Mutex<Option<ServerMsg>>>,
     cols: u16,
     rows: u16,
     /// Set once the client has fallen too far behind to keep.
@@ -136,7 +151,7 @@ impl Session {
                 .filter(|d| crate::cwd::is_safe_local_dir(d))
                 .map(std::path::PathBuf::from)
                 .filter(|p| p.is_dir());
-            if let Err(e) = session.spawn_pane_in(id, rect.w, rect.h, dir) {
+            if let Err(e) = session.spawn_pane_retrying(id, rect.w, rect.h, dir) {
                 // One dead pane must not prevent the session from starting:
                 // drop it from the layout and carry on with the rest.
                 eprintln!("[session] could not restore pane {}: {e}", id.0);
@@ -205,6 +220,35 @@ impl Session {
     /// Create the pty for `id` and start forwarding its events.
     fn spawn_pane(&self, id: PaneId, cols: u16, rows: u16) -> Result<()> {
         self.spawn_pane_in(id, cols, rows, None)
+    }
+
+    /// Spawn a pane, retrying a transient failure.
+    ///
+    /// Creating a ConPTY and a process can fail under resource pressure. The
+    /// first version gave up immediately and dropped the pane, which meant a
+    /// session restore could silently come back with fewer panes than it had -
+    /// observed under parallel load. Losing a pane is worth a couple of
+    /// retries before accepting.
+    fn spawn_pane_retrying(
+        &self,
+        id: PaneId,
+        cols: u16,
+        rows: u16,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<()> {
+        const ATTEMPTS: usize = 3;
+        let mut last = None;
+        for attempt in 1..=ATTEMPTS {
+            match self.spawn_pane_in(id, cols, rows, cwd.clone()) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("[session] pane {} spawn attempt {attempt}/{ATTEMPTS} failed: {e}", id.0);
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("pane {} could not be created", id.0)))
     }
 
     fn spawn_pane_in(
@@ -290,12 +334,13 @@ impl Session {
         let new_id = PaneId::alloc();
         let accepted = lock(&self.layout).split(dir, area, new_id).is_some();
         if !accepted {
+            eprintln!("[session] split refused: area {}x{} too small", area.w, area.h);
             return Ok(None); // too small; no pty is created for a pane that cannot fit
         }
         let rect = lock(&self.layout).rect_of(new_id, area).unwrap_or(Rect::new(0, 0, 1, 1));
         // Inherit the focused pane's directory, as tmux does.
         let inherit = self.focused_cwd();
-        if let Err(e) = self.spawn_pane_in(new_id, rect.w, rect.h, inherit) {
+        if let Err(e) = self.spawn_pane_retrying(new_id, rect.w, rect.h, inherit) {
             // Roll the tree back: a leaf with no runtime would render as a
             // dead hole and confuse focus and reflow.
             let mut l = lock(&self.layout);
@@ -489,19 +534,27 @@ impl Session {
         {
             let mut cs = self.lock_clients();
             for c in cs.iter_mut() {
-                let msg = match (&msg_delta, c.needs_full) {
+                let mut slot = lock(&c.latest);
+                // If the slot still holds a frame, the writer has not taken it
+                // and that frame will NEVER be delivered - we are about to
+                // overwrite it. Any delta we send now would be based on a
+                // state the client never saw, and it would be refused forever
+                // because nothing asks for a resync. Coalescing therefore
+                // forces a FULL frame, which is self-contained.
+                let coalescing = slot.is_some();
+                let msg = match (&msg_delta, c.needs_full || coalescing) {
                     (Some(d), false) => d,
                     _ => {
                         c.needs_full = false;
                         &full
                     }
                 };
-                match c.tx.try_send(msg.clone()) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        c.lagged = true;
-                        eprintln!("[zmuxd] dropping client {} - {CLIENT_QUEUE} frames behind", c.id);
-                    }
+                *slot = Some(msg.clone());
+                drop(slot);
+                match c.tx.try_send(Outbound::FrameReady) {
+                    // Full just means a wake-up is already pending, and the
+                    // slot now holds the newer frame. Nothing is lost.
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => c.lagged = true,
                 }
             }
@@ -526,14 +579,27 @@ impl Session {
 
     /// Register a client. The caller must send it a full snapshot before
     /// forwarding anything from the returned queue.
-    pub fn attach(&self, cols: u16, rows: u16) -> (u64, Receiver<ServerMsg>) {
+    pub fn attach(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> (u64, Receiver<Outbound>, Arc<Mutex<Option<ServerMsg>>>) {
         // Raw, for the same reason as set_client_size; apply_size filters and
         // then clamps the surviving minimum.
         let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE);
+        let latest = Arc::new(Mutex::new(None));
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
-        self.lock_clients().push(Client { id, tx, cols, rows, lagged: false, needs_full: true });
+        self.lock_clients().push(Client {
+            id,
+            tx,
+            latest: Arc::clone(&latest),
+            cols,
+            rows,
+            lagged: false,
+            needs_full: true,
+        });
         self.apply_size();
-        (id, rx)
+        (id, rx, latest)
     }
 
     pub fn detach(&self, id: u64) {
@@ -645,17 +711,17 @@ impl Session {
 
     /// Send to every attached client.
     ///
-    /// Queues are bounded, so a client that stops draining is DROPPED rather
-    /// than allowed to grow the daemon's memory without limit. Losing a
-    /// wedged client is strictly better than losing the daemon.
+    /// These are never coalesced - a client that misses ShuttingDown or
+    /// PaneExited misses the protocol. A full control queue really does mean a
+    /// stuck peer, and that one is dropped.
     pub fn broadcast(&self, msg: &ServerMsg) {
         let mut cs = self.lock_clients();
         for c in cs.iter_mut() {
-            match c.tx.try_send(msg.clone()) {
+            match c.tx.try_send(Outbound::Control(msg.clone())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     c.lagged = true;
-                    eprintln!("[zmuxd] dropping client {} - {} frames behind", c.id, CLIENT_QUEUE);
+                    eprintln!("[zmuxd] dropping client {} - control queue full", c.id);
                 }
                 Err(TrySendError::Disconnected(_)) => c.lagged = true,
             }
