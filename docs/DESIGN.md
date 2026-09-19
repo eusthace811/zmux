@@ -1,4 +1,4 @@
-# zmux — implementation plan (v4)
+# zmux — design and implementation record (v5)
 
 tmux-style panes for Windows with persistent, detachable sessions.
 Git Bash is the pane shell. A locked-down corporate laptop is the runtime target.
@@ -6,10 +6,11 @@ Git Bash is the pane shell. A locked-down corporate laptop is the runtime target
 Rule: **do what herdr does, reuse herdr's code, build nothing new unless
 forced.** Divergences are justified inline.
 
-> **v4.** Phase 0 probes are run and all four are green (§0.1, §0.2, §2.5,
-> §6.1). Earlier conclusions that measurement overturned are marked
-> **[CORRECTED]** with the evidence, because the reasoning matters more than
-> the conclusion.
+> **v5 — BUILT.** Phases 0–5 are implemented and 57 tests pass. This document
+> is now a record rather than a plan: it keeps the reasoning, the measurements,
+> and the conclusions that measurement overturned (marked **[CORRECTED]**),
+> because the reasoning is what makes the code changeable later. See
+> `../README.md` for how to use what was built.
 
 ## Plain summary
 
