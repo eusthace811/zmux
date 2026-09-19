@@ -71,6 +71,7 @@ In a session (Ctrl-b is the prefix):
   C-b d          detach              C-b %          split left/right
   C-b x          close pane          C-b \"          split top/bottom
   C-b <arrow>    move focus          C-b C-<arrow>  resize
+  C-b c          new window          C-b n / C-b p  next / previous window
   C-b C-b        send a literal Ctrl-b";
 
 fn main() -> Result<()> {
@@ -319,6 +320,9 @@ fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
         KeyCode::Char('%') => Prefix::Command(Cmd::SplitHorizontal),
         KeyCode::Char('"') => Prefix::Command(Cmd::SplitVertical),
         KeyCode::Char('x') => Prefix::Command(Cmd::ClosePane),
+        KeyCode::Char('c') => Prefix::Command(Cmd::NewWindow),
+        KeyCode::Char('n') => Prefix::Command(Cmd::NextWindow),
+        KeyCode::Char('p') => Prefix::Command(Cmd::PrevWindow),
         KeyCode::Char('[') => Prefix::Scroll,
         KeyCode::PageUp => Prefix::Command(Cmd::ScrollPageUp),
         KeyCode::Left if ctrl => Prefix::Command(Cmd::ResizeLeft),

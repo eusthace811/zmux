@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 /// Bumped on any incompatible change. Handshake rejects a mismatch.
 /// v2 added `ServerMsg::Delta`. An old v1 client would accept the handshake and
 /// then fail to decode the new variant, so the version MUST move with the wire.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3 added the window commands: a v3 client sending `Cmd::NewWindow` to a v2
+/// daemon would be a decode error mid-stream, which the handshake catches first.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -72,6 +74,11 @@ pub enum Cmd {
     ScrollPageUp,
     ScrollPageDown,
     ScrollToBottom,
+    // --- appended. Append-only. ---
+    /// Create a window and switch to it.
+    NewWindow,
+    NextWindow,
+    PrevWindow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

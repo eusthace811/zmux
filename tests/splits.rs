@@ -139,3 +139,22 @@ fn a_too_small_terminal_refuses_to_split() {
     );
     assert!(ipc::is_running(&d.session), "the daemon should still be healthy");
 }
+
+/// Exiting one pane's shell closes that pane and leaves the session standing.
+/// The counterpart to `typing_exit_in_the_only_pane_ends_the_session`.
+#[test]
+fn a_shell_exiting_closes_only_its_own_pane() {
+    let d = Daemon::start("zmux-test-exit-one");
+    let mut c = d.attach_ready(120, 30);
+    c.cmd(Cmd::SplitHorizontal);
+    assert!(c.wait_for(25, |t| t.contains("2 panes")).is_some(), "split failed");
+    // Focus follows the new pane, so `exit` lands in it.
+    assert!(c.wait_for(20, |t| t.contains('$')).is_some(), "no prompt in the new pane");
+
+    c.input("exit\r");
+    let screen = c
+        .wait_for(25, |t| t.contains("1 pane"))
+        .expect("the exited pane was never reclaimed");
+    assert!(!screen.contains('│'), "the survivor should reclaim the divider:\n{screen}");
+    assert!(ipc::is_running(&d.session), "one shell exiting must not end the session");
+}

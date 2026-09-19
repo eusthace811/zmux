@@ -420,11 +420,11 @@ mintty (probe D) or Windows Terminal
       │   \\.\pipe\zmux-<user>-<session>
       ▼
    zmuxd.exe               daemon — detached, job-escaped (§0.2)
-      ├── Pane × N
-      │    ├── ConPTY (portable-pty) → bash.exe -l
+      ├── Pane × N              EVERY window's panes, in one flat map
+      │    ├── ConPTY (portable-pty) → bash.exe --rcfile (§2.4)
       │    ├── vt100::Parser (grid + scrollback + Callbacks)
       │    └── reader thread → mpsc
-      ├── LayoutTree (adapted layout.rs)
+      ├── Windows               Vec<Layout>, one current (§9)
       └── session.json → %APPDATA%\zmux\
 ```
 
@@ -500,8 +500,11 @@ it must land before splits multiply the surface.
 - **Done when:** you stop reaching for anything else.
 
 ### Phase 5 — optional
-Mouse · tabs · TOML config · Kitty keyboard negotiation · OSC 52/OSC 8 policy ·
+Mouse · TOML config · Kitty keyboard negotiation · OSC 52/OSC 8 policy ·
 adapt `render_ansi.rs` only if ratatui's blitting proves inadequate.
+
+### Phase 6 — windows (§9)
+`C-b c` / `C-b n` / `C-b p`. Several layouts per session, one composited.
 
 **Total: ~3 weeks.** Up from v2's 2–2.5 — that estimate assumed a verbatim
 harvest that does not exist (§2.1) and deferred work that cannot be deferred.
@@ -519,7 +522,7 @@ harvest that does not exist (§2.1) and deferred work that cannot be deferred.
 | Cross-platform abstraction | Windows only |
 | Bundled ConPTY runtime | §6.2 — no shipped binaries |
 | Installer / updater / telemetry | §6.2 |
-| Config file, tabs, mouse (v1) | Phase 5 |
+| Named windows, window indices with gaps | §9 — windows are positional |
 | Agent detection, workspaces, plugins, remote | herdr's product |
 
 ---
@@ -676,3 +679,81 @@ when policy forbids unsigned executables but permits building from source.
 When you get access, before trusting anything: re-run **Probe C** (zero deps,
 needs no toolchain — just copy the `.exe`), then **Probe D**, then record the
 Windows build. Those three answers determine whether the design still holds.
+
+
+---
+
+## 9. Windows
+
+Several independent screenfuls of panes in one session: `C-b c` creates one,
+`C-b n` / `C-b p` cycle. tmux's model, reduced to the smallest thing that
+works.
+
+### A window IS a layout
+
+`src/windows.rs` holds `Vec<Layout>` plus a current index. There is no window
+struct, no `WindowId` and no second id allocator to keep in step with
+`PaneId` — a window carries no state beyond its layout, so inventing a type
+for it would have bought nothing. Windows are addressed by position, which is
+also what the status bar shows.
+
+The cost is that closing a window renumbers the ones after it, where tmux
+leaves a gap. Accepted: it keeps indices contiguous and there is no
+`C-b <digit>` binding whose target could shift underneath the user.
+
+### Panes never move
+
+Panes stay in the session's one `HashMap<PaneId, PaneState>` whichever window
+displays them. Switching windows changes only which layout gets composited —
+nothing is suspended, restarted or re-parented, and a background window's
+shell keeps running with its output parsed into its own `vt100` grid. That is
+the whole feature; everything else is bookkeeping.
+
+Two consequences worth stating:
+
+- **`MAX_PANES` counts across every window.** A hidden pane costs a ConPTY and
+  a shell exactly like a visible one.
+- **Every window reflows, not just the visible one.** A hidden pane left at an
+  old size keeps producing output wrapped for that size, and switching to it
+  later cannot un-wrap text that was already laid out wrongly.
+
+### A window switch cannot be a delta
+
+`reflow_locked()` clears `last_published`, so the next publish is a full
+frame. A window switch replaces every cell on screen; a row diff against the
+screen the client was showing would be meaningless. This falls out of reusing
+reflow rather than being special-cased, which is why `switch_window` calls it
+even though no pane geometry changed.
+
+### Closing
+
+A window's last pane taking the window with it is load-bearing, not a nicety:
+without it a window created by mistake could only be dismissed by exiting its
+shell. Both `C-b x` and a shell exiting route through one `remove_pane`, which
+returns `Closed::{Pane, Window, LastPane, NotFound}` — a bool cannot say
+whether a closed window means a closed session.
+
+`remove_pane` does nothing once `running` is false. `shutdown()` saves the
+arrangement the user actually had and then kills every pane, each of which
+duly reports its exit; letting those edit and re-save the layout replaced that
+snapshot with whatever panes happened to still be standing. Observed as a
+restarted session coming back with one window instead of two.
+
+### Persistence
+
+`FORMAT_VERSION` 2 stores a window list and the current index. v1 files are
+**migrated**, not discarded — a v1 session is exactly a v2 session with one
+window, so this is a mechanical translation rather than the guessing §4
+otherwise forbids.
+
+`Windows::repaired()` exists because `serde`'s derive bypasses
+`Layout::from_saved`, which is the only thing that advances the `PaneId`
+allocator past restored ids (§2.2) and repairs focus naming a missing pane.
+Deserialising straight into the runtime type would have reintroduced the
+id-collision bug this design exists to avoid.
+
+### Wire
+
+`PROTOCOL_VERSION` 3 appends `Cmd::{NewWindow, NextWindow, PrevWindow}`. The
+handshake rejects a mismatch, so a v3 client meeting a v2 daemon is refused
+cleanly rather than failing to decode mid-stream.

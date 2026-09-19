@@ -14,3 +14,4 @@ pub mod pty;
 pub mod render;
 pub mod session;
 pub mod term;
+pub mod windows;

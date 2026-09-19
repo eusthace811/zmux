@@ -197,3 +197,34 @@ fn alt_keys_reach_the_shell_as_escape_prefixed_bytes() {
         "Alt-b did not reach readline as a word motion:\n{screen}"
     );
 }
+
+/// A shell exiting must actually be noticed.
+///
+/// This is the regression test for a bug that made every `PtyEvent::Exited`
+/// unreachable: the constructor took the child handle OUT of the shared slot
+/// the waiter thread polls, so the waiter found `None` on its first tick and
+/// returned. Typing `exit` left a dead pane on screen and a session whose last
+/// shell had gone lingered until its idle timeout. Nothing in the suite typed
+/// `exit`, so it went unnoticed.
+#[test]
+fn typing_exit_in_the_only_pane_ends_the_session() {
+    let name = "zmux-test-exit";
+    let d = Daemon::start(name);
+    let mut c = d.attach_ready(100, 24);
+    c.input("exit\r");
+
+    // The client is told, rather than just being cut off.
+    let told = (0..40).any(|_| {
+        matches!(
+            c.next_msg(500),
+            Some(ServerMsg::PaneExited { .. } | ServerMsg::ShuttingDown)
+        )
+    });
+    assert!(told, "the client was never told its session had ended");
+
+    let gone = (0..40).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        !ipc::is_running(name)
+    });
+    assert!(gone, "the daemon outlived its only shell");
+}

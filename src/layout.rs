@@ -178,16 +178,29 @@ impl Layout {
         Some(new_id)
     }
 
+    /// Remove a specific pane. Returns false when it is absent or is the last
+    /// one (a window always keeps at least one pane).
+    ///
+    /// Focus only moves if the pane being removed held it. Callers used to
+    /// emulate this by focusing the victim, closing, then restoring focus -
+    /// which silently closed the WRONG pane whenever the victim had already
+    /// gone. Removing by id has no such failure mode.
+    pub fn close(&mut self, id: PaneId) -> bool {
+        if self.len() <= 1 || !self.panes().contains(&id) {
+            return false;
+        }
+        let Some(surviving) = remove_leaf(&mut self.root, id) else { return false };
+        if self.focus == id {
+            self.focus = surviving;
+        }
+        true
+    }
+
     /// Remove the focused pane. Returns the removed id, or `None` if it is the
     /// last one (a session always keeps at least one pane).
     pub fn close_focused(&mut self) -> Option<PaneId> {
-        if self.len() <= 1 {
-            return None;
-        }
         let removed = self.focus;
-        let surviving = remove_leaf(&mut self.root, removed)?;
-        self.focus = surviving;
-        Some(removed)
+        self.close(removed).then_some(removed)
     }
 
     /// Geometry for every pane, plus the dividers between them.
@@ -482,6 +495,25 @@ mod tests {
         assert_eq!(l.panes(), vec![PaneId(1)]);
         assert_eq!(l.focus(), PaneId(1));
         assert_eq!(l.compute(area()).0[0].1, area(), "survivor reclaims the space");
+    }
+
+    #[test]
+    fn closing_by_id_leaves_focus_alone_unless_it_was_the_victim() {
+        let mut l = Layout::new(PaneId(1));
+        l.split(Dir::Horizontal, area(), PaneId(2)).unwrap(); // focus 2
+        l.split(Dir::Vertical, area(), PaneId(3)).unwrap();   // focus 3
+        assert!(l.close(PaneId(1)), "pane 1 should close");
+        assert_eq!(l.focus(), PaneId(3), "closing another pane must not steal focus");
+        assert!(l.close(PaneId(3)), "the focused pane should close");
+        assert_eq!(l.focus(), PaneId(2), "focus moves to the survivor");
+    }
+
+    #[test]
+    fn closing_a_pane_that_is_not_here_does_nothing() {
+        let mut l = Layout::new(PaneId(1));
+        l.split(Dir::Horizontal, area(), PaneId(2)).unwrap();
+        assert!(!l.close(PaneId(99)));
+        assert_eq!(l.len(), 2, "a no-op close must not disturb the tree");
     }
 
     #[test]

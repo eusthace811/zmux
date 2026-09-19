@@ -193,6 +193,15 @@ fn apply(session: &Arc<Session>, cmd: Cmd) -> Result<()> {
         Cmd::ScrollPageUp => session.scroll_focused(Some(10)),
         Cmd::ScrollPageDown => session.scroll_focused(Some(-10)),
         Cmd::ScrollToBottom => session.scroll_focused(None),
+        Cmd::NewWindow => {
+            session.new_window()?;
+        }
+        Cmd::NextWindow => {
+            session.next_window();
+        }
+        Cmd::PrevWindow => {
+            session.prev_window();
+        }
     }
     Ok(())
 }

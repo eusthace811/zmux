@@ -1,5 +1,8 @@
-//! A session: a tiling layout of ConPTY panes, owned by the daemon and
-//! **outliving any individual client**.
+//! A session: one or more windows of tiled ConPTY panes, owned by the daemon
+//! and **outliving any individual client**.
+//!
+//! Panes live in one flat map regardless of which window shows them
+//! (DESIGN.md §9), so a hidden window's shells keep running.
 //!
 //! An earlier version owned the pane inside the connection handler, so
 //! detaching dropped the ConPTY and killed the shell - persistence in name
@@ -13,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anyhow::{bail, Result};
 
 use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
+use crate::windows::{Closed, Windows};
 use crate::protocol::{clamp_size, Frame, ServerMsg, MAX_INPUT_BYTES, MAX_PANES};
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
@@ -66,8 +70,10 @@ struct Client {
 
 pub struct Session {
     pub name: String,
+    /// EVERY pane in the session, whichever window shows it. Panes do not
+    /// move between windows and are not suspended when a window is hidden.
     panes: Mutex<HashMap<PaneId, PaneState>>,
-    layout: Mutex<Layout>,
+    windows: Mutex<Windows>,
     clients: Mutex<Vec<Client>>,
     next_client: AtomicU64,
     pub running: Arc<AtomicBool>,
@@ -95,18 +101,17 @@ pub struct Session {
 ///
 /// Processes cannot be restored; directories can. Each restored pane gets a
 /// fresh shell started in the directory that pane last reported.
-fn restore_layout(name: &str) -> Option<(Layout, HashMap<u32, String>)> {
+fn restore_layout(name: &str) -> Option<(Windows, HashMap<u32, String>)> {
     let snap = persist::load(name)?;
-    let layout = Layout::from_saved(snap.root, snap.focus);
-    // A corrupt or absurd saved layout must not spawn a shell per leaf.
-    if layout.panes().len() > MAX_PANES {
-        eprintln!(
-            "[session] saved layout has {} panes (max {MAX_PANES}); starting fresh",
-            layout.panes().len()
-        );
+    // A corrupt or absurd saved layout must not spawn a shell per leaf. The
+    // bound is across ALL windows: a background window's ptys are as real as
+    // the visible one's.
+    let total = snap.windows.panes().len();
+    if total > MAX_PANES {
+        eprintln!("[session] saved layout has {total} panes (max {MAX_PANES}); starting fresh");
         return None;
     }
-    Some((layout, snap.cwds))
+    Some((snap.windows, snap.cwds))
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -123,14 +128,14 @@ impl Session {
         // would defeat the bound entirely.
         let (events_tx, events_rx) = std::sync::mpsc::sync_channel(EVENT_QUEUE);
         let restored = restore_layout(name);
-        let layout = match &restored {
-            Some((l, _)) => l.clone(),
-            None => Layout::new(PaneId::alloc()),
+        let windows = match &restored {
+            Some((w, _)) => w.clone(),
+            None => Windows::new(Layout::new(PaneId::alloc())),
         };
         let session = Arc::new(Self {
             name: name.to_string(),
             panes: Mutex::new(HashMap::new()),
-            layout: Mutex::new(layout),
+            windows: Mutex::new(windows),
             clients: Mutex::new(Vec::new()),
             next_client: AtomicU64::new(1),
             running: Arc::new(AtomicBool::new(true)),
@@ -143,9 +148,15 @@ impl Session {
             events_tx,
         });
         let area = session.area(cols, rows);
-        let (rects, _) = lock(&session.layout).compute(area);
+        // Panes from EVERY window, not just the visible one. A background
+        // window restored without shells would look empty the moment you
+        // switched to it.
+        let planned: Vec<(PaneId, Rect)> = {
+            let w = lock(&session.windows);
+            w.all().iter().flat_map(|l| l.compute(area).0).collect()
+        };
         let cwds = restored.map(|(_, c)| c).unwrap_or_default();
-        for (id, rect) in rects {
+        for (id, rect) in planned {
             let dir = cwds
                 .get(&id.0)
                 .filter(|d| crate::cwd::is_safe_local_dir(d))
@@ -153,19 +164,15 @@ impl Session {
                 .filter(|p| p.is_dir());
             if let Err(e) = session.spawn_pane_retrying(id, rect.w, rect.h, dir) {
                 // One dead pane must not prevent the session from starting:
-                // drop it from the layout and carry on with the rest.
+                // drop it, and its window with it if that was its only pane.
                 eprintln!("[session] could not restore pane {}: {e}", id.0);
-                let mut l = lock(&session.layout);
-                if l.len() > 1 {
-                    l.set_focus(id);
-                    l.close_focused();
-                }
+                lock(&session.windows).close_pane(id);
             }
         }
         // A restored layout whose panes all failed leaves nothing to show.
         if lock(&session.panes).is_empty() {
             let id = PaneId::alloc();
-            *lock(&session.layout) = Layout::new(id);
+            *lock(&session.windows) = Windows::new(Layout::new(id));
             session.spawn_pane(id, area.w, area.h)?;
         }
         session.save_state();
@@ -180,20 +187,19 @@ impl Session {
         // Capture layout and panes together. Taking them under separate locks
         // allowed a split to land in between, producing a snapshot whose tree
         // and directories described different moments.
-        let (root, focus, cwds) = {
-            let l = lock(&self.layout);
+        let (windows, cwds) = {
+            let w = lock(&self.windows);
             let panes = lock(&self.panes);
             let cwds = panes
                 .iter()
                 .filter_map(|(id, p)| lock(&p.term).cwd_windows().map(|d| (id.0, d)))
                 .collect();
-            (l.root_snapshot(), l.focus(), cwds)
+            (w.clone(), cwds)
         };
         let snap = SessionSnapshot {
             version: persist::FORMAT_VERSION,
             name: self.name.clone(),
-            root,
-            focus,
+            windows,
             cwds,
         };
         if let Err(e) = persist::save(&snap) {
@@ -290,7 +296,15 @@ impl Session {
     }
 
     pub fn focus(&self) -> PaneId {
-        lock(&self.layout).focus()
+        lock(&self.windows).current().focus()
+    }
+
+    pub fn window_count(&self) -> usize {
+        lock(&self.windows).len()
+    }
+
+    pub fn window_index(&self) -> usize {
+        lock(&self.windows).index()
     }
 
     pub fn pane_count(&self) -> usize {
@@ -301,8 +315,9 @@ impl Session {
         *lock(&self.size)
     }
 
+    /// The CURRENT window's layout - the one that gets composited.
     pub fn layout_snapshot(&self) -> Layout {
-        lock(&self.layout).clone()
+        lock(&self.windows).current().clone()
     }
 
     /// Write to the focused pane.
@@ -326,26 +341,27 @@ impl Session {
 
     pub fn split(&self, dir: Dir) -> Result<Option<PaneId>> {
         let _g = lock(&self.geometry);
-        if lock(&self.layout).len() >= MAX_PANES {
+        // Across every window: a hidden pane costs a ConPTY and a shell
+        // exactly like a visible one.
+        if lock(&self.windows).panes().len() >= MAX_PANES {
             return Ok(None);
         }
         let (cols, rows) = self.size();
         let area = self.area(cols, rows);
         let new_id = PaneId::alloc();
-        let accepted = lock(&self.layout).split(dir, area, new_id).is_some();
+        let accepted = lock(&self.windows).current_mut().split(dir, area, new_id).is_some();
         if !accepted {
             eprintln!("[session] split refused: area {}x{} too small", area.w, area.h);
             return Ok(None); // too small; no pty is created for a pane that cannot fit
         }
-        let rect = lock(&self.layout).rect_of(new_id, area).unwrap_or(Rect::new(0, 0, 1, 1));
+        let rect =
+            lock(&self.windows).current().rect_of(new_id, area).unwrap_or(Rect::new(0, 0, 1, 1));
         // Inherit the focused pane's directory, as tmux does.
         let inherit = self.focused_cwd();
         if let Err(e) = self.spawn_pane_retrying(new_id, rect.w, rect.h, inherit) {
             // Roll the tree back: a leaf with no runtime would render as a
             // dead hole and confuse focus and reflow.
-            let mut l = lock(&self.layout);
-            l.set_focus(new_id);
-            l.close_focused();
+            lock(&self.windows).current_mut().close(new_id);
             return Err(e);
         }
         self.reflow_locked();
@@ -354,66 +370,127 @@ impl Session {
         Ok(Some(new_id))
     }
 
-    /// Close the focused pane. Returns false when it is the last one.
+    /// Close the focused pane. Returns false when it is the session's last.
+    ///
+    /// Closing a window's last pane closes the WINDOW, as tmux does - without
+    /// that, a window created with `NewWindow` could only be dismissed by
+    /// exiting its shell.
     pub fn close_focused(&self) -> bool {
-        let _g = lock(&self.geometry);
-        let removed = { lock(&self.layout).close_focused() };
-        match removed {
-            Some(id) => {
-                let pane = lock(&self.panes).remove(&id);
-                self.reflow_locked();
-                drop(_g);
-                // Close OUTSIDE the geometry lock. ClosePseudoConsole can hang
-                // on pre-24H2 Windows, and holding `geometry` across it would
-                // freeze every layout and resize operation in the session.
-                if let Some(p) = pane {
-                    std::thread::spawn(move || p.pty.close());
-                }
-                self.save_state();
-                true
-            }
-            None => false,
-        }
+        let id = self.focus();
+        self.remove_pane(id) != Closed::LastPane
     }
 
-    /// A pane's process exited: remove it, and end the session if it was last.
-    pub fn pane_exited(&self, id: PaneId) -> bool {
+    /// Remove one pane and tear its pty down, whichever window holds it.
+    ///
+    /// The single path for "this pane is going away", whether the user asked
+    /// or the shell exited. Both used to open-code it, and they disagreed.
+    fn remove_pane(&self, id: PaneId) -> Closed {
+        // Once shutdown() has started it is killing every pane on purpose, and
+        // each one duly reports its exit. Editing the layout and re-saving it
+        // here would replace the arrangement shutdown() deliberately persisted
+        // with whatever panes happened to still be standing when the last pty
+        // closed - a restarted session came back with one window instead of
+        // two. There is nothing left to remove from, so say so.
+        if !self.running.load(Ordering::Relaxed) {
+            return Closed::NotFound;
+        }
         let _g = lock(&self.geometry);
-        // A manual close can race an already-queued Exited for the same pane.
-        // Without this check set_focus(id) fails, its result is ignored, and
-        // close_focused() removes whichever pane happens to be FOCUSED -
-        // killing a live pane and orphaning it in the pane map.
-        if !lock(&self.layout).panes().contains(&id) {
-            lock(&self.panes).remove(&id);
-            return false;
-        }
-        if lock(&self.layout).len() <= 1 {
-            return true;
-        }
-        {
-            let mut l = lock(&self.layout);
-            let previous = l.focus();
-            if !l.set_focus(id) {
-                return false; // vanished between the check and here
+        let outcome = lock(&self.windows).close_pane(id);
+        match outcome {
+            // Nothing was removed from the tree in either case.
+            Closed::LastPane => return outcome,
+            Closed::NotFound => {
+                // A stale exit for a pane already closed by hand. The tree has
+                // forgotten it; make sure the pane map has too.
+                lock(&self.panes).remove(&id);
+                return outcome;
             }
-            l.close_focused();
-            // Keep the user's focus where it was unless it was the dead pane.
-            if previous != id {
-                l.set_focus(previous);
-            }
+            Closed::Pane | Closed::Window => {}
         }
         let pane = lock(&self.panes).remove(&id);
         self.reflow_locked();
         drop(_g);
+        // Close OUTSIDE the geometry lock. ClosePseudoConsole can hang on
+        // pre-24H2 Windows, and holding `geometry` across it would freeze
+        // every layout and resize operation in the session.
         if let Some(p) = pane {
             std::thread::spawn(move || p.pty.close());
         }
-        false
+        self.save_state();
+        outcome
+    }
+
+    /// A pane's process exited: remove it, and end the session if it was the
+    /// last one anywhere. Returns true when there is nothing left to show.
+    ///
+    /// A shell exiting in a background window closes that window without
+    /// disturbing the one being looked at.
+    pub fn pane_exited(&self, id: PaneId) -> bool {
+        self.remove_pane(id) == Closed::LastPane
+    }
+
+    /// Create a window with one pane and switch to it.
+    ///
+    /// `Ok(None)` means the session is already at `MAX_PANES`.
+    pub fn new_window(&self) -> Result<Option<usize>> {
+        let _g = lock(&self.geometry);
+        if lock(&self.windows).panes().len() >= MAX_PANES {
+            eprintln!("[session] new window refused: already at {MAX_PANES} panes");
+            return Ok(None);
+        }
+        let (cols, rows) = self.size();
+        let area = self.area(cols, rows);
+        let id = PaneId::alloc();
+        // Inherit the focused pane's directory, as a split does.
+        let inherit = self.focused_cwd();
+        // Spawn BEFORE touching the window list. A new window occupies the
+        // whole area, so unlike a split there is no rect to compute from the
+        // tree first - which means no half-built state to roll back if the
+        // shell will not start.
+        self.spawn_pane_retrying(id, area.w, area.h, inherit)?;
+        let index = lock(&self.windows).push(Layout::new(id));
+        self.reflow_locked();
+        drop(_g);
+        self.save_state();
+        Ok(Some(index))
+    }
+
+    pub fn next_window(&self) -> bool {
+        self.switch_window(|w| w.select_next())
+    }
+
+    pub fn prev_window(&self) -> bool {
+        self.switch_window(|w| w.select_previous())
+    }
+
+    pub fn select_window(&self, index: usize) -> bool {
+        self.switch_window(|w| w.select(index))
+    }
+
+    /// Change which window is composited.
+    ///
+    /// `reflow_locked` is what makes this correct rather than just convenient:
+    /// it clears `last_published`, and a window switch replaces every cell on
+    /// screen, so no delta could describe it. Without that the client would be
+    /// sent row diffs against a screen it is no longer showing.
+    fn switch_window(&self, f: impl FnOnce(&mut Windows) -> bool) -> bool {
+        let changed = {
+            let _g = lock(&self.geometry);
+            let changed = f(&mut lock(&self.windows));
+            if changed {
+                self.reflow_locked();
+            }
+            changed
+        };
+        if changed {
+            self.save_state();
+        }
+        changed
     }
 
     pub fn focus_dir(&self, nav: Nav) -> bool {
         let (cols, rows) = self.size();
-        let changed = lock(&self.layout).focus_dir(nav, self.area(cols, rows));
+        let changed = lock(&self.windows).current_mut().focus_dir(nav, self.area(cols, rows));
         if changed {
             self.revision.fetch_add(1, Ordering::Relaxed);
         }
@@ -423,7 +500,8 @@ impl Session {
     pub fn resize_focused(&self, nav: Nav, step: u16) -> bool {
         let _g = lock(&self.geometry);
         let (cols, rows) = self.size();
-        let changed = lock(&self.layout).resize_focused(nav, self.area(cols, rows), step);
+        let changed =
+            lock(&self.windows).current_mut().resize_focused(nav, self.area(cols, rows), step);
         if changed {
             self.reflow_locked();
         }
@@ -464,10 +542,10 @@ impl Session {
 
     pub fn focus_at(&self, x: u16, y: u16) -> bool {
         let (cols, rows) = self.size();
-        let hit = lock(&self.layout).pane_at(self.area(cols, rows), x, y);
+        let hit = lock(&self.windows).current().pane_at(self.area(cols, rows), x, y);
         match hit {
             Some(id) => {
-                let changed = lock(&self.layout).set_focus(id);
+                let changed = lock(&self.windows).current_mut().set_focus(id);
                 if changed {
                     self.revision.fetch_add(1, Ordering::Relaxed);
                 }
@@ -484,7 +562,13 @@ impl Session {
     fn reflow_locked(&self) {
         let (cols, rows) = self.size();
         let area = self.area(cols, rows);
-        let (rects, _) = lock(&self.layout).compute(area);
+        // EVERY window, not just the visible one. A hidden pane left at an old
+        // size keeps producing output wrapped for that size, and switching to
+        // it later cannot undo text that was already laid out wrongly.
+        let rects: Vec<(PaneId, Rect)> = {
+            let w = lock(&self.windows);
+            w.all().iter().flat_map(|l| l.compute(area).0).collect()
+        };
         let panes = lock(&self.panes);
         for (id, r) in rects {
             if let Some(p) = panes.get(&id) {
@@ -663,31 +747,48 @@ impl Session {
     }
 
     pub fn status_line(&self) -> String {
-        let (n, focus) = {
-            let l = lock(&self.layout);
-            (l.len(), l.focus().0)
+        let (n, focus, windows, current) = {
+            let w = lock(&self.windows);
+            (w.current().len(), w.current().focus().0, w.len(), w.index())
         };
         let scrolled = if self.focused_is_scrolled() { " | SCROLL" } else { "" };
         let width = self.size().0 as usize;
+        let plural = if n == 1 { "" } else { "s" };
+
+        // The window list appears only once there IS more than one window.
+        // With a single window it would be a constant "0*" occupying space
+        // that the parts which actually vary need on a narrow terminal.
+        let wins = if windows > 1 {
+            let list = (0..windows)
+                .map(|i| if i == current { format!("{i}*") } else { i.to_string() })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{list} | ")
+        } else {
+            String::new()
+        };
 
         // Drop the least useful parts first rather than letting the whole line
         // be truncated. On a narrow pane the old format showed a clipped
         // session name and nothing else - the pane count, which is what you
         // actually need, fell off the end.
-        let full = format!(
-            " {} | {} pane{} | pane {}{} ",
-            self.name,
-            n,
-            if n == 1 { "" } else { "s" },
-            focus,
-            scrolled
-        );
+        let full = format!(" {} | {wins}{n} pane{plural} | pane {focus}{scrolled} ", self.name);
         if full.chars().count() <= width {
             return full;
         }
-        let medium = format!(" {} pane{} | pane {}{} ", n, if n == 1 { "" } else { "s" }, focus, scrolled);
+        let medium = format!(" {wins}{n} pane{plural} | pane {focus}{scrolled} ");
         if medium.chars().count() <= width {
             return medium;
+        }
+        // Which window you are on outranks how many panes it holds: getting
+        // lost between windows is worse than not knowing the pane count.
+        let short = if windows > 1 {
+            format!(" {current}/{windows} | {n}p{scrolled} ")
+        } else {
+            format!(" {n}p{scrolled} ")
+        };
+        if short.chars().count() <= width || windows <= 1 {
+            return short;
         }
         format!(" {n}p{scrolled} ")
     }

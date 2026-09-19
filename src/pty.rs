@@ -117,7 +117,14 @@ pub struct Pane {
     /// Closing the pseudoconsole is supposed to take the shell with it, but in
     /// practice shells survived and accumulated as orphaned bash.exe processes
     /// across runs. Teardown now kills explicitly rather than trusting that.
-    child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+    ///
+    /// SHARED with the waiter thread, which polls it for the shell's exit.
+    /// This used to be a separate slot that the constructor filled by TAKING
+    /// the child out of the waiter's handle - so the waiter found `None` on
+    /// its first tick and returned, and `PtyEvent::Exited` could never fire
+    /// for any pane. Typing `exit` left a dead pane on screen and a session
+    /// whose last shell had gone never ended. One handle, two owners.
+    child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
     /// `Option` so `close()` can TAKE it and drop the pseudoconsole.
     ///
     /// This is load-bearing: the reader thread blocks in `read()` until the
@@ -293,23 +300,13 @@ impl Pane {
         });
 
         let pane = Self {
-                master: Mutex::new(Some(pair.master)),
-                child: Mutex::new(None), // replaced below
-                writer,
+            master: Mutex::new(Some(pair.master)),
+            // The waiter's own handle, not a copy of it.
+            child,
+            writer,
             closing,
             threads: Mutex::new(vec![reader, waiter]),
         };
-        // Hand the shared child handle to the pane so close() can kill it.
-        {
-            let mut slot = match pane.child.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            *slot = match child.lock() {
-                Ok(mut c) => c.take(),
-                Err(p) => p.into_inner().take(),
-            };
-        }
         Ok((pane, events))
     }
 

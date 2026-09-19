@@ -11,19 +11,46 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::layout::{Layout, Node, PaneId};
+use crate::windows::Windows;
 
-/// Bumped when the on-disk shape changes. An unreadable or older file is
+/// Bumped when the on-disk shape changes. An unreadable or NEWER file is
 /// discarded rather than guessed at - a wrong layout is worse than none.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v2 replaced the single `root`/`focus` pair with a list of windows.
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub version: u32,
     pub name: String,
-    pub root: Node,
-    pub focus: PaneId,
+    pub windows: Windows,
     /// Pane id -> last reported working directory (Windows form).
     pub cwds: HashMap<u32, String>,
+}
+
+/// The v1 shape: one layout, no windows.
+///
+/// Kept so an upgrade does not silently discard the arrangement someone has
+/// been using. This is a mechanical translation, not a guess - a v1 session is
+/// exactly a v2 session with one window - which is why it is worth doing when
+/// discarding a file we cannot interpret is otherwise the rule.
+#[derive(Deserialize)]
+struct SnapshotV1 {
+    name: String,
+    root: Node,
+    focus: PaneId,
+    cwds: HashMap<u32, String>,
+}
+
+impl SnapshotV1 {
+    fn upgrade(self) -> SessionSnapshot {
+        SessionSnapshot {
+            version: FORMAT_VERSION,
+            name: self.name,
+            windows: Windows::new(Layout::from_saved(self.root, self.focus)),
+            cwds: self.cwds,
+        }
+    }
 }
 
 pub fn state_dir() -> PathBuf {
@@ -59,16 +86,21 @@ pub fn save(snap: &SessionSnapshot) -> Result<()> {
 
 pub fn load(name: &str) -> Option<SessionSnapshot> {
     let raw = std::fs::read_to_string(path_for(name)).ok()?;
-    let snap: SessionSnapshot = serde_json::from_str(&raw).ok()?;
-    if snap.version != FORMAT_VERSION {
-        return None;
-    }
-    // A layout with no panes would panic on restore.
-    let l = Layout::from_saved(snap.root.clone(), snap.focus);
-    if l.panes().is_empty() {
-        return None;
-    }
-    Some(snap)
+    // Read the version FIRST and dispatch on it. Trying each shape in turn and
+    // taking whichever parses would let a half-matching file be read as the
+    // wrong format, which is precisely the guessing this module avoids.
+    let version = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("version")?
+        .as_u64()? as u32;
+    let snap = match version {
+        FORMAT_VERSION => serde_json::from_str::<SessionSnapshot>(&raw).ok()?,
+        1 => serde_json::from_str::<SnapshotV1>(&raw).ok()?.upgrade(),
+        _ => return None, // a FUTURE version; we cannot know what it means
+    };
+    // Everything above came off disk, so it is repaired - not trusted - before
+    // anyone indexes into it or allocates a pane id.
+    Some(SessionSnapshot { windows: snap.windows.repaired()?, ..snap })
 }
 
 pub fn remove(name: &str) {
@@ -92,8 +124,7 @@ mod tests {
         SessionSnapshot {
             version: FORMAT_VERSION,
             name: name.into(),
-            root,
-            focus: PaneId(2),
+            windows: Windows::new(Layout::from_saved(root, PaneId(2))),
             cwds,
         }
     }
@@ -103,11 +134,41 @@ mod tests {
         let s = snapshot("zmux-unit-roundtrip");
         save(&s).expect("save");
         let back = load(&s.name).expect("load");
-        assert_eq!(back.focus, PaneId(2));
+        assert_eq!(back.windows.current().focus(), PaneId(2));
         assert_eq!(back.cwds.get(&1).map(String::as_str), Some(r"C:\work"));
-        let l = Layout::from_saved(back.root, back.focus);
-        assert_eq!(l.panes().len(), 2);
+        assert_eq!(back.windows.current().panes().len(), 2);
         remove(&s.name);
+    }
+
+    #[test]
+    fn several_windows_round_trip() {
+        let name = "zmux-unit-windows";
+        let mut s = snapshot(name);
+        s.windows.push(Layout::new(PaneId(7)));
+        s.windows.select(0);
+        save(&s).expect("save");
+        let back = load(name).expect("load");
+        assert_eq!(back.windows.len(), 2);
+        assert_eq!(back.windows.index(), 0, "the current window is part of the state");
+        assert_eq!(back.windows.panes().len(), 3);
+        remove(name);
+    }
+
+    /// Upgrading must not silently discard the arrangement someone was using.
+    #[test]
+    fn a_v1_file_is_migrated_to_one_window() {
+        let name = "zmux-unit-v1";
+        std::fs::create_dir_all(state_dir()).ok();
+        let v1 = format!(
+            r#"{{"version":1,"name":"{name}","root":{{"Leaf":3}},"focus":3,"cwds":{{"3":"C:\\v1"}}}}"#
+        );
+        std::fs::write(path_for(name), v1).expect("write v1 file");
+        let back = load(name).expect("a v1 file must still be readable");
+        assert_eq!(back.windows.len(), 1, "a v1 session is one window");
+        assert_eq!(back.windows.current().panes(), vec![PaneId(3)]);
+        assert_eq!(back.cwds.get(&3).map(String::as_str), Some(r"C:\v1"),
+                   "directories are the point of persistence; they must survive the upgrade");
+        remove(name);
     }
 
     #[test]
@@ -125,6 +186,21 @@ mod tests {
         std::fs::create_dir_all(state_dir()).ok();
         std::fs::write(super::path_for(name), b"{ this is not json").ok();
         assert!(load(name).is_none());
+        remove(name);
+    }
+
+    /// A file can name a window that does not exist. Indexing it would panic
+    /// on the first frame, taking the daemon down at startup.
+    #[test]
+    fn an_out_of_range_current_window_is_repaired_not_trusted() {
+        let name = "zmux-unit-badcurrent";
+        std::fs::create_dir_all(state_dir()).ok();
+        let bad = format!(
+            r#"{{"version":2,"name":"{name}","windows":{{"list":[{{"root":{{"Leaf":4}},"focus":4}}],"current":9}},"cwds":{{}}}}"#
+        );
+        std::fs::write(path_for(name), bad).expect("write");
+        let back = load(name).expect("repairable, not discarded");
+        assert_eq!(back.windows.index(), 0);
         remove(name);
     }
 

@@ -206,7 +206,20 @@ impl Client {
     }
 
     /// Collect frames until one satisfies `pred`, or the deadline passes.
+    ///
+    /// Checks the screen we ALREADY hold before blocking. The daemon sends
+    /// nothing while nothing changes, so once a screen has settled there is no
+    /// further frame to absorb - and waiting for a condition that is already
+    /// true waits the full deadline and then fails. That is not hypothetical:
+    /// it made the daemon-restart test fail under load and pass in isolation,
+    /// purely because a slower restore let both restored shells finish drawing
+    /// before the client attached.
     pub fn wait_for(&mut self, secs: u64, pred: impl Fn(&str) -> bool) -> Option<String> {
+        if let Some(now) = self.frame.as_ref().map(text_of) {
+            if pred(&now) {
+                return Some(now);
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut last = String::new();
         while Instant::now() < deadline {

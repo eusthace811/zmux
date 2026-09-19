@@ -5,11 +5,12 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–5 complete. 82 tests passing, clippy clean.
+Phases 0–6 complete. 117 tests passing, clippy clean.
 
 | | |
 | --- | --- |
 | Split panes | horizontal + vertical, BSP tiling, drag-free resize |
+| Windows | several screenfuls per session; hidden ones keep running |
 | Persistence | detach and reattach; layout and directories survive a daemon restart |
 | Scrollback | per pane, with mouse wheel and a scroll mode |
 | cwd tracking | OSC 7; new panes inherit the focused pane's directory |
@@ -38,7 +39,9 @@ zmux kill work          terminate a session
 | --- | --- |
 | `C-b d` | detach (the session keeps running) |
 | `C-b %` / `C-b "` | split left/right, top/bottom |
-| `C-b x` | close pane |
+| `C-b c` | new window |
+| `C-b n` / `C-b p` | next / previous window (wraps) |
+| `C-b x` | close pane — and its window, if it was the last one |
 | `C-b <arrow>` | move focus |
 | `C-b C-<arrow>` | resize |
 | `C-b [` | scroll mode (`q`/`Esc` to leave) |
@@ -54,13 +57,14 @@ zmux kill work          terminate a session
 | `src/pty.rs` | ConPTY via `portable-pty`; Git Bash fingerprint; reader thread; explicit teardown. |
 | `src/term.rs` | `vt100` + **terminal query responder** + scrollback. |
 | `src/layout.rs` | BSP tiling tree. |
+| `src/windows.rs` | Several layouts per session. A window **is** a `Layout`. |
 | `src/render.rs` | vt100 cells → composited `Frame` → ratatui `Buffer`. |
 | `src/session.rs` | Owns panes, layout and clients. Outlives any connection. |
 | `src/persist.rs` | Layout + cwd to `%APPDATA%`. |
 | `src/cwd.rs` | OSC 7 parsing and the bash integration snippet. |
 | `src/config.rs` | `config.toml`. |
 
-## Five things that will bite you if you change them
+## Six things that will bite you if you change them
 
 **1. Terminal query replies are mandatory.** ConPTY is created with
 `PSEUDOCONSOLE_INHERIT_CURSOR` and emits `ESC[6n` at startup. Unanswered, the
@@ -84,6 +88,14 @@ blocks in `read()` until the pseudoconsole closes. Joining first deadlocks.
 `portable-pty` probes for `conpty.dll` by bare name, and unlike `kernel32.dll`
 that is not a KnownDLL — a planted file would execute in-process. A test proves
 the mitigation rather than assuming it.
+
+**6. The waiter thread and `close()` share ONE child handle.** They used to
+hold separate slots, and the constructor filled `Pane::child` by *taking* the
+child out of the waiter's — so the waiter found `None` on its first tick and
+returned, and `PtyEvent::Exited` could never fire for any pane. Typing `exit`
+left a dead pane on screen and a session whose last shell had gone lingered
+until its idle timeout. Nothing typed `exit` in the suite, so it went unseen;
+two tests now do.
 
 ## Tests
 
@@ -112,6 +124,8 @@ sustained output, attach/detach churn, many splits, and malformed input.
   the name. `FILE_FLAG_FIRST_PIPE_INSTANCE` would close this; `interprocess`
   does not expose it.
 - **Session names are sanitised lossily**, so `a/b` and `a_b` collide.
+- **Windows are positional**, so closing one renumbers those after it. tmux
+  leaves a gap instead. There are no window names and no `C-b <digit>`.
 - **Queues are bounded by message count, not bytes.**
 
 ## One more thing that will bite you

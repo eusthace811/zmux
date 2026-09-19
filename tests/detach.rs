@@ -61,6 +61,15 @@ fn reattaching_at_a_different_size_resizes_the_pty() {
     std::thread::sleep(std::time::Duration::from_millis(600));
 
     let mut c2 = d.attach(100, 30);
+    // Wait for a frame that IS 100 columns wide rather than trusting the sleep
+    // above. The session only widens once the 80-column client is gone, and
+    // under load that takes longer than any fixed delay - typing `tput cols`
+    // too early gets a truthful answer of 80 and fails the test.
+    assert!(
+        c2.wait_for(20, |t| t.lines().next().is_some_and(|l| l.chars().count() == 100))
+            .is_some(),
+        "the session never resized to the reattaching client's 100 columns"
+    );
     // `tput cols` reports what the pty believes, which is what we changed.
     c2.input("tput cols\r");
     assert!(
