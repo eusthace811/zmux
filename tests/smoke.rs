@@ -5,7 +5,7 @@ mod common;
 use common::Daemon;
 
 use zmux::ipc;
-use zmux::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use zmux::protocol::{ClientMsg, ServerMsg};
 
 #[test]
 fn daemon_runs_git_bash_and_renders_output() {

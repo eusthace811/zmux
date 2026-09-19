@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{bail, Result};
@@ -21,6 +21,9 @@ use crate::term::Term;
 
 use crate::config::Config;
 
+/// A live session plus the channel its panes report on.
+pub type SessionHandle = (Arc<Session>, Receiver<(PaneId, PtyEvent)>);
+
 pub struct PaneState {
     pub term: Arc<Mutex<Term>>,
     pub pty: Arc<Pane>,
@@ -30,6 +33,9 @@ pub struct PaneState {
 /// without limit. When the queue is full the client is dropped: a peer that is
 /// this far behind is not usefully attached any more.
 const CLIENT_QUEUE: usize = 64;
+
+/// Bounded for the same reason as the per-pane queue.
+const EVENT_QUEUE: usize = 512;
 
 struct Client {
     id: u64,
@@ -63,7 +69,7 @@ pub struct Session {
     /// changes geometry now holds this for the whole read-compute-apply.
     geometry: Mutex<()>,
     /// Pane lifecycle events, tagged with which pane they came from.
-    events_tx: Sender<(PaneId, PtyEvent)>,
+    events_tx: SyncSender<(PaneId, PtyEvent)>,
     pub cfg: Config,
 }
 
@@ -93,9 +99,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Session {
-    pub fn new(name: &str, cols: u16, rows: u16) -> Result<(Arc<Self>, Receiver<(PaneId, PtyEvent)>)> {
+    pub fn new(name: &str, cols: u16, rows: u16) -> Result<SessionHandle> {
         let (cols, rows) = clamp_size(cols, rows);
-        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        // Bounded: forwarding each pane's bounded queue into an unbounded one
+        // would defeat the bound entirely.
+        let (events_tx, events_rx) = std::sync::mpsc::sync_channel(EVENT_QUEUE);
         let restored = restore_layout(name);
         let layout = match &restored {
             Some((l, _)) => l.clone(),
@@ -121,6 +129,7 @@ impl Session {
         for (id, rect) in rects {
             let dir = cwds
                 .get(&id.0)
+                .filter(|d| crate::cwd::is_safe_local_dir(d))
                 .map(std::path::PathBuf::from)
                 .filter(|p| p.is_dir());
             if let Err(e) = session.spawn_pane_in(id, rect.w, rect.h, dir) {
@@ -179,6 +188,11 @@ impl Session {
         let panes = lock(&self.panes);
         let p = panes.get(&id)?;
         let dir = lock(&p.term).cwd_windows()?;
+        // Check the STRING before touching the filesystem: is_dir() on a UNC
+        // path makes Windows negotiate SMB with a host the pane chose.
+        if !crate::cwd::is_safe_local_dir(&dir) {
+            return None;
+        }
         let path = std::path::PathBuf::from(dir);
         path.is_dir().then_some(path)
     }
@@ -296,13 +310,15 @@ impl Session {
         let removed = { lock(&self.layout).close_focused() };
         match removed {
             Some(id) => {
-                // Explicit close so the ConPTY is torn down and its threads
-                // joined, rather than relying on drop order (DESIGN.md §2.5).
-                if let Some(p) = lock(&self.panes).remove(&id) {
-                    p.pty.close();
-                }
+                let pane = lock(&self.panes).remove(&id);
                 self.reflow_locked();
                 drop(_g);
+                // Close OUTSIDE the geometry lock. ClosePseudoConsole can hang
+                // on pre-24H2 Windows, and holding `geometry` across it would
+                // freeze every layout and resize operation in the session.
+                if let Some(p) = pane {
+                    std::thread::spawn(move || p.pty.close());
+                }
                 self.save_state();
                 true
             }
@@ -326,10 +342,12 @@ impl Session {
                 l.set_focus(previous);
             }
         }
-        if let Some(p) = lock(&self.panes).remove(&id) {
-            p.pty.close();
-        }
+        let pane = lock(&self.panes).remove(&id);
         self.reflow_locked();
+        drop(_g);
+        if let Some(p) = pane {
+            std::thread::spawn(move || p.pty.close());
+        }
         false
     }
 
@@ -551,14 +569,28 @@ impl Session {
             (l.len(), l.focus().0)
         };
         let scrolled = if self.focused_is_scrolled() { " | SCROLL" } else { "" };
-        format!(
+        let width = self.size().0 as usize;
+
+        // Drop the least useful parts first rather than letting the whole line
+        // be truncated. On a narrow pane the old format showed a clipped
+        // session name and nothing else - the pane count, which is what you
+        // actually need, fell off the end.
+        let full = format!(
             " {} | {} pane{} | pane {}{} ",
             self.name,
             n,
             if n == 1 { "" } else { "s" },
             focus,
             scrolled
-        )
+        );
+        if full.chars().count() <= width {
+            return full;
+        }
+        let medium = format!(" {} pane{} | pane {}{} ", n, if n == 1 { "" } else { "s" }, focus, scrolled);
+        if medium.chars().count() <= width {
+            return medium;
+        }
+        format!(" {n}p{scrolled} ")
     }
 
     pub fn snapshot(&self) -> Frame {

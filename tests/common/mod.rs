@@ -47,11 +47,17 @@ impl Daemon {
 
     fn spawn(session: &str, preserve_state: bool) -> Self {
         // A leftover daemon from a previous run would silently serve the test.
+        // The daemon now refuses to start when one is already listening, so
+        // wait for the old one to actually go rather than racing it.
         if ipc::is_running(session) {
             if let Ok(mut s) = ipc::connect(session) {
                 let _ = ipc::write_msg(&mut s, &ClientMsg::Shutdown);
             }
-            std::thread::sleep(Duration::from_millis(300));
+            let gone = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < gone && ipc::is_running(session) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(!ipc::is_running(session), "a previous daemon for {session} would not exit");
         }
         // Null ALL of the daemon's stdio. Inheriting the harness's pipes means
         // the daemon - and every bash it spawns - holds them open, so cargo
@@ -106,6 +112,13 @@ impl Drop for Daemon {
                 Err(_) => break,
             }
         }
+        // Reaching here means the daemon ignored a clean Shutdown for five
+        // seconds. That is a teardown bug, so make it loud rather than
+        // quietly killing the process and letting the suite stay green.
+        eprintln!(
+            "WARNING: daemon for session {session} did not exit on Shutdown; killing it. \
+             This hides teardown deadlocks - investigate."
+        );
         let _ = self.child.kill();
         let _ = self.child.wait();
         if !preserve {
@@ -214,8 +227,25 @@ impl Client {
         None
     }
 
-    /// The most recent frame, after letting things settle.
+    /// The most recent screen, after letting updates settle.
+    ///
+    /// Drains everything currently queued rather than returning the first
+    /// message to arrive - the previous version returned the OLDEST pending
+    /// update while claiming to be the newest.
     pub fn current(&mut self, secs: u64) -> Option<String> {
-        self.wait_for(secs, |_| true)
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut latest = None;
+        // Take at least one update, then drain whatever else is already there.
+        while Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(300)) {
+                Ok(msg) => {
+                    if let Some(s) = self.absorb(msg) {
+                        latest = Some(s);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        latest.or_else(|| self.frame.as_ref().map(text_of))
     }
 }

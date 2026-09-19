@@ -116,6 +116,7 @@ fn main() -> Result<()> {
 }
 
 fn attach(session: String) -> Result<()> {
+    let cfg = zmux::config::Config::load();
 
     if !ipc::is_running(&session) {
         eprintln!("starting daemon...");
@@ -163,19 +164,26 @@ fn attach(session: String) -> Result<()> {
         // Input. Ctrl-b is the prefix, as in tmux.
         if event::poll(Duration::from_millis(8))? {
             match event::read()? {
-                Event::Key(k) if is_prefix(&k) => match read_prefix_command()? {
+                Event::Key(k) if is_prefix(&k, &cfg) => match read_prefix_command(&cfg)? {
                     Prefix::Detach => {
                         ipc::write_msg(&mut stream, &ClientMsg::Detach)?;
                         break;
                     }
-                    Prefix::Scroll => scroll_mode(&mut stream)?,
+                    Prefix::Scroll => {
+                        if !scroll_mode(&mut stream)? {
+                            drop(_guard);
+                            eprintln!("lost connection to the daemon");
+                            return Ok(());
+                        }
+                    }
                     Prefix::Command(cmd) => {
                         ipc::write_msg(&mut stream, &ClientMsg::Command(cmd))?;
                     }
                     // A doubled prefix sends a literal Ctrl-b to the pane, so
                     // the shortcut stays reachable inside programs that use it.
                     Prefix::Literal => {
-                        ipc::write_msg(&mut stream, &ClientMsg::Input { data: vec![0x02] })?;
+                        ipc::write_msg(&mut stream,
+                            &ClientMsg::Input { data: vec![cfg.prefix_byte()] })?;
                     }
                     Prefix::Ignore => {}
                 },
@@ -209,7 +217,12 @@ fn attach(session: String) -> Result<()> {
         loop {
             match frame_rx.try_recv() {
                 Ok(ServerMsg::Frame(f)) => {
-                    if f.revision >= seen_revision {
+                    // Strictly newer, or the first frame we have seen. An
+                    // EQUAL revision means a queued frame from before an
+                    // attach snapshot, which would move the screen backwards.
+                    if !f.is_well_formed() {
+                        eprintln!("discarding a malformed frame from the daemon");
+                    } else if latest.is_none() || f.revision > seen_revision {
                         seen_revision = f.revision;
                         latest = Some(f);
                     }
@@ -260,8 +273,9 @@ fn attach(session: String) -> Result<()> {
     Ok(())
 }
 
-fn is_prefix(k: &KeyEvent) -> bool {
-    k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL)
+fn is_prefix(k: &KeyEvent, cfg: &zmux::config::Config) -> bool {
+    k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&cfg.prefix))
 }
 
 enum Prefix {
@@ -276,7 +290,7 @@ enum Prefix {
 /// Read the key following the prefix and map it to an action.
 ///
 /// Bindings follow tmux so muscle memory transfers.
-fn read_prefix_command() -> Result<Prefix> {
+fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
     // Bounded wait: a prefix followed by nothing must not wedge the client.
     if !event::poll(Duration::from_millis(2000))? {
         return Ok(Prefix::Ignore);
@@ -285,7 +299,7 @@ fn read_prefix_command() -> Result<Prefix> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     Ok(match k.code {
         KeyCode::Char('d') => Prefix::Detach,
-        KeyCode::Char('b') if ctrl => Prefix::Literal,
+        KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&cfg.prefix) => Prefix::Literal,
         KeyCode::Char('%') => Prefix::Command(Cmd::SplitHorizontal),
         KeyCode::Char('"') => Prefix::Command(Cmd::SplitVertical),
         KeyCode::Char('x') => Prefix::Command(Cmd::ClosePane),
@@ -309,7 +323,10 @@ fn read_prefix_command() -> Result<Prefix> {
 /// Blocking here keeps the mode explicit and avoids threading a mode flag
 /// through the main loop, at the cost of not repainting while scrolling - the
 /// daemon still pushes frames, which the next loop iteration drains.
-fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<()> {
+/// Returns false if the connection died while we were in scroll mode - the
+/// main loop watches the frame channel, but this one has its own input loop
+/// and would otherwise spin forever in raw alternate-screen mode.
+fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<bool> {
     loop {
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -317,8 +334,8 @@ fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<()> {
         let cmd = match event::read()? {
             Event::Key(k) => match k.code {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
-                    ipc::write_msg(stream, &ClientMsg::Command(Cmd::ScrollToBottom))?;
-                    return Ok(());
+                    return Ok(ipc::write_msg(stream,
+                        &ClientMsg::Command(Cmd::ScrollToBottom)).is_ok());
                 }
                 KeyCode::Up | KeyCode::Char('k') => Cmd::ScrollUp,
                 KeyCode::Down | KeyCode::Char('j') => Cmd::ScrollDown,
@@ -326,8 +343,8 @@ fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<()> {
                 KeyCode::PageDown => Cmd::ScrollPageDown,
                 KeyCode::Home => Cmd::ScrollPageUp,
                 KeyCode::End => {
-                    ipc::write_msg(stream, &ClientMsg::Command(Cmd::ScrollToBottom))?;
-                    return Ok(());
+                    return Ok(ipc::write_msg(stream,
+                        &ClientMsg::Command(Cmd::ScrollToBottom)).is_ok());
                 }
                 _ => continue,
             },
@@ -337,12 +354,17 @@ fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<()> {
                 _ => continue,
             },
             Event::Resize(c, r) => {
-                ipc::write_msg(stream, &ClientMsg::Resize { cols: c, rows: r })?;
+                if ipc::write_msg(stream, &ClientMsg::Resize { cols: c, rows: r }).is_err() {
+                    return Ok(false);
+                }
                 continue;
             }
             _ => continue,
         };
-        ipc::write_msg(stream, &ClientMsg::Command(cmd))?;
+        // A failed write is how we notice the daemon has gone.
+        if ipc::write_msg(stream, &ClientMsg::Command(cmd)).is_err() {
+            return Ok(false);
+        }
     }
 }
 

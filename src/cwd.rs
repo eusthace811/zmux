@@ -79,9 +79,9 @@ __zmux_osc7
 /// the shell reported it; conversion to a Windows path is the caller's job.
 pub fn parse_osc7(payload: &str) -> Option<String> {
     let rest = match payload.strip_prefix("file://") {
-        Some(r) => match r.find('/') {
-            Some(i) => &r[i..], // skip the host component
-            None => return None,
+        Some(r) => {
+            let i = r.find('/')?;
+            &r[i..]
         },
         None if payload.starts_with('/') => payload,
         None => return None,
@@ -126,6 +126,25 @@ pub fn msys_to_windows(p: &str) -> String {
     rest.replace('/', "\\")
 }
 
+/// True only for a plain local drive path like `C:\work`.
+///
+/// ANY program in a pane can emit OSC 7, including a hostile one. A value such
+/// as `file://h//server/share` becomes a UNC path, and merely calling
+/// `is_dir()` on it makes Windows reach out over SMB and negotiate
+/// credentials. Automatic cwd reuse is therefore restricted to local drives.
+pub fn is_safe_local_dir(p: &str) -> bool {
+    let b = p.as_bytes();
+    if b.len() < 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return false;
+    }
+    if b[2] != b'\\' && b[2] != b'/' {
+        return false;
+    }
+    // Reject UNC-ish and relative escapes outright rather than reasoning about
+    // how Windows will normalise them.
+    !p.contains("\\\\") && !p.contains("..")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +184,25 @@ mod tests {
         assert_eq!(msys_to_windows("/c/work/x"), r"C:\work\x");
         assert_eq!(msys_to_windows("/c"), r"C:\");
         assert_eq!(msys_to_windows("/cygdrive/d/tmp"), r"D:\tmp");
+    }
+
+    #[test]
+    fn only_local_drive_paths_are_reused() {
+        assert!(is_safe_local_dir(r"C:\work"));
+        assert!(is_safe_local_dir(r"D:\"));
+        // A pane can emit any OSC 7 it likes; touching a UNC path would make
+        // Windows negotiate SMB credentials with an attacker-chosen host.
+        assert!(!is_safe_local_dir(r"\\server\share"));
+        assert!(!is_safe_local_dir(r"C:\a\\\\server\share"));
+        assert!(!is_safe_local_dir(r"C:\work\..\..\Windows"));
+        assert!(!is_safe_local_dir("/usr/bin"));
+        assert!(!is_safe_local_dir(""));
+    }
+
+    #[test]
+    fn a_unc_osc7_payload_does_not_become_a_reusable_path() {
+        let p = parse_osc7("file://h//server/share").expect("parses");
+        assert!(!is_safe_local_dir(&msys_to_windows(&p)), "UNC path was accepted");
     }
 
     #[test]

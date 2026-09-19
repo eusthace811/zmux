@@ -46,10 +46,7 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
 /// cannot make us reserve an arbitrary buffer.
 pub fn read_msg<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>> {
     let mut len_buf = [0u8; 4];
-    match read_exact_or_eof(r, &mut len_buf)? {
-        false => return Ok(None),
-        true => {}
-    }
+    if !read_exact_or_eof(r, &mut len_buf)? { return Ok(None) }
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_FRAME_BYTES {
         bail!("incoming frame {len} exceeds MAX_FRAME_BYTES {MAX_FRAME_BYTES}");

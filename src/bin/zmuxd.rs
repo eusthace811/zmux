@@ -18,14 +18,17 @@ use zmux::protocol::{Cmd, ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use zmux::pty::PtyEvent;
 use zmux::session::Session;
 
-/// How long an idle daemon lingers with no clients before exiting.
-/// `None` would mean "forever"; a bounded default avoids orphaned daemons.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 8);
-
 fn main() -> Result<()> {
     let session_name = std::env::args().nth(1).unwrap_or_else(|| "default".into());
     eprintln!("[zmuxd] session={session_name}");
 
+    // Windows allows MULTIPLE instances of the same named pipe, so without
+    // this two daemons can serve one session name and clients land on
+    // whichever answers first - with different panes behind each.
+    if ipc::is_running(&session_name) {
+        eprintln!("[zmuxd] session '{session_name}' is already served by another daemon");
+        return Ok(());
+    }
     let listener = ipc::listen(&session_name)?;
     eprintln!("[zmuxd] listening on {}", ipc::pipe_name(&session_name));
 
@@ -41,13 +44,15 @@ fn main() -> Result<()> {
     // Exit once the pane is gone, or after a long idle with nobody attached.
     {
         let s = Arc::clone(&session);
+        let idle_timeout = Duration::from_secs(session.cfg.idle_timeout_hours * 3600);
+        let wake_name = session_name.clone();
         std::thread::spawn(move || {
             let mut idle_since: Option<std::time::Instant> = None;
             while s.running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(5));
                 if s.client_count() == 0 {
                     let since = idle_since.get_or_insert_with(std::time::Instant::now);
-                    if since.elapsed() > IDLE_TIMEOUT {
+                    if since.elapsed() > idle_timeout {
                         eprintln!("[zmuxd] idle timeout, exiting");
                         s.shutdown();
                     }
@@ -55,6 +60,10 @@ fn main() -> Result<()> {
                     idle_since = None;
                 }
             }
+            // The main thread is blocked in accept(); shutting the session
+            // down does not wake it. Without this the "idle exit" leaves a
+            // listening orphan forever.
+            let _ = ipc::connect(&wake_name);
         });
     }
 

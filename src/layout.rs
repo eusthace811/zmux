@@ -161,8 +161,8 @@ impl Layout {
     pub fn split(&mut self, dir: Dir, area: Rect, new_id: PaneId) -> Option<PaneId> {
         let current = self.rect_of(self.focus, area)?;
         let fits = match dir {
-            Dir::Horizontal => current.w >= MIN_COLS * 2 + 1,
-            Dir::Vertical => current.h >= MIN_ROWS * 2 + 1,
+            Dir::Horizontal => current.w > MIN_COLS * 2,
+            Dir::Vertical => current.h > MIN_ROWS * 2,
         };
         if !fits {
             return None;
@@ -338,6 +338,12 @@ fn adjust_ratio(
             Dir::Horizontal => MIN_COLS as f32 / span as f32,
             Dir::Vertical => MIN_ROWS as f32 / span as f32,
         };
+        // f32::clamp panics when lo > hi or either bound is NaN. Both happen
+        // in a viewport too small for two minimum-size panes, which is exactly
+        // when a user is most likely to be dragging a divider around.
+        if !min.is_finite() || min >= 0.5 {
+            return false;
+        }
         let next = (*ratio + sign * delta).clamp(min, 1.0 - min);
         if (next - *ratio).abs() < f32::EPSILON {
             return false;
@@ -361,10 +367,16 @@ fn split_rects(dir: Dir, ratio: f32, area: Rect) -> (Rect, Rect) {
     match dir {
         Dir::Horizontal => {
             let usable = area.w.saturating_sub(1);
-            let aw = ((usable as f32 * ratio).round() as u16).clamp(
-                MIN_COLS.min(usable),
-                usable.saturating_sub(MIN_COLS.min(usable)),
-            );
+            // `clamp(lo, hi)` PANICS when lo > hi, which happens as soon as the
+            // area is too small to hold two minimum-width panes - reachable by
+            // shrinking an existing split, not just by creating one.
+            let lo = MIN_COLS.min(usable);
+            let hi = usable.saturating_sub(lo);
+            let aw = if lo > hi {
+                usable / 2 // too small for the minimum; split evenly and let it be ugly
+            } else {
+                ((usable as f32 * ratio).round() as u16).clamp(lo, hi)
+            };
             (
                 Rect::new(area.x, area.y, aw, area.h),
                 Rect::new(area.x + aw + 1, area.y, usable.saturating_sub(aw), area.h),
@@ -372,10 +384,13 @@ fn split_rects(dir: Dir, ratio: f32, area: Rect) -> (Rect, Rect) {
         }
         Dir::Vertical => {
             let usable = area.h.saturating_sub(1);
-            let ah = ((usable as f32 * ratio).round() as u16).clamp(
-                MIN_ROWS.min(usable),
-                usable.saturating_sub(MIN_ROWS.min(usable)),
-            );
+            let lo = MIN_ROWS.min(usable);
+            let hi = usable.saturating_sub(lo);
+            let ah = if lo > hi {
+                usable / 2
+            } else {
+                ((usable as f32 * ratio).round() as u16).clamp(lo, hi)
+            };
             (
                 Rect::new(area.x, area.y, area.w, ah),
                 Rect::new(area.x, area.y + ah + 1, area.w, usable.saturating_sub(ah)),
@@ -516,6 +531,33 @@ mod tests {
         l.split(Dir::Horizontal, area(), PaneId(2)).unwrap();
         assert_eq!(l.pane_at(area(), 2, 2), Some(PaneId(1)));
         assert_eq!(l.pane_at(area(), 78, 2), Some(PaneId(2)));
+    }
+
+    /// `clamp(lo, hi)` panics when lo > hi. Creating a split in a tiny area is
+    /// refused, but SHRINKING an existing one walks straight into it.
+    #[test]
+    fn shrinking_a_split_below_the_minimum_does_not_panic() {
+        let mut l = Layout::new(PaneId(1));
+        l.split(Dir::Horizontal, area(), PaneId(2)).unwrap();
+        // Squeeze the viewport well past what two panes can occupy.
+        for w in (1..=20).rev() {
+            let tiny = Rect::new(0, 0, w, 24);
+            let _ = l.compute(tiny);
+            let _ = l.resize_focused(Nav::Left, tiny, 1);
+            let _ = l.focus_dir(Nav::Right, tiny);
+        }
+        for h in (1..=8).rev() {
+            let tiny = Rect::new(0, 0, 80, h);
+            let _ = l.compute(tiny);
+        }
+    }
+
+    #[test]
+    fn a_split_layout_in_a_one_cell_area_still_computes() {
+        let mut l = Layout::new(PaneId(1));
+        l.split(Dir::Vertical, area(), PaneId(2)).unwrap();
+        let (panes, _) = l.compute(Rect::new(0, 0, 1, 1));
+        assert_eq!(panes.len(), 2, "every leaf must still get a rect");
     }
 
     /// The bug from DESIGN.md §2.2 that this module exists to avoid.

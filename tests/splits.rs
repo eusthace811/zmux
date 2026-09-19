@@ -82,13 +82,22 @@ fn each_pane_gets_its_own_pty_size() {
     c.cmd(Cmd::SplitHorizontal);
     assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some());
 
-    // Each pane is about half of 100 columns, so neither should still be 100.
-    c.input("tput cols\r");
-    let screen = c.wait_for(20, |t| t.contains("4") || t.contains("5"))
+    // Ask for an unambiguous marker rather than a bare number: a prompt or a
+    // path contains "4" or "5" too, so the old check could pass before tput
+    // had produced anything at all.
+    c.input("echo COLS=$(tput cols)\r");
+    let screen = c
+        .wait_for(20, |t| t.contains("COLS=") && t.matches("COLS=").count() >= 2)
         .expect("pane never reported its width");
+    let reported: Vec<u16> = screen
+        .match_indices("COLS=")
+        .filter_map(|(i, _)| screen[i + 5..].split_whitespace().next())
+        .filter_map(|v| v.parse::<u16>().ok())
+        .collect();
+    assert!(!reported.is_empty(), "no numeric width in:\n{screen}");
     assert!(
-        !screen.contains("100"),
-        "pane still believes it is full width; ConPTY was not resized:\n{screen}"
+        reported.iter().all(|&w| w < 100 && w > 0),
+        "pane still believes it is full width; ConPTY was not resized: {reported:?}"
     );
 }
 
@@ -115,9 +124,18 @@ fn splits_survive_detach_and_reattach() {
 #[test]
 fn a_too_small_terminal_refuses_to_split() {
     let d = Daemon::start("zmux-test-tiny");
-    let mut c = d.attach(12, 6); // below MIN_COLS*2+1
+    let mut c = d.attach(16, 6); // below MIN_COLS*2+1 = 17
+    assert!(c.wait_for(20, |t| !t.trim().is_empty()).is_some(), "no frame arrived");
     c.cmd(Cmd::SplitHorizontal);
-    std::thread::sleep(std::time::Duration::from_millis(600));
-    // Still alive and still one pane: a refused split must not spawn a pty.
-    assert!(ipc::is_running(&d.session));
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    // Assert the split was REFUSED, not merely that we survived it. The
+    // divider is the width-independent signal: a status line is truncated on a
+    // terminal this narrow.
+    let screen = c.current(5).unwrap_or_default();
+    assert!(
+        !screen.contains('│'),
+        "a split that cannot fit must be refused, not spawned:\n{screen}"
+    );
+    assert!(ipc::is_running(&d.session), "the daemon should still be healthy");
 }

@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change. Handshake rejects a mismatch.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2 added `ServerMsg::Delta`. An old v1 client would accept the handshake and
+/// then fail to decode the new variant, so the version MUST move with the wire.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -105,6 +107,16 @@ pub struct FrameDelta {
 }
 
 impl Frame {
+    /// True when the cell count matches the declared geometry.
+    ///
+    /// A frame is peer-supplied data. A short `cells` vector would index out
+    /// of bounds during painting, so it is checked before anything reads it.
+    pub fn is_well_formed(&self) -> bool {
+        self.cells.len() == self.cols as usize * self.rows as usize
+            && self.cols <= MAX_COLS
+            && self.rows <= MAX_ROWS
+    }
+
     /// Rows that differ from `prev`, or `None` when the geometry changed and a
     /// delta would be meaningless.
     pub fn delta_from(&self, prev: &Frame) -> Option<FrameDelta> {
@@ -138,10 +150,16 @@ impl Frame {
             return false;
         }
         let w = self.cols as usize;
+        // Validate EVERY row before mutating any of them. Checking as we go
+        // would leave the frame half-updated when a later row is malformed -
+        // exactly the corrupted screen the base check exists to prevent.
+        if d.rows_changed
+            .iter()
+            .any(|(r, cells)| (*r as usize) >= self.rows as usize || cells.len() != w)
+        {
+            return false;
+        }
         for (r, cells) in &d.rows_changed {
-            if (*r as usize) >= self.rows as usize || cells.len() != w {
-                return false;
-            }
             self.cells[*r as usize * w..(*r as usize + 1) * w].clone_from_slice(cells);
         }
         self.cursor = d.cursor;
