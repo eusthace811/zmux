@@ -104,6 +104,7 @@ pub struct FrameDelta {
     /// (row index, that row's cells).
     pub rows_changed: Vec<(u16, Vec<Cell>)>,
     pub cursor: Option<(u16, u16)>,
+    pub app_cursor: bool,
 }
 
 impl Frame {
@@ -139,6 +140,7 @@ impl Frame {
             rows: self.rows,
             rows_changed,
             cursor: self.cursor,
+            app_cursor: self.app_cursor,
         })
     }
 
@@ -163,6 +165,7 @@ impl Frame {
             self.cells[*r as usize * w..(*r as usize + 1) * w].clone_from_slice(cells);
         }
         self.cursor = d.cursor;
+        self.app_cursor = d.app_cursor;
         self.revision = d.revision;
         true
     }
@@ -202,6 +205,12 @@ pub struct Frame {
     pub cells: Vec<Cell>,
     /// (col, row) of the cursor, if it should be shown.
     pub cursor: Option<(u16, u16)>,
+    /// Whether the focused pane has DECCKM set (application cursor keys).
+    ///
+    /// Only the daemon's vt100 state knows this, but the CLIENT encodes keys,
+    /// so it has to travel. Without it arrows are wrong in vim and in
+    /// readline's vi mode.
+    pub app_cursor: bool,
     /// Monotonic session revision this frame was composed at.
     ///
     /// Arrival order is not trustworthy: a queued broadcast can be delivered
@@ -218,6 +227,7 @@ impl Frame {
             rows,
             cells: vec![Cell::default(); cols as usize * rows as usize],
             cursor: None,
+            app_cursor: false,
             revision: 0,
         }
     }

@@ -122,6 +122,7 @@ fn a_delta_against_an_unknown_base_is_refused() {
         rows: 3,
         rows_changed: vec![(0, vec![Default::default(); 10])],
         cursor: None,
+        app_cursor: false,
     };
     assert!(!f.apply_delta(&bogus), "applied a delta with the wrong base");
     assert_eq!(f.revision, 7, "a refused delta must not mutate the frame");
@@ -140,6 +141,59 @@ fn a_delta_with_mismatched_geometry_is_refused() {
         rows: 3,
         rows_changed: vec![(0, vec![Default::default(); 20])],
         cursor: None,
+        app_cursor: false,
     };
     assert!(!f.apply_delta(&wrong));
+}
+
+/// Keys that the Phase 1 encoder could not represent must actually reach the
+/// shell. Ctrl-C is the one users notice first.
+#[test]
+fn control_c_interrupts_a_running_command() {
+    let d = Daemon::start("zmux-test-ctrlc");
+    let mut c = d.attach_ready(100, 24);
+
+    // The marker is split by shell quoting so the ECHOED COMMAND LINE does not
+    // contain it - only the command's OUTPUT would. A naive marker matches the
+    // line the user typed and reports failure even when Ctrl-C worked
+    // perfectly, which is exactly what happened the first time this was
+    // written.
+    c.input("sleep 60; echo SHOULD_NOT''_PRINT\r");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    c.send(&ClientMsg::Input { data: vec![0x03] }); // Ctrl-C
+
+    // The prompt must come back well before `sleep 60` could have ended.
+    let screen = c
+        .wait_for(20, |t| t.matches('$').count() >= 2)
+        .expect("Ctrl-C did not interrupt the command");
+    assert!(
+        !screen.contains("SHOULD_NOT_PRINT"),
+        "the command ran to completion instead of being interrupted:\n{screen}"
+    );
+}
+
+/// Alt-based word motion is readline's, and the old encoder dropped it
+/// entirely.
+#[test]
+fn alt_keys_reach_the_shell_as_escape_prefixed_bytes() {
+    let d = Daemon::start("zmux-test-altkeys");
+    let mut c = d.attach_ready(100, 24);
+
+    // Type a line, then Alt-b (back one word) and insert a marker mid-line.
+    c.input("echo alpha bravo");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    c.send(&ClientMsg::Input { data: b"\x1bb".to_vec() }); // Alt-b
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    c.input("X");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    c.input("\r");
+
+    // If Alt-b worked the X lands before "bravo"; otherwise at the end.
+    let screen = c
+        .wait_for(20, |t| t.contains("alpha Xbravo") || t.contains("alpha bravoX"))
+        .expect("neither outcome appeared");
+    assert!(
+        screen.contains("alpha Xbravo"),
+        "Alt-b did not reach readline as a word motion:\n{screen}"
+    );
 }

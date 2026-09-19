@@ -19,6 +19,8 @@ use zmux::pty::PtyEvent;
 use zmux::session::Session;
 
 fn main() -> Result<()> {
+    // Before anything that could trigger a LoadLibrary (see harden.rs).
+    zmux::harden::restrict_dll_search_path();
     let session_name = std::env::args().nth(1).unwrap_or_else(|| "default".into());
     eprintln!("[zmuxd] session={session_name}");
 

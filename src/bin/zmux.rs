@@ -74,6 +74,8 @@ In a session (Ctrl-b is the prefix):
   C-b C-b        send a literal Ctrl-b";
 
 fn main() -> Result<()> {
+    // Before anything that could trigger a LoadLibrary (see harden.rs).
+    zmux::harden::restrict_dll_search_path();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
@@ -188,7 +190,8 @@ fn attach(session: String) -> Result<()> {
                     Prefix::Ignore => {}
                 },
                 Event::Key(k) => {
-                    if let Some(bytes) = encode_key(k) {
+                    let app_cursor = latest.as_ref().is_some_and(|f| f.app_cursor);
+                    if let Some(bytes) = zmux::keys::encode(k, app_cursor) {
                         ipc::write_msg(&mut stream, &ClientMsg::Input { data: bytes })?;
                     }
                 }
@@ -366,33 +369,4 @@ fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<bool> 
             return Ok(false);
         }
     }
-}
-
-/// Minimal key encoder.
-///
-/// Phase 2 replaces this with herdr's `input/encode.rs`, which handles the
-/// Kitty keyboard protocol, application cursor mode and mouse encoding.
-fn encode_key(k: KeyEvent) -> Option<Vec<u8>> {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    Some(match k.code {
-        KeyCode::Char(c) if ctrl => {
-            let b = (c.to_ascii_uppercase() as u8).wrapping_sub(b'@');
-            vec![b]
-        }
-        KeyCode::Char(c) => c.to_string().into_bytes(),
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        _ => return None,
-    })
 }

@@ -54,7 +54,7 @@ pub fn frame_from_screen(screen: &vt100::Screen) -> Frame {
         let (r, c) = screen.cursor_position();
         Some((c, r))
     };
-    Frame { cols, rows, cells, cursor, revision: 0 }
+    Frame { cols, rows, cells, cursor, app_cursor: screen.application_cursor(), revision: 0 }
 }
 
 /// Paint a Frame into a ratatui Buffer at an offset.
@@ -204,6 +204,9 @@ pub fn composite(
         if let Some(f) = pane_frame(*id) {
             blit(&mut out, &f, *rect);
             if *id == focus {
+                // Key encoding follows the FOCUSED pane's mode - that is the
+                // pane the keystrokes will reach.
+                out.app_cursor = f.app_cursor;
                 if let Some((cx, cy)) = f.cursor {
                     if cx < rect.w && cy < rect.h {
                         cursor = Some((rect.x + cx, rect.y + cy));

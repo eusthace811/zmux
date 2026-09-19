@@ -4,7 +4,9 @@
 
 pub mod config;
 pub mod cwd;
+pub mod harden;
 pub mod ipc;
+pub mod keys;
 pub mod layout;
 pub mod protocol;
 pub mod persist;
