@@ -2,6 +2,7 @@
 //!
 //! Windows only by design (DESIGN.md §3): no `cfg(unix)` branches anywhere.
 
+pub mod config;
 pub mod cwd;
 pub mod ipc;
 pub mod layout;

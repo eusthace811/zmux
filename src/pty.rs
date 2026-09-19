@@ -51,18 +51,32 @@ pub fn find_git_bash() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Write the shell-integration rcfile once per daemon and return its path.
-fn ensure_rcfile() -> Result<std::path::PathBuf> {
+/// Write the shell-integration rcfile and return its path, or `None` to launch
+/// a plain login shell instead.
+fn ensure_rcfile(cfg: &crate::config::Config) -> Option<std::path::PathBuf> {
+    if !cfg.shell_integration {
+        return None;
+    }
     let dir = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("zmux");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("zmux.bashrc");
-    // Rewrite every time: a stale copy from an older build would silently
-    // change shell behaviour in ways that are painful to diagnose.
-    std::fs::write(&path, crate::cwd::RCFILE.as_bytes())?;
-    Ok(path)
+    let write = || -> std::io::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("zmux.bashrc");
+        // Rewrite every time: a stale copy from an older build would silently
+        // change shell behaviour in ways that are painful to diagnose.
+        std::fs::write(&path, crate::cwd::RCFILE.as_bytes())?;
+        Ok(path)
+    };
+    match write() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            // Losing cwd tracking beats losing the user's profile.
+            eprintln!("[pty] no shell integration ({e}); using a login shell");
+            None
+        }
+    }
 }
 
 pub enum PtyEvent {
@@ -131,12 +145,30 @@ impl Pane {
         cols: u16,
         rows: u16,
         cwd: Option<&std::path::Path>,
+        on_output: F,
+    ) -> Result<(Self, Receiver<PtyEvent>)>
+    where
+        F: FnMut(&[u8]) -> Vec<u8> + Send + 'static,
+    {
+        Self::spawn_with(cols, rows, cwd, &crate::config::Config::load(), on_output)
+    }
+
+    pub fn spawn_with<F>(
+        cols: u16,
+        rows: u16,
+        cwd: Option<&std::path::Path>,
+        cfg: &crate::config::Config,
         mut on_output: F,
     ) -> Result<(Self, Receiver<PtyEvent>)>
     where
         F: FnMut(&[u8]) -> Vec<u8> + Send + 'static,
     {
-        let shell = find_git_bash().context(
+        let shell = if cfg.shell.is_empty() {
+            find_git_bash()
+        } else {
+            Some(std::path::PathBuf::from(&cfg.shell)).filter(|p| p.is_file())
+        };
+        let shell = shell.context(
             "Git Bash not found; looked for bash.exe with msys-2.0.dll and cmd/git.exe alongside",
         )?;
 
@@ -157,16 +189,18 @@ impl Pane {
         //
         // If the rcfile cannot be written we fall back to a plain login shell:
         // losing cwd tracking is much better than losing the user's profile.
-        match ensure_rcfile() {
-            Ok(rc) => {
+        match ensure_rcfile(cfg) {
+            Some(rc) => {
                 cmd.arg("--rcfile");
                 cmd.arg(&rc);
                 cmd.arg("-i");
             }
-            Err(e) => {
-                eprintln!("[pty] no shell integration ({e}); falling back to a login shell");
+            None => {
                 cmd.arg("-l");
             }
+        }
+        for a in &cfg.shell_args {
+            cmd.arg(a);
         }
         match cwd {
             Some(d) if d.is_dir() => cmd.cwd(d),

@@ -238,13 +238,18 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
             while let Ok(msg) = in_rx.try_recv() {
                 match msg {
                     ClientMsg::Input { data } => session.write_focused(&data)?,
+                    // Commands publish to EVERY client rather than writing a
+                    // frame to this one stream. Two reasons: a split or a
+                    // focus change is session state that other attached
+                    // clients must see, and a direct write would bypass the
+                    // delta base, leaving the next delta unapplicable.
                     ClientMsg::Command(cmd) => {
                         apply(&session, cmd)?;
-                        ipc::write_msg(&mut stream, &ServerMsg::Frame(session.snapshot()))?;
+                        session.publish();
                     }
                     ClientMsg::Click { x, y } => {
                         if session.focus_at(x, y) {
-                            ipc::write_msg(&mut stream, &ServerMsg::Frame(session.snapshot()))?;
+                            session.publish();
                         }
                     }
                     ClientMsg::Resize { cols, rows } => session.set_client_size(id, cols, rows),

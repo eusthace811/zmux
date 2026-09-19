@@ -16,10 +16,10 @@ use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::protocol::{clamp_size, Frame, ServerMsg, MAX_INPUT_BYTES, MAX_PANES};
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
-use crate::render::{composite, frame_from_screen, pane_area};
+use crate::render::{composite, frame_from_screen, pane_area_with};
 use crate::term::Term;
 
-pub const SCROLLBACK: usize = 10_000;
+use crate::config::Config;
 
 pub struct PaneState {
     pub term: Arc<Mutex<Term>>,
@@ -64,6 +64,7 @@ pub struct Session {
     geometry: Mutex<()>,
     /// Pane lifecycle events, tagged with which pane they came from.
     events_tx: Sender<(PaneId, PtyEvent)>,
+    pub cfg: Config,
 }
 
 /// Restore the pane arrangement from disk, if there is a usable one.
@@ -111,9 +112,10 @@ impl Session {
             size: Mutex::new((cols, rows)),
             last_published: Mutex::new(None),
             geometry: Mutex::new(()),
+            cfg: Config::load(),
             events_tx,
         });
-        let area = pane_area(cols, rows);
+        let area = session.area(cols, rows);
         let (rects, _) = lock(&session.layout).compute(area);
         let cwds = restored.map(|(_, c)| c).unwrap_or_default();
         for (id, rect) in rects {
@@ -193,12 +195,12 @@ impl Session {
         rows: u16,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<()> {
-        let term = Arc::new(Mutex::new(Term::new(cols.max(1), rows.max(1), SCROLLBACK)));
+        let term = Arc::new(Mutex::new(Term::new(cols.max(1), rows.max(1), self.cfg.scrollback)));
         let feed = Arc::clone(&term);
 
         // Feed vt100, then answer device queries. Answering is MANDATORY:
         // ConPTY emits ESC[6n at startup and deadlocks if ignored (§2.5).
-        let (pty, events) = Pane::spawn_in(cols.max(1), rows.max(1), cwd.as_deref(), move |chunk| {
+        let (pty, events) = Pane::spawn_with(cols.max(1), rows.max(1), cwd.as_deref(), &self.cfg, move |chunk| {
             let mut t = lock(&feed);
             t.parser.process(chunk);
             let cur = t.cursor();
@@ -218,6 +220,10 @@ impl Session {
             }
         });
         Ok(())
+    }
+
+    fn area(&self, cols: u16, rows: u16) -> Rect {
+        pane_area_with(cols, rows, self.cfg.status_bar)
     }
 
     pub fn focus(&self) -> PaneId {
@@ -261,7 +267,7 @@ impl Session {
             return Ok(None);
         }
         let (cols, rows) = self.size();
-        let area = pane_area(cols, rows);
+        let area = self.area(cols, rows);
         let new_id = PaneId::alloc();
         let accepted = lock(&self.layout).split(dir, area, new_id).is_some();
         if !accepted {
@@ -329,13 +335,17 @@ impl Session {
 
     pub fn focus_dir(&self, nav: Nav) -> bool {
         let (cols, rows) = self.size();
-        lock(&self.layout).focus_dir(nav, pane_area(cols, rows))
+        let changed = lock(&self.layout).focus_dir(nav, self.area(cols, rows));
+        if changed {
+            self.revision.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
     }
 
     pub fn resize_focused(&self, nav: Nav, step: u16) -> bool {
         let _g = lock(&self.geometry);
         let (cols, rows) = self.size();
-        let changed = lock(&self.layout).resize_focused(nav, pane_area(cols, rows), step);
+        let changed = lock(&self.layout).resize_focused(nav, self.area(cols, rows), step);
         if changed {
             self.reflow_locked();
         }
@@ -353,6 +363,9 @@ impl Session {
             Some(n) if n > 0 => t.scroll_up(n as usize),
             Some(n) => t.scroll_down((-n) as usize),
         }
+        drop(t);
+        drop(panes);
+        self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
     /// True when the focused pane is showing history rather than live output.
@@ -373,9 +386,15 @@ impl Session {
 
     pub fn focus_at(&self, x: u16, y: u16) -> bool {
         let (cols, rows) = self.size();
-        let hit = lock(&self.layout).pane_at(pane_area(cols, rows), x, y);
+        let hit = lock(&self.layout).pane_at(self.area(cols, rows), x, y);
         match hit {
-            Some(id) => lock(&self.layout).set_focus(id),
+            Some(id) => {
+                let changed = lock(&self.layout).set_focus(id);
+                if changed {
+                    self.revision.fetch_add(1, Ordering::Relaxed);
+                }
+                changed
+            }
             None => false,
         }
     }
@@ -386,7 +405,7 @@ impl Session {
     /// entry point.
     fn reflow_locked(&self) {
         let (cols, rows) = self.size();
-        let area = pane_area(cols, rows);
+        let area = self.area(cols, rows);
         let (rects, _) = lock(&self.layout).compute(area);
         let panes = lock(&self.panes);
         for (id, r) in rects {
@@ -545,7 +564,7 @@ impl Session {
     pub fn snapshot(&self) -> Frame {
         let (cols, rows) = self.size();
         let layout = self.layout_snapshot();
-        let status = self.status_line();
+        let status = self.cfg.status_bar.then(|| self.status_line());
         let revision = self.revision.load(Ordering::Relaxed);
         let panes = lock(&self.panes);
         let mut f = composite(
@@ -553,7 +572,7 @@ impl Session {
             rows,
             &layout,
             |id| panes.get(&id).map(|p| frame_from_screen(lock(&p.term).parser.screen())),
-            &status,
+            status.as_deref(),
         );
         f.revision = revision;
         f

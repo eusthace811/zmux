@@ -175,7 +175,11 @@ pub fn highlight_focus(dst: &mut Frame, dividers: &[Divider], focus: LRect) {
 
 /// The area available to panes: everything above the status bar.
 pub fn pane_area(cols: u16, rows: u16) -> LRect {
-    LRect::new(0, 0, cols, rows.saturating_sub(1))
+    pane_area_with(cols, rows, true)
+}
+
+pub fn pane_area_with(cols: u16, rows: u16, status_bar: bool) -> LRect {
+    LRect::new(0, 0, cols, if status_bar { rows.saturating_sub(1) } else { rows })
 }
 
 /// Compose the whole screen from the layout and each pane's current grid.
@@ -188,10 +192,10 @@ pub fn composite(
     rows: u16,
     layout: &Layout,
     pane_frame: impl Fn(PaneId) -> Option<Frame>,
-    status: &str,
+    status: Option<&str>,
 ) -> Frame {
     let mut out = Frame::blank(cols, rows);
-    let area = pane_area(cols, rows);
+    let area = pane_area_with(cols, rows, status.is_some());
     let (panes, dividers) = layout.compute(area);
     let focus = layout.focus();
     let mut cursor = None;
@@ -212,7 +216,9 @@ pub fn composite(
     if let Some((_, r)) = panes.iter().find(|(p, _)| *p == focus) {
         highlight_focus(&mut out, &dividers, *r);
     }
-    draw_status(&mut out, status);
+    if let Some(text) = status {
+        draw_status(&mut out, text);
+    }
     out.cursor = cursor;
     out
 }
