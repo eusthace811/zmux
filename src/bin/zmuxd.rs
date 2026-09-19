@@ -210,8 +210,17 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
     let (cols, rows) = match ipc::read_msg::<_, ClientMsg>(&mut stream)? {
         Some(ClientMsg::Hello { version, cols, rows }) => {
             if version != PROTOCOL_VERSION {
+                // Say what to DO about it. The common cause by far is an
+                // upgraded binary meeting a session still served by the daemon
+                // the previous build left running, and "protocol 3 != 2" does
+                // not tell anyone that killing the session fixes it.
                 ipc::write_msg(&mut stream, &ServerMsg::Refused {
-                    reason: format!("protocol {version} != daemon {PROTOCOL_VERSION}"),
+                    reason: format!(
+                        "client speaks protocol {version}, this daemon speaks \
+                         {PROTOCOL_VERSION}. The session is served by an older build; \
+                         run `zmux kill {}` and attach again to restart it.",
+                        session.name
+                    ),
                 })?;
                 return Ok(());
             }
