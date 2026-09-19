@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use zmux::ipc;
-use zmux::protocol::{ClientMsg, Frame, ServerMsg, PROTOCOL_VERSION};
+use zmux::protocol::{Cmd, ClientMsg, Frame, ServerMsg, PROTOCOL_VERSION};
 use zmux::render::{paint, paint_cursor};
 
 /// Restores terminal state even on panic or early return.
@@ -25,14 +25,15 @@ impl TermGuard {
         // autowrap or writing the last column wraps and corrupts the next row
         // (render_ansi.rs:986, terminal_setup.rs:114). DESIGN.md §0.4.
         execute!(stdout(), terminal::EnterAlternateScreen, terminal::DisableLineWrap,
-                 crossterm::cursor::Hide)?;
+                 crossterm::event::EnableMouseCapture, crossterm::cursor::Hide)?;
         Ok(Self)
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), crossterm::cursor::Show, terminal::EnableLineWrap,
+        let _ = execute!(stdout(), crossterm::cursor::Show,
+                         crossterm::event::DisableMouseCapture, terminal::EnableLineWrap,
                          terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
@@ -66,7 +67,11 @@ zmux - tmux-style panes for Windows
   zmux kill <session>     terminate a session and its daemon
   zmux --help
 
-In a session:  Ctrl-b d  detach";
+In a session (Ctrl-b is the prefix):
+  C-b d          detach              C-b %          split left/right
+  C-b x          close pane          C-b \"          split top/bottom
+  C-b <arrow>    move focus          C-b C-<arrow>  resize
+  C-b C-b        send a literal Ctrl-b";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -151,21 +156,32 @@ fn attach(session: String) -> Result<()> {
 
     let mut latest: Option<Frame> = None;
     loop {
-        // Input. Ctrl-b d detaches (tmux muscle memory).
+        // Input. Ctrl-b is the prefix, as in tmux.
         if event::poll(Duration::from_millis(8))? {
             match event::read()? {
-                Event::Key(k) => {
-                    if k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL) {
-                        if let Event::Key(next) = event::read()? {
-                            if next.code == KeyCode::Char('d') {
-                                ipc::write_msg(&mut stream, &ClientMsg::Detach)?;
-                                break;
-                            }
-                        }
-                        continue;
+                Event::Key(k) if is_prefix(&k) => match read_prefix_command()? {
+                    Prefix::Detach => {
+                        ipc::write_msg(&mut stream, &ClientMsg::Detach)?;
+                        break;
                     }
+                    Prefix::Command(cmd) => {
+                        ipc::write_msg(&mut stream, &ClientMsg::Command(cmd))?;
+                    }
+                    // A doubled prefix sends a literal Ctrl-b to the pane, so
+                    // the shortcut stays reachable inside programs that use it.
+                    Prefix::Literal => {
+                        ipc::write_msg(&mut stream, &ClientMsg::Input { data: vec![0x02] })?;
+                    }
+                    Prefix::Ignore => {}
+                },
+                Event::Key(k) => {
                     if let Some(bytes) = encode_key(k) {
                         ipc::write_msg(&mut stream, &ClientMsg::Input { data: bytes })?;
+                    }
+                }
+                Event::Mouse(m) => {
+                    if matches!(m.kind, event::MouseEventKind::Down(event::MouseButton::Left)) {
+                        ipc::write_msg(&mut stream, &ClientMsg::Click { x: m.column, y: m.row })?;
                     }
                 }
                 Event::Resize(c, r) => {
@@ -204,7 +220,46 @@ fn attach(session: String) -> Result<()> {
     Ok(())
 }
 
-/// Minimal key encoder for Phase 1.
+fn is_prefix(k: &KeyEvent) -> bool {
+    k.code == KeyCode::Char('b') && k.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+enum Prefix {
+    Detach,
+    Command(Cmd),
+    Literal,
+    Ignore,
+}
+
+/// Read the key following the prefix and map it to an action.
+///
+/// Bindings follow tmux so muscle memory transfers.
+fn read_prefix_command() -> Result<Prefix> {
+    // Bounded wait: a prefix followed by nothing must not wedge the client.
+    if !event::poll(Duration::from_millis(2000))? {
+        return Ok(Prefix::Ignore);
+    }
+    let Event::Key(k) = event::read()? else { return Ok(Prefix::Ignore) };
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    Ok(match k.code {
+        KeyCode::Char('d') => Prefix::Detach,
+        KeyCode::Char('b') if ctrl => Prefix::Literal,
+        KeyCode::Char('%') => Prefix::Command(Cmd::SplitHorizontal),
+        KeyCode::Char('"') => Prefix::Command(Cmd::SplitVertical),
+        KeyCode::Char('x') => Prefix::Command(Cmd::ClosePane),
+        KeyCode::Left if ctrl => Prefix::Command(Cmd::ResizeLeft),
+        KeyCode::Right if ctrl => Prefix::Command(Cmd::ResizeRight),
+        KeyCode::Up if ctrl => Prefix::Command(Cmd::ResizeUp),
+        KeyCode::Down if ctrl => Prefix::Command(Cmd::ResizeDown),
+        KeyCode::Left => Prefix::Command(Cmd::FocusLeft),
+        KeyCode::Right => Prefix::Command(Cmd::FocusRight),
+        KeyCode::Up => Prefix::Command(Cmd::FocusUp),
+        KeyCode::Down => Prefix::Command(Cmd::FocusDown),
+        _ => Prefix::Ignore,
+    })
+}
+
+/// Minimal key encoder.
 ///
 /// Phase 2 replaces this with herdr's `input/encode.rs`, which handles the
 /// Kitty keyboard protocol, application cursor mode and mouse encoding.

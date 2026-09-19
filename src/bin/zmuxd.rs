@@ -13,7 +13,8 @@ use interprocess::local_socket::prelude::*;
 use interprocess::TryClone as _;
 
 use zmux::ipc;
-use zmux::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use zmux::layout::{Dir, Nav, PaneId};
+use zmux::protocol::{Cmd, ClientMsg, ServerMsg, PROTOCOL_VERSION};
 use zmux::pty::PtyEvent;
 use zmux::session::Session;
 
@@ -78,15 +79,20 @@ fn main() -> Result<()> {
 
 /// Coalesce pty output into frames. Output arrives in bursts, so redrawing per
 /// chunk would be wasteful; we mark dirty and emit at most one frame per tick.
-fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<PtyEvent>) {
+fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEvent)>) {
     let mut dirty = false;
     loop {
         match events.recv_timeout(Duration::from_millis(16)) {
-            Ok(PtyEvent::Output(_)) => dirty = true,
-            Ok(PtyEvent::Exited(code)) => {
-                session.broadcast(&ServerMsg::PaneExited { code });
-                session.shutdown();
-                return;
+            Ok((_, PtyEvent::Output(_))) => dirty = true,
+            Ok((id, PtyEvent::Exited(code))) => {
+                // Only the LAST pane exiting ends the session; otherwise the
+                // pane is removed and the survivors reclaim its space.
+                if session.pane_exited(id) {
+                    session.broadcast(&ServerMsg::PaneExited { code });
+                    session.shutdown();
+                    return;
+                }
+                dirty = true;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -104,6 +110,45 @@ fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<PtyEvent>) {
             dirty = false;
         }
     }
+}
+
+fn apply(session: &Arc<Session>, cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::SplitHorizontal => {
+            session.split(Dir::Horizontal)?;
+        }
+        Cmd::SplitVertical => {
+            session.split(Dir::Vertical)?;
+        }
+        Cmd::ClosePane => {
+            session.close_focused();
+        }
+        Cmd::FocusLeft => {
+            session.focus_dir(Nav::Left);
+        }
+        Cmd::FocusRight => {
+            session.focus_dir(Nav::Right);
+        }
+        Cmd::FocusUp => {
+            session.focus_dir(Nav::Up);
+        }
+        Cmd::FocusDown => {
+            session.focus_dir(Nav::Down);
+        }
+        Cmd::ResizeLeft => {
+            session.resize_focused(Nav::Left, 2);
+        }
+        Cmd::ResizeRight => {
+            session.resize_focused(Nav::Right, 2);
+        }
+        Cmd::ResizeUp => {
+            session.resize_focused(Nav::Up, 1);
+        }
+        Cmd::ResizeDown => {
+            session.resize_focused(Nav::Down, 1);
+        }
+    }
+    Ok(())
 }
 
 fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) -> Result<()> {
@@ -157,7 +202,16 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
         loop {
             while let Ok(msg) = in_rx.try_recv() {
                 match msg {
-                    ClientMsg::Input { data } => session.pane.write_input(&data)?,
+                    ClientMsg::Input { data } => session.write_focused(&data)?,
+                    ClientMsg::Command(cmd) => {
+                        apply(&session, cmd)?;
+                        ipc::write_msg(&mut stream, &ServerMsg::Frame(session.snapshot()))?;
+                    }
+                    ClientMsg::Click { x, y } => {
+                        if session.focus_at(x, y) {
+                            ipc::write_msg(&mut stream, &ServerMsg::Frame(session.snapshot()))?;
+                        }
+                    }
                     ClientMsg::Resize { cols, rows } => session.set_client_size(id, cols, rows),
                     ClientMsg::Detach => {
                         let _ = ipc::write_msg(&mut stream, &ServerMsg::Detached);

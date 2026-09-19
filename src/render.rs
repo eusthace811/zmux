@@ -99,3 +99,120 @@ pub fn paint_cursor(buf: &mut Buffer, frame: &Frame, ox: u16, oy: u16) {
         c.set_style(c.style().add_modifier(Modifier::REVERSED));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Compositing (Phase 3)
+// ---------------------------------------------------------------------------
+
+use crate::layout::{Dir, Divider, Layout, PaneId, Rect as LRect};
+
+/// Copy one pane's grid into `dst` at `at`, clipped to `at`.
+///
+/// Clipping matters: the pty is resized to the pane rect, but a resize is
+/// asynchronous, so a frame produced just before the resize lands can be
+/// larger than the rect it must go in. Without clipping that scribbles over
+/// the neighbouring pane.
+pub fn blit(dst: &mut Frame, src: &Frame, at: LRect) {
+    for row in 0..src.rows.min(at.h) {
+        for col in 0..src.cols.min(at.w) {
+            let (x, y) = (at.x + col, at.y + row);
+            if x >= dst.cols || y >= dst.rows {
+                continue;
+            }
+            dst.cells[y as usize * dst.cols as usize + x as usize] =
+                src.cells[row as usize * src.cols as usize + col as usize].clone();
+        }
+    }
+}
+
+fn put(dst: &mut Frame, x: u16, y: u16, ch: char, mods: u16) {
+    if x < dst.cols && y < dst.rows {
+        let c = &mut dst.cells[y as usize * dst.cols as usize + x as usize];
+        c.ch = ch;
+        c.mods = mods;
+    }
+}
+
+pub fn draw_dividers(dst: &mut Frame, dividers: &[Divider]) {
+    for d in dividers {
+        let ch = match d.dir {
+            Dir::Horizontal => '│',
+            Dir::Vertical => '─',
+        };
+        for row in 0..d.rect.h {
+            for col in 0..d.rect.w {
+                put(dst, d.rect.x + col, d.rect.y + row, ch, 0);
+            }
+        }
+    }
+}
+
+/// One-line status bar along the bottom.
+pub fn draw_status(dst: &mut Frame, text: &str) {
+    if dst.rows == 0 {
+        return;
+    }
+    let y = dst.rows - 1;
+    for x in 0..dst.cols {
+        put(dst, x, y, ' ', MOD_REVERSE);
+    }
+    for (i, ch) in text.chars().take(dst.cols as usize).enumerate() {
+        put(dst, i as u16, y, ch, MOD_REVERSE);
+    }
+}
+
+/// Mark the focused pane so it is obvious which one takes input.
+pub fn highlight_focus(dst: &mut Frame, dividers: &[Divider], focus: LRect) {
+    let _ = dividers;
+    // A bold top-left corner marker is cheap and does not steal a row.
+    if focus.w > 0 && focus.h > 0 {
+        let idx = focus.y as usize * dst.cols as usize + focus.x as usize;
+        if idx < dst.cells.len() {
+            dst.cells[idx].mods |= MOD_BOLD;
+        }
+    }
+}
+
+/// The area available to panes: everything above the status bar.
+pub fn pane_area(cols: u16, rows: u16) -> LRect {
+    LRect::new(0, 0, cols, rows.saturating_sub(1))
+}
+
+/// Compose the whole screen from the layout and each pane's current grid.
+///
+/// The DAEMON does this, not the client: it owns the layout and every vt100
+/// state, so one composited Frame goes over the wire and the client stays
+/// dumb. Splits therefore need no protocol change at all.
+pub fn composite(
+    cols: u16,
+    rows: u16,
+    layout: &Layout,
+    pane_frame: impl Fn(PaneId) -> Option<Frame>,
+    status: &str,
+) -> Frame {
+    let mut out = Frame::blank(cols, rows);
+    let area = pane_area(cols, rows);
+    let (panes, dividers) = layout.compute(area);
+    let focus = layout.focus();
+    let mut cursor = None;
+
+    for (id, rect) in &panes {
+        if let Some(f) = pane_frame(*id) {
+            blit(&mut out, &f, *rect);
+            if *id == focus {
+                if let Some((cx, cy)) = f.cursor {
+                    if cx < rect.w && cy < rect.h {
+                        cursor = Some((rect.x + cx, rect.y + cy));
+                    }
+                }
+            }
+        }
+    }
+    draw_dividers(&mut out, &dividers);
+    if let Some((_, r)) = panes.iter().find(|(p, _)| *p == focus) {
+        highlight_focus(&mut out, &dividers, *r);
+    }
+    draw_status(&mut out, status);
+    out.cursor = cursor;
+    out
+}

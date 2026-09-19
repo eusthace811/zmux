@@ -22,6 +22,26 @@ pub enum ClientMsg {
     // --- appended after v1 shipped. Append-only: never reorder the above. ---
     /// Ask the daemon to terminate the session and exit.
     Shutdown,
+    /// A pane-management command, issued after the client's prefix key.
+    Command(Cmd),
+    /// Mouse click at a screen position: focus the pane under it.
+    Click { x: u16, y: u16 },
+}
+
+/// Pane management. Append-only, like everything else on this wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cmd {
+    SplitHorizontal,
+    SplitVertical,
+    ClosePane,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
