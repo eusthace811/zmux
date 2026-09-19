@@ -109,6 +109,12 @@ fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEve
     let mut dirty = false;
     let mut next_frame = std::time::Instant::now();
     loop {
+        // The session holds its own events_tx, so Disconnected is unreachable
+        // while it lives; `running` is the actual stop signal.
+        if !session.running.load(Ordering::Relaxed) {
+            return;
+        }
+        session.settle_size();
         match events.recv_timeout(FRAME_INTERVAL) {
             Ok((_, PtyEvent::Output(_))) => dirty = true,
             Ok((id, PtyEvent::Exited(code))) => {
@@ -233,7 +239,9 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
     ipc::write_msg(&mut stream, &ServerMsg::Frame(session.snapshot()))?;
 
     // Inbound on its own thread; socket reads block.
-    let (in_tx, in_rx) = std::sync::mpsc::channel::<ClientMsg>();
+    // Bounded: a peer that floods input must not grow the daemon's memory.
+    // Backpressure lands on the socket read, which is where it belongs.
+    let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<ClientMsg>(256);
     let mut rstream = stream.try_clone()?;
     std::thread::spawn(move || {
         while let Ok(Some(msg)) = ipc::read_msg::<_, ClientMsg>(&mut rstream) {

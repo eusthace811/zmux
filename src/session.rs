@@ -61,6 +61,9 @@ pub struct Session {
     size: Mutex<(u16, u16)>,
     /// Last frame sent to clients, as the base for deltas.
     last_published: Mutex<Option<Frame>>,
+    /// Set when a client was dropped mid-broadcast; the pump recomputes size
+    /// outside the broadcast path, where taking the geometry lock is safe.
+    size_dirty: std::sync::atomic::AtomicBool,
     /// Serialises every geometry mutation.
     ///
     /// apply_size previously read the client list, released the lock, then
@@ -119,6 +122,7 @@ impl Session {
             revision: Arc::new(AtomicU64::new(0)),
             size: Mutex::new((cols, rows)),
             last_published: Mutex::new(None),
+            size_dirty: std::sync::atomic::AtomicBool::new(false),
             geometry: Mutex::new(()),
             cfg: Config::load(),
             events_tx,
@@ -158,16 +162,17 @@ impl Session {
     /// Called after any structural change. Failures are logged, never fatal:
     /// not being able to save a layout is no reason to lose a working session.
     pub fn save_state(&self) {
-        let (root, focus) = {
+        // Capture layout and panes together. Taking them under separate locks
+        // allowed a split to land in between, producing a snapshot whose tree
+        // and directories described different moments.
+        let (root, focus, cwds) = {
             let l = lock(&self.layout);
-            (l.root_snapshot(), l.focus())
-        };
-        let cwds = {
             let panes = lock(&self.panes);
-            panes
+            let cwds = panes
                 .iter()
                 .filter_map(|(id, p)| lock(&p.term).cwd_windows().map(|d| (id.0, d)))
-                .collect()
+                .collect();
+            (l.root_snapshot(), l.focus(), cwds)
         };
         let snap = SessionSnapshot {
             version: persist::FORMAT_VERSION,
@@ -429,8 +434,13 @@ impl Session {
         for (id, r) in rects {
             if let Some(p) = panes.get(&id) {
                 if r.w > 0 && r.h > 0 {
-                    let _ = p.pty.resize(r.w, r.h);
-                    lock(&p.term).resize(r.w, r.h);
+                    // Only resize the parser if the pty accepted the new size.
+                    // Resizing it regardless left vt100 and ConPTY disagreeing
+                    // about the grid, which renders as misplaced output.
+                    match p.pty.resize(r.w, r.h) {
+                        Ok(()) => lock(&p.term).resize(r.w, r.h),
+                        Err(e) => eprintln!("[session] pane {} resize failed: {e}", id.0),
+                    }
                 }
             }
         }
@@ -458,12 +468,13 @@ impl Session {
     /// almost entirely waste.
     pub fn publish(&self) {
         let frame = self.snapshot();
-        let delta = {
-            let last = lock(&self.last_published);
-            last.as_ref().and_then(|prev| frame.delta_from(prev))
-        };
+        // Hold `last_published` across derive-send-update. Releasing it between
+        // steps let two publishers derive deltas from the SAME base and then
+        // update that base out of order, so a client could receive a delta
+        // whose base it had already moved past.
+        let mut last = lock(&self.last_published);
+        let msg_delta = last.as_ref().and_then(|prev| frame.delta_from(prev)).map(ServerMsg::Delta);
         let full = ServerMsg::Frame(frame.clone());
-        let msg_delta = delta.map(ServerMsg::Delta);
 
         {
             let mut cs = self.lock_clients();
@@ -484,9 +495,17 @@ impl Session {
                     Err(TrySendError::Disconnected(_)) => c.lagged = true,
                 }
             }
+            let dropped = cs.iter().any(|c| c.lagged);
             cs.retain(|c| !c.lagged);
+            drop(cs);
+            // A dropped client's dimensions were constraining the session, so
+            // the remaining viewports must be recomputed - otherwise one
+            // wedged peer pins everyone else's geometry forever.
+            if dropped {
+                self.size_dirty.store(true, Ordering::Relaxed);
+            }
         }
-        *lock(&self.last_published) = Some(frame);
+        *last = Some(frame);
     }
 
     // --- clients -----------------------------------------------------------
@@ -635,11 +654,24 @@ impl Session {
     /// Explicit teardown matters on Windows - closing a pseudoconsole without
     /// draining it can hang (DESIGN.md §2.5), and `process::exit` would skip
     /// this entirely.
+    /// Recompute viewport size if a broadcast dropped a client.
+    pub fn settle_size(&self) {
+        if self.size_dirty.swap(false, Ordering::Relaxed) {
+            self.apply_size();
+        }
+    }
+
     pub fn shutdown(&self) {
         if !self.running.swap(false, Ordering::Relaxed) {
             return; // already shutting down
         }
         self.broadcast(&ServerMsg::ShuttingDown);
+        // Save the final directories: cwd was otherwise only persisted on
+        // structural changes, so a plain `cd` before shutdown was lost.
+        self.save_state();
+        // Take `geometry` so a concurrent split cannot insert a pane AFTER the
+        // map is drained, which would leave a ConPTY outside teardown.
+        let _g = lock(&self.geometry);
         let panes: Vec<_> = lock(&self.panes).drain().map(|(_, p)| p).collect();
         for p in panes {
             p.pty.close();

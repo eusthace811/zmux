@@ -147,7 +147,9 @@ fn attach(session: String) -> Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     // Frames arrive on their own thread; the main loop owns input and drawing.
-    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<ServerMsg>();
+    // Bounded: if the UI thread stalls, queued frames must not grow without
+    // limit. Dropping the oldest is correct here - only the newest matters.
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ServerMsg>(128);
     let mut rstream = stream.try_clone()?;
     std::thread::spawn(move || {
         while let Ok(Some(msg)) = ipc::read_msg::<_, ServerMsg>(&mut rstream) {

@@ -48,8 +48,10 @@ pub fn save(snap: &SessionSnapshot) -> Result<()> {
     let path = path_for(&snap.name);
     let json = serde_json::to_string_pretty(snap)?;
     // Write-then-rename: a crash mid-write must not leave a truncated file
-    // that we would later try to restore from.
-    let tmp = path.with_extension("json.tmp");
+    // that we would later try to restore from. The temp name includes the
+    // thread id because two savers sharing one .tmp path would interleave and
+    // rename each other's partial writes.
+    let tmp = path.with_extension(format!("{:?}.tmp", std::thread::current().id()).replace(['(', ')', ' '], ""));
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())

@@ -15,9 +15,85 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::protocol::MAX_FRAME_BYTES;
 
+/// Per-user pipe name, keyed on the user's SID rather than `%USERNAME%`.
+///
+/// `USERNAME` is an ordinary environment variable that any process can set, so
+/// deriving the name from it lets one local user predict - or collide with -
+/// another's pipe. The SID is a real security principal and cannot be spoofed
+/// by editing the environment.
+///
+/// The session component is sanitised because it reaches an OS object name.
 pub fn pipe_name(session: &str) -> String {
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-    format!("zmux-{user}-{session}")
+    let user = current_user_key();
+    let safe: String = session
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(64)
+        .collect();
+    format!("zmux-{user}-{safe}")
+}
+
+/// The current user's SID, or a clearly-marked fallback.
+fn current_user_key() -> String {
+    #[cfg(windows)]
+    {
+        if let Some(sid) = windows_user_sid() {
+            return sid;
+        }
+    }
+    // Falling back to USERNAME is weaker but still separates ordinary users;
+    // the restrictive DACL remains the real protection either way.
+    format!("u-{}", std::env::var("USERNAME").unwrap_or_else(|_| "unknown".into()))
+}
+
+#[cfg(windows)]
+fn windows_user_sid() -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+
+    type Handle = *mut core::ffi::c_void;
+    extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn OpenProcessToken(p: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(t: Handle, class: i32, info: *mut u8, len: u32, ret: *mut u32) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut core::ffi::c_void, out: *mut *mut u16) -> i32;
+        fn CloseHandle(h: Handle) -> i32;
+        fn LocalFree(p: *mut u16) -> *mut u16;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER: i32 = 1;
+
+    unsafe {
+        let mut token: Handle = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut need = 0u32;
+        GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut need);
+        if need == 0 {
+            CloseHandle(token);
+            return None;
+        }
+        let mut buf = vec![0u8; need as usize];
+        let ok = GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr(), need, &mut need) != 0;
+        CloseHandle(token);
+        if !ok {
+            return None;
+        }
+        // TOKEN_USER begins with SID_AND_ATTRIBUTES { PSID Sid; ... }
+        let sid = *(buf.as_ptr() as *const *mut core::ffi::c_void);
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut raw) == 0 || raw.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+        let text = std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len));
+        LocalFree(raw);
+        // SIDs contain '-' and digits, both legal in a pipe name.
+        text.into_string().ok()
+    }
 }
 
 fn bincode_config() -> bincode::config::Configuration {
@@ -91,8 +167,8 @@ pub fn is_running(session: &str) -> bool {
 /// registry of our own - a pipe exists exactly while its daemon does, which
 /// makes stale entries structurally impossible.
 pub fn list_sessions() -> Vec<String> {
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-    let prefix = format!("zmux-{user}-");
+    // Must use the same key as pipe_name, or listing silently finds nothing.
+    let prefix = format!("zmux-{}-", current_user_key());
     let Ok(dir) = std::fs::read_dir(r"\\.\pipe\") else {
         return Vec::new();
     };
@@ -128,4 +204,33 @@ pub fn listen(session: &str) -> Result<interprocess::local_socket::Listener> {
     let sd = SecurityDescriptor::deserialize(&sddl).context("build pipe security descriptor")?;
 
     Ok(ListenerOptions::new().name(ns).security_descriptor(sd).create_sync()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_name_cannot_inject_into_the_pipe_name() {
+        // The session string reaches an OS object name, so anything exotic
+        // must be flattened rather than passed through.
+        let n = pipe_name("../../evil\\path");
+        assert!(!n.contains('/') && !n.contains('\\') && !n.contains(".."), "{n}");
+    }
+
+    #[test]
+    fn different_sessions_get_different_pipes() {
+        assert_ne!(pipe_name("a"), pipe_name("b"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_pipe_name_is_keyed_on_the_user_sid() {
+        // USERNAME is writable by any process; the SID is not.
+        let key = super::current_user_key();
+        assert!(
+            key.starts_with("S-1-"),
+            "expected a SID-derived key, got {key:?} - the name would be spoofable"
+        );
+    }
 }
