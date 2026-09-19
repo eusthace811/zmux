@@ -1,0 +1,35 @@
+[package]
+name = "zmux"
+version = "0.1.0"
+edition = "2021"
+description = "tmux-style panes for Windows with persistent, detachable sessions"
+license = "Apache-2.0"
+
+[dependencies]
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
+crossterm = "0.29"
+ratatui = "0.30"
+interprocess = "2.4"
+bincode = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[[bin]]
+name = "zmux"
+path = "src/bin/zmux.rs"
+
+[[bin]]
+name = "zmuxd"
+path = "src/bin/zmuxd.rs"
+
+[profile.release]
+opt-level = 2

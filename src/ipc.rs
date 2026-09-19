@@ -1,0 +1,96 @@
+//! Named-pipe transport. Adapted from herdr's `src/ipc.rs` (Apache-2.0),
+//! reduced to Windows-only and given explicit framing.
+//!
+//! herdr consumes `interprocess::local_socket` as a BYTE STREAM with
+//! arbitrary-size reads, so message boundaries do not survive. Framing is
+//! therefore mandatory, not optional (DESIGN.md §3).
+
+use std::io::{self, Read, Write};
+
+use anyhow::{bail, Context, Result};
+use interprocess::local_socket::{
+    prelude::*, GenericNamespaced, ListenerOptions, Stream,
+};
+use serde::{de::DeserializeOwned, Serialize};
+
+use crate::protocol::MAX_FRAME_BYTES;
+
+pub fn pipe_name(session: &str) -> String {
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+    format!("zmux-{user}-{session}")
+}
+
+fn bincode_config() -> bincode::config::Configuration {
+    bincode::config::standard()
+}
+
+/// Length-prefixed write: u32 big-endian length, then the payload.
+pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
+    let bytes = bincode::serde::encode_to_vec(msg, bincode_config())
+        .context("encode message")?;
+    if bytes.len() as u64 > MAX_FRAME_BYTES as u64 {
+        bail!("outgoing frame {} exceeds MAX_FRAME_BYTES", bytes.len());
+    }
+    w.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    w.write_all(&bytes)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Length-prefixed read. Returns `Ok(None)` on clean EOF.
+///
+/// The length is validated BEFORE allocating, so a corrupt or hostile peer
+/// cannot make us reserve an arbitrary buffer.
+pub fn read_msg<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<Option<T>> {
+    let mut len_buf = [0u8; 4];
+    match read_exact_or_eof(r, &mut len_buf)? {
+        false => return Ok(None),
+        true => {}
+    }
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_FRAME_BYTES {
+        bail!("incoming frame {len} exceeds MAX_FRAME_BYTES {MAX_FRAME_BYTES}");
+    }
+    let mut buf = vec![0u8; len as usize];
+    if !read_exact_or_eof(r, &mut buf)? {
+        bail!("truncated frame: wanted {len} bytes");
+    }
+    let (msg, _) = bincode::serde::decode_from_slice(&buf, bincode_config())
+        .context("decode message")?;
+    Ok(Some(msg))
+}
+
+/// Reads exactly `buf.len()` bytes. `false` means clean EOF before any byte.
+fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => return Ok(filled != 0 && { bail!("eof mid-frame") }),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(true)
+}
+
+pub fn connect(session: &str) -> Result<Stream> {
+    let name = pipe_name(session);
+    let ns = name.as_str().to_ns_name::<GenericNamespaced>()?;
+    Ok(Stream::connect(ns)?)
+}
+
+/// True if a daemon is already listening for this session.
+pub fn is_running(session: &str) -> bool {
+    connect(session).is_ok()
+}
+
+pub fn listen(session: &str) -> Result<interprocess::local_socket::Listener> {
+    let name = pipe_name(session);
+    let ns = name.as_str().to_ns_name::<GenericNamespaced>()?;
+    // NOTE (DESIGN.md §3): herdr additionally applies an SDDL of
+    // D:P(A;;GA;;;SY)(A;;GA;;;OW) - SYSTEM + OBJECT OWNER. Windows named pipes
+    // already default to the creating user's token; tightening this explicitly
+    // is a Phase 2 task, tracked so it is not forgotten.
+    Ok(ListenerOptions::new().name(ns).create_sync()?)
+}
