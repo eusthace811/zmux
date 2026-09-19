@@ -564,7 +564,30 @@ untargeted, compiled out on Windows), `shared_library`.
 | Named pipe security | SDDL `D:P(A;;GA;;;SY)(A;;GA;;;OW)` — document it (§3) |
 | No network egress | Local named pipe only. No telemetry, no update check |
 
-## 7. Build setup
+## 7. Build setup — source in WSL, compiler on Windows
+
+Use `./x` at the repo root; it exists so nobody has to remember the following.
+
+The source lives in WSL so git lives with it. The compiler must be the Windows
+MSVC toolchain. Three facts make that work, each found by hitting it:
+
+1. `cargo.exe` **can** read the source over `\\wsl.localhost\...` (pass
+   `--manifest-path`; `cmd.exe` cannot `cd` to a UNC path, but cargo does not
+   need it to).
+2. `cargo.exe` **cannot** put `target/` there — 9p has no lock-file support, so
+   the incremental-compilation session lock fails with
+   `os error -2147024895`. `CARGO_TARGET_DIR` must be a Windows-local path.
+3. WSL does **not** forward environment variables to Windows processes without
+   `WSLENV`. Setting `CARGO_TARGET_DIR` alone silently does nothing — the same
+   trap that produced a false Probe D result (§0.1).
+
+```bash
+./x test              # cargo test
+./x release           # optimised build
+./x clippy            # anything else is passed through to cargo
+```
+
+### Original notes
 
 Windows toolchain: `/mnt/c/Users/eusth/.cargo/bin/cargo.exe`,
 `1.96.1-x86_64-pc-windows-msvc`, VS 2019.

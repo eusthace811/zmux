@@ -7,10 +7,20 @@ Panes run Git Bash. See `../zmux/docs/DESIGN.md` for the full plan.
 
 One full-screen Git Bash pane, client/daemon split, detach-safe.
 
+```bash
+./x test          # run the tests
+./x release       # build optimised binaries
 ```
-cargo build --release
-./target/release/zmux.exe [session]     # run from a Git Bash window
+
+Then, **from a Git Bash window** (it needs a console):
+
+```bash
+"$(./x run 2>/dev/null | tail -1)"        # or just run zmux.exe directly
 ```
+
+`./x` wraps the Windows toolchain: source lives in WSL for git, but
+`CARGO_TARGET_DIR` has to be Windows-local because 9p cannot do lock files.
+See `docs/DESIGN.md` §7.
 
 `Ctrl-b d` detaches. Run again to reattach; the shell kept running.
 
@@ -41,8 +51,8 @@ EDR detection on a managed laptop. See DESIGN.md §0.2.
 
 ## Tests
 
-```
-cargo test
+```bash
+./x test
 ```
 
 `tests/smoke.rs` drives a real Git Bash through the daemon and asserts the
