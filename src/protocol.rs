@@ -13,6 +13,28 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
 
+/// Hard bounds on client-supplied geometry.
+///
+/// Without these, `Hello { cols: 65535, rows: 65535 }` reaches
+/// `vt100::Screen::set_size` and asks for ~4 billion cells. A peer on a local
+/// named pipe is not automatically trusted.
+pub const MAX_COLS: u16 = 1000;
+pub const MAX_ROWS: u16 = 500;
+pub const MIN_USABLE_COLS: u16 = 8;
+pub const MIN_USABLE_ROWS: u16 = 3;
+
+/// Cap a single `Input` payload. Keystrokes and pastes are small; anything
+/// larger is a bug or an attack.
+pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// Largest number of panes one session will tile.
+pub const MAX_PANES: usize = 64;
+
+/// Clamp client geometry into something we are willing to allocate.
+pub fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(MIN_USABLE_COLS, MAX_COLS), rows.clamp(MIN_USABLE_ROWS, MAX_ROWS))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
     Hello { version: u32, cols: u16, rows: u16 },
@@ -92,10 +114,23 @@ pub struct Frame {
     pub cells: Vec<Cell>,
     /// (col, row) of the cursor, if it should be shown.
     pub cursor: Option<(u16, u16)>,
+    /// Monotonic session revision this frame was composed at.
+    ///
+    /// Arrival order is not trustworthy: a queued broadcast can be delivered
+    /// after a newer snapshot written directly on attach. The client keeps the
+    /// highest revision it has seen and drops anything older, so the screen
+    /// cannot regress.
+    pub revision: u64,
 }
 
 impl Frame {
     pub fn blank(cols: u16, rows: u16) -> Self {
-        Self { cols, rows, cells: vec![Cell::default(); cols as usize * rows as usize], cursor: None }
+        Self {
+            cols,
+            rows,
+            cells: vec![Cell::default(); cols as usize * rows as usize],
+            cursor: None,
+            revision: 0,
+        }
     }
 }

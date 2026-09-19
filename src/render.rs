@@ -54,7 +54,7 @@ pub fn frame_from_screen(screen: &vt100::Screen) -> Frame {
         let (r, c) = screen.cursor_position();
         Some((c, r))
     };
-    Frame { cols, rows, cells, cursor }
+    Frame { cols, rows, cells, cursor, revision: 0 }
 }
 
 /// Paint a Frame into a ratatui Buffer at an offset.

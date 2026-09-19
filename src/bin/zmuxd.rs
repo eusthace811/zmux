@@ -55,7 +55,6 @@ fn main() -> Result<()> {
                     idle_since = None;
                 }
             }
-            std::process::exit(0);
         });
     }
 
@@ -63,10 +62,16 @@ fn main() -> Result<()> {
         let stream = match listener.accept() {
             Ok(s) => s,
             Err(e) => {
+                if !session.running.load(Ordering::Relaxed) {
+                    break;
+                }
                 eprintln!("[zmuxd] accept: {e}");
                 continue;
             }
         };
+        if !session.running.load(Ordering::Relaxed) {
+            break;
+        }
         let s = Arc::clone(&session);
         std::thread::spawn(move || {
             if let Err(e) = serve(s, stream) {
@@ -74,15 +79,26 @@ fn main() -> Result<()> {
             }
         });
     }
+    // Tear every ConPTY down explicitly rather than exiting under them.
+    session.shutdown();
+    eprintln!("[zmuxd] stopped");
     Ok(())
 }
 
-/// Coalesce pty output into frames. Output arrives in bursts, so redrawing per
-/// chunk would be wasteful; we mark dirty and emit at most one frame per tick.
+/// Frame pacing.
+///
+/// An earlier version used `recv_timeout(16ms)` and published at the bottom of
+/// every successful iteration - but recv_timeout returns IMMEDIATELY when an
+/// event is waiting, so continuous output produced one full composite per pty
+/// read chunk, hundreds per second. This uses a real deadline: drain whatever
+/// has arrived, then publish at most once per FRAME_INTERVAL.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
 fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEvent)>) {
     let mut dirty = false;
+    let mut next_frame = std::time::Instant::now();
     loop {
-        match events.recv_timeout(Duration::from_millis(16)) {
+        match events.recv_timeout(FRAME_INTERVAL) {
             Ok((_, PtyEvent::Output(_))) => dirty = true,
             Ok((id, PtyEvent::Exited(code))) => {
                 // Only the LAST pane exiting ends the session; otherwise the
@@ -100,15 +116,23 @@ fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEve
                 return;
             }
         }
-        if dirty && session.client_count() > 0 {
-            session.revision.fetch_add(1, Ordering::Relaxed);
-            session.broadcast(&ServerMsg::Frame(session.snapshot()));
-            dirty = false;
-        } else if dirty && session.client_count() == 0 {
-            // Nobody attached: keep parsing (vt100 is fed on the reader thread)
-            // but do not render. Reattach sends a full frame anyway.
-            dirty = false;
+        if !dirty {
+            continue;
         }
+        // Nobody attached: keep parsing (vt100 is fed on the reader thread)
+        // but do not spend CPU compositing. Reattach sends a full frame.
+        if session.client_count() == 0 {
+            dirty = false;
+            continue;
+        }
+        let now = std::time::Instant::now();
+        if now < next_frame {
+            continue;
+        }
+        next_frame = now + FRAME_INTERVAL;
+        session.revision.fetch_add(1, Ordering::Relaxed);
+        session.publish();
+        dirty = false;
     }
 }
 
@@ -163,9 +187,11 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
             (cols, rows)
         }
         Some(ClientMsg::Shutdown) => {
-            ipc::write_msg(&mut stream, &ServerMsg::ShuttingDown)?;
+            let _ = ipc::write_msg(&mut stream, &ServerMsg::ShuttingDown);
             session.shutdown();
-            std::process::exit(0);
+            // Unblock the accept loop so main() can run its clean teardown.
+            let _ = ipc::connect(&session.name);
+            return Ok(());
         }
         other => {
             ipc::write_msg(&mut stream, &ServerMsg::Refused {
@@ -184,6 +210,10 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
 
     // Full frame immediately on attach: a reattaching client has no history,
     // and deltas are meaningless without a base (DESIGN.md §4 Phase 2).
+    //
+    // A broadcast queued between attach() and here would be OLDER than this
+    // snapshot but arrive after it. Frames carry their revision and the client
+    // drops anything it has already surpassed, so the screen cannot regress.
     ipc::write_msg(&mut stream, &ServerMsg::Frame(session.snapshot()))?;
 
     // Inbound on its own thread; socket reads block.

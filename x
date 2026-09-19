@@ -27,5 +27,9 @@ case "${1:-test}" in
   run)     shift; "$CARGO" build --release --manifest-path "$MANIFEST"
            echo "Run this from a Git Bash window (it needs a console):"
            echo "  $(wslpath -w "$target_unix/release/zmux.exe")" ;;
-  *)       "$CARGO" "$@" --manifest-path "$MANIFEST" ;;
+  *)       # Insert --manifest-path right after the subcommand: appending it
+           # would land after any `--`, where it reaches the test binary
+           # instead of cargo.
+           sub="$1"; shift
+           "$CARGO" "$sub" --manifest-path "$MANIFEST" "$@" ;;
 esac

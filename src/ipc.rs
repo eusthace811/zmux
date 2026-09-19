@@ -26,6 +26,9 @@ fn bincode_config() -> bincode::config::Configuration {
 
 /// Length-prefixed write: u32 big-endian length, then the payload.
 pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
+    // NOTE: this checks AFTER encoding, so a pathological message is still
+    // allocated once. Callers bound their inputs upstream (protocol::MAX_*);
+    // this is the backstop, not the primary defence.
     let bytes = bincode::serde::encode_to_vec(msg, bincode_config())
         .context("encode message")?;
     if bytes.len() as u64 > MAX_FRAME_BYTES as u64 {

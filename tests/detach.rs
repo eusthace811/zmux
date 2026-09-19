@@ -5,47 +5,34 @@
 //! like it worked - the client exited cleanly - and persistence was a fiction.
 
 mod common;
-use common::{text_of, wait_for, Daemon};
+use common::Daemon;
 
 use zmux::ipc;
-use zmux::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
-
-fn hello(s: &mut interprocess::local_socket::Stream, cols: u16, rows: u16) {
-    ipc::write_msg(s, &ClientMsg::Hello { version: PROTOCOL_VERSION, cols, rows }).expect("hello");
-    match ipc::read_msg::<_, ServerMsg>(s).expect("reply") {
-        Some(ServerMsg::Hello { .. }) => {}
-        other => panic!("expected Hello, got {other:?}"),
-    }
-}
+use zmux::protocol::{ClientMsg, ServerMsg};
 
 #[test]
 fn shell_survives_detach_and_state_is_restored_on_reattach() {
     let d = Daemon::start("zmux-test-detach");
 
-    // Attach, leave a marker in the scrollback, detach.
+    // Attach, leave a marker on screen, detach.
     {
-        let mut s = ipc::connect(&d.session).expect("connect");
-        hello(&mut s, 80, 24);
-        assert!(wait_for(&mut s, 20, |t| t.contains('$')).is_some(), "no prompt");
-        ipc::write_msg(&mut s, &ClientMsg::Input { data: b"echo PERSIST_MARKER\r".to_vec() })
-            .expect("input");
+        let mut c = d.attach_ready(80, 24);
+        c.input("echo PERSIST_MARKER\r");
         assert!(
-            wait_for(&mut s, 20, |t| t.matches("PERSIST_MARKER").count() >= 2).is_some(),
+            c.wait_for(20, |t| t.matches("PERSIST_MARKER").count() >= 2).is_some(),
             "marker never rendered"
         );
-        ipc::write_msg(&mut s, &ClientMsg::Detach).expect("detach");
+        c.send(&ClientMsg::Detach);
     }
-
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // The daemon must still be listening - this is the whole feature.
     assert!(ipc::is_running(&d.session), "daemon died on detach; session was not persistent");
 
     // Reattach: the first frame must already carry the pre-detach screen.
-    let mut s2 = ipc::connect(&d.session).expect("reconnect");
-    hello(&mut s2, 80, 24);
-    let first = match ipc::read_msg::<_, ServerMsg>(&mut s2).expect("frame") {
-        Some(ServerMsg::Frame(f)) => text_of(&f),
+    let mut c2 = d.attach(80, 24);
+    let first = match c2.next_msg(10_000) {
+        Some(ServerMsg::Frame(f)) => common::text_of(&f),
         other => panic!("expected an immediate full Frame on attach, got {other:?}"),
     };
     assert!(
@@ -54,11 +41,9 @@ fn shell_survives_detach_and_state_is_restored_on_reattach() {
     );
 
     // And the same shell is still alive, not a fresh one.
-    ipc::write_msg(&mut s2, &ClientMsg::Input { data: b"echo SECOND_MARKER\r".to_vec() })
-        .expect("input");
+    c2.input("echo SECOND_MARKER\r");
     assert!(
-        wait_for(&mut s2, 20, |t| t.contains("SECOND_MARKER") && t.contains("PERSIST_MARKER"))
-            .is_some(),
+        c2.wait_for(20, |t| t.contains("SECOND_MARKER") && t.contains("PERSIST_MARKER")).is_some(),
         "shell did not respond after reattach"
     );
 }
@@ -67,17 +52,19 @@ fn shell_survives_detach_and_state_is_restored_on_reattach() {
 fn reattaching_at_a_different_size_resizes_the_pty() {
     let d = Daemon::start("zmux-test-resize");
     {
-        let mut s = ipc::connect(&d.session).expect("connect");
-        hello(&mut s, 80, 24);
-        assert!(wait_for(&mut s, 20, |t| t.contains('$')).is_some(), "no prompt");
-        ipc::write_msg(&mut s, &ClientMsg::Detach).expect("detach");
+        let mut c = d.attach_ready(80, 24);
+        c.send(&ClientMsg::Detach);
     }
-    let mut s2 = ipc::connect(&d.session).expect("reconnect");
-    hello(&mut s2, 100, 30);
+    // Let the daemon actually deregister the old client. The session sizes to
+    // the SMALLEST attached viewport, so attaching before the 80x24 client is
+    // gone would correctly keep the session at 80 columns.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let mut c2 = d.attach(100, 30);
     // `tput cols` reports what the pty believes, which is what we changed.
-    ipc::write_msg(&mut s2, &ClientMsg::Input { data: b"tput cols\r".to_vec() }).expect("input");
+    c2.input("tput cols\r");
     assert!(
-        wait_for(&mut s2, 20, |t| t.contains("100")).is_some(),
+        c2.wait_for(20, |t| t.contains("100")).is_some(),
         "pty was not resized to the reattaching client's viewport"
     );
 }

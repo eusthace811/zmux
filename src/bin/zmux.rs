@@ -149,12 +149,16 @@ fn attach(session: String) -> Result<()> {
     std::thread::spawn(move || {
         while let Ok(Some(msg)) = ipc::read_msg::<_, ServerMsg>(&mut rstream) {
             if frame_tx.send(msg).is_err() {
-                break;
+                return;
             }
         }
+        // Dropping frame_tx here disconnects frame_rx, which is how the main
+        // loop learns the daemon is gone. Without this the client sits in raw
+        // alternate-screen mode redrawing the last frame forever.
     });
 
     let mut latest: Option<Frame> = None;
+    let mut seen_revision = 0u64;
     loop {
         // Input. Ctrl-b is the prefix, as in tmux.
         if event::poll(Duration::from_millis(8))? {
@@ -191,17 +195,34 @@ fn attach(session: String) -> Result<()> {
             }
         }
 
-        // Newest frame wins; older ones are stale by definition.
-        while let Ok(msg) = frame_rx.try_recv() {
-            match msg {
-                ServerMsg::Frame(f) => latest = Some(f),
-                ServerMsg::PaneExited { code } => {
+        // Arrival order is not trustworthy: a queued broadcast can land after
+        // a newer snapshot written directly on attach. Revisions decide.
+        loop {
+            match frame_rx.try_recv() {
+                Ok(ServerMsg::Frame(f)) => {
+                    if f.revision >= seen_revision {
+                        seen_revision = f.revision;
+                        latest = Some(f);
+                    }
+                }
+                Ok(ServerMsg::PaneExited { code }) => {
                     drop(_guard);
-                    println!("pane exited with code {code}");
+                    println!("session ended (exit code {code})");
                     return Ok(());
                 }
-                ServerMsg::Detached => return Ok(()),
-                _ => {}
+                Ok(ServerMsg::Detached) => return Ok(()),
+                Ok(ServerMsg::ShuttingDown) => {
+                    drop(_guard);
+                    println!("session terminated");
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    drop(_guard);
+                    eprintln!("lost connection to the daemon");
+                    return Ok(());
+                }
             }
         }
 
