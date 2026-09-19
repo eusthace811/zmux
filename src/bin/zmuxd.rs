@@ -171,6 +171,11 @@ fn apply(session: &Arc<Session>, cmd: Cmd) -> Result<()> {
         Cmd::ResizeDown => {
             session.resize_focused(Nav::Down, 1);
         }
+        Cmd::ScrollUp => session.scroll_focused(Some(1)),
+        Cmd::ScrollDown => session.scroll_focused(Some(-1)),
+        Cmd::ScrollPageUp => session.scroll_focused(Some(10)),
+        Cmd::ScrollPageDown => session.scroll_focused(Some(-10)),
+        Cmd::ScrollToBottom => session.scroll_focused(None),
     }
     Ok(())
 }

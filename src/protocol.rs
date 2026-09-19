@@ -64,6 +64,12 @@ pub enum Cmd {
     ResizeRight,
     ResizeUp,
     ResizeDown,
+    // --- appended. Append-only. ---
+    ScrollUp,
+    ScrollDown,
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollToBottom,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

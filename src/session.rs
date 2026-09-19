@@ -15,6 +15,7 @@ use anyhow::{bail, Result};
 use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::protocol::{clamp_size, Frame, ServerMsg, MAX_INPUT_BYTES, MAX_PANES};
 use crate::pty::{Pane, PtyEvent};
+use crate::persist::{self, SessionSnapshot};
 use crate::render::{composite, frame_from_screen, pane_area};
 use crate::term::Term;
 
@@ -60,6 +61,16 @@ pub struct Session {
     events_tx: Sender<(PaneId, PtyEvent)>,
 }
 
+/// Restore the pane arrangement from disk, if there is a usable one.
+///
+/// Processes cannot be restored; directories can. Each restored pane gets a
+/// fresh shell started in the directory that pane last reported.
+fn restore_layout(name: &str) -> Option<(Layout, HashMap<u32, String>)> {
+    let snap = persist::load(name)?;
+    let layout = Layout::from_saved(snap.root, snap.focus);
+    Some((layout, snap.cwds))
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     match m.lock() {
         Ok(g) => g,
@@ -71,11 +82,15 @@ impl Session {
     pub fn new(name: &str, cols: u16, rows: u16) -> Result<(Arc<Self>, Receiver<(PaneId, PtyEvent)>)> {
         let (cols, rows) = clamp_size(cols, rows);
         let (events_tx, events_rx) = std::sync::mpsc::channel();
-        let first = PaneId::alloc();
+        let restored = restore_layout(name);
+        let layout = match &restored {
+            Some((l, _)) => l.clone(),
+            None => Layout::new(PaneId::alloc()),
+        };
         let session = Arc::new(Self {
             name: name.to_string(),
             panes: Mutex::new(HashMap::new()),
-            layout: Mutex::new(Layout::new(first)),
+            layout: Mutex::new(layout),
             clients: Mutex::new(Vec::new()),
             next_client: AtomicU64::new(1),
             running: Arc::new(AtomicBool::new(true)),
@@ -85,18 +100,91 @@ impl Session {
             events_tx,
         });
         let area = pane_area(cols, rows);
-        session.spawn_pane(first, area.w, area.h)?;
+        let (rects, _) = lock(&session.layout).compute(area);
+        let cwds = restored.map(|(_, c)| c).unwrap_or_default();
+        for (id, rect) in rects {
+            let dir = cwds
+                .get(&id.0)
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_dir());
+            if let Err(e) = session.spawn_pane_in(id, rect.w, rect.h, dir) {
+                // One dead pane must not prevent the session from starting:
+                // drop it from the layout and carry on with the rest.
+                eprintln!("[session] could not restore pane {}: {e}", id.0);
+                let mut l = lock(&session.layout);
+                if l.len() > 1 {
+                    l.set_focus(id);
+                    l.close_focused();
+                }
+            }
+        }
+        // A restored layout whose panes all failed leaves nothing to show.
+        if lock(&session.panes).is_empty() {
+            let id = PaneId::alloc();
+            *lock(&session.layout) = Layout::new(id);
+            session.spawn_pane(id, area.w, area.h)?;
+        }
+        session.save_state();
         Ok((session, events_rx))
+    }
+
+    /// Persist the layout and each pane's directory.
+    ///
+    /// Called after any structural change. Failures are logged, never fatal:
+    /// not being able to save a layout is no reason to lose a working session.
+    pub fn save_state(&self) {
+        let (root, focus) = {
+            let l = lock(&self.layout);
+            (l.root_snapshot(), l.focus())
+        };
+        let cwds = {
+            let panes = lock(&self.panes);
+            panes
+                .iter()
+                .filter_map(|(id, p)| lock(&p.term).cwd_windows().map(|d| (id.0, d)))
+                .collect()
+        };
+        let snap = SessionSnapshot {
+            version: persist::FORMAT_VERSION,
+            name: self.name.clone(),
+            root,
+            focus,
+            cwds,
+        };
+        if let Err(e) = persist::save(&snap) {
+            eprintln!("[session] could not save layout: {e}");
+        }
+    }
+
+    /// The focused pane's reported working directory, if the shell has sent
+    /// one. New panes start there, as tmux does.
+    fn focused_cwd(&self) -> Option<std::path::PathBuf> {
+        let id = self.focus();
+        let panes = lock(&self.panes);
+        let p = panes.get(&id)?;
+        let dir = lock(&p.term).cwd_windows()?;
+        let path = std::path::PathBuf::from(dir);
+        path.is_dir().then_some(path)
     }
 
     /// Create the pty for `id` and start forwarding its events.
     fn spawn_pane(&self, id: PaneId, cols: u16, rows: u16) -> Result<()> {
+        self.spawn_pane_in(id, cols, rows, None)
+    }
+
+    fn spawn_pane_in(
+        &self,
+        id: PaneId,
+        cols: u16,
+        rows: u16,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<()> {
         let term = Arc::new(Mutex::new(Term::new(cols.max(1), rows.max(1), SCROLLBACK)));
         let feed = Arc::clone(&term);
 
         // Feed vt100, then answer device queries. Answering is MANDATORY:
         // ConPTY emits ESC[6n at startup and deadlocks if ignored (§2.5).
-        let (pty, events) = Pane::spawn(cols.max(1), rows.max(1), move |chunk| {
+        let (pty, events) = Pane::spawn_in(cols.max(1), rows.max(1), cwd.as_deref(), move |chunk| {
             let mut t = lock(&feed);
             t.parser.process(chunk);
             let cur = t.cursor();
@@ -139,6 +227,7 @@ impl Session {
         if data.len() > MAX_INPUT_BYTES {
             bail!("input of {} bytes exceeds MAX_INPUT_BYTES", data.len());
         }
+        self.follow_focused();
         let id = self.focus();
         let pty = {
             let panes = lock(&self.panes);
@@ -165,7 +254,9 @@ impl Session {
             return Ok(None); // too small; no pty is created for a pane that cannot fit
         }
         let rect = lock(&self.layout).rect_of(new_id, area).unwrap_or(Rect::new(0, 0, 1, 1));
-        if let Err(e) = self.spawn_pane(new_id, rect.w, rect.h) {
+        // Inherit the focused pane's directory, as tmux does.
+        let inherit = self.focused_cwd();
+        if let Err(e) = self.spawn_pane_in(new_id, rect.w, rect.h, inherit) {
             // Roll the tree back: a leaf with no runtime would render as a
             // dead hole and confuse focus and reflow.
             let mut l = lock(&self.layout);
@@ -174,6 +265,8 @@ impl Session {
             return Err(e);
         }
         self.reflow_locked();
+        drop(_g);
+        self.save_state();
         Ok(Some(new_id))
     }
 
@@ -189,6 +282,8 @@ impl Session {
                     p.pty.close();
                 }
                 self.reflow_locked();
+                drop(_g);
+                self.save_state();
                 true
             }
             None => false,
@@ -231,6 +326,35 @@ impl Session {
             self.reflow_locked();
         }
         changed
+    }
+
+    /// Scroll the focused pane's history. `None` snaps back to live output.
+    pub fn scroll_focused(&self, lines: Option<i64>) {
+        let id = self.focus();
+        let panes = lock(&self.panes);
+        let Some(p) = panes.get(&id) else { return };
+        let mut t = lock(&p.term);
+        match lines {
+            None => t.scroll_to_bottom(),
+            Some(n) if n > 0 => t.scroll_up(n as usize),
+            Some(n) => t.scroll_down((-n) as usize),
+        }
+    }
+
+    /// True when the focused pane is showing history rather than live output.
+    pub fn focused_is_scrolled(&self) -> bool {
+        let id = self.focus();
+        let panes = lock(&self.panes);
+        panes.get(&id).is_some_and(|p| lock(&p.term).scroll_offset() > 0)
+    }
+
+    /// Typing snaps the view back to live output, as a terminal does.
+    pub fn follow_focused(&self) {
+        let id = self.focus();
+        let panes = lock(&self.panes);
+        if let Some(p) = panes.get(&id) {
+            lock(&p.term).follow_output();
+        }
     }
 
     pub fn focus_at(&self, x: u16, y: u16) -> bool {
@@ -355,13 +479,18 @@ impl Session {
     }
 
     pub fn status_line(&self) -> String {
-        let l = lock(&self.layout);
+        let (n, focus) = {
+            let l = lock(&self.layout);
+            (l.len(), l.focus().0)
+        };
+        let scrolled = if self.focused_is_scrolled() { " | SCROLL" } else { "" };
         format!(
-            " {} | {} pane{} | pane {} | C-b ? help ",
+            " {} | {} pane{} | pane {}{} ",
             self.name,
-            l.len(),
-            if l.len() == 1 { "" } else { "s" },
-            l.focus().0
+            n,
+            if n == 1 { "" } else { "s" },
+            focus,
+            scrolled
         )
     }
 

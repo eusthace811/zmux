@@ -3,6 +3,8 @@
 //! vt100 handles the grid, scrollback and alt-screen. It does NOT generate
 //! replies to device queries, so we do that here (DESIGN.md §0.3, §2.5).
 
+use std::sync::{Arc, Mutex};
+
 use vt100::Parser;
 
 /// Scans for terminal queries and produces the replies the pane expects.
@@ -104,14 +106,116 @@ fn classify(s: &[u8]) -> Query {
     }
 }
 
+/// Side-channel facts vt100 surfaces through callbacks rather than the grid.
+#[derive(Default)]
+pub struct Signals {
+    /// Latest OSC 7 working directory, as the shell reported it (MSYS form).
+    pub cwd: Option<String>,
+    /// Latest OSC 0/2 window title.
+    pub title: Option<String>,
+    /// Bell since last checked.
+    pub bell: bool,
+}
+
+/// vt100 callback sink. OSC 7 is not a sequence vt100 handles itself, so it
+/// arrives via `unhandled_osc` - which is how we get cwd at all on Windows
+/// (DESIGN.md §4).
+pub struct Hooks {
+    pub signals: Arc<Mutex<Signals>>,
+}
+
+impl vt100::Callbacks for Hooks {
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        // OSC 7 ; file://host/path
+        if params.len() >= 2 && params[0] == b"7" {
+            if let Ok(payload) = std::str::from_utf8(params[1]) {
+                if let Some(path) = crate::cwd::parse_osc7(payload) {
+                    if let Ok(mut s) = self.signals.lock() {
+                        s.cwd = Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        if let Ok(t) = std::str::from_utf8(title) {
+            if let Ok(mut s) = self.signals.lock() {
+                s.title = Some(t.to_string());
+            }
+        }
+    }
+
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        if let Ok(mut s) = self.signals.lock() {
+            s.bell = true;
+        }
+    }
+}
+
 pub struct Term {
-    pub parser: Parser,
+    pub parser: Parser<Hooks>,
+    pub signals: Arc<Mutex<Signals>>,
     pub responder: QueryResponder,
+    /// Rows scrolled back from the live screen. 0 = following output.
+    scroll: usize,
 }
 
 impl Term {
     pub fn new(cols: u16, rows: u16, scrollback: usize) -> Self {
-        Self { parser: Parser::new(rows, cols, scrollback), responder: QueryResponder::default() }
+        let signals = Arc::new(Mutex::new(Signals::default()));
+        Self {
+            parser: Parser::new_with_callbacks(
+                rows,
+                cols,
+                scrollback,
+                Hooks { signals: Arc::clone(&signals) },
+            ),
+            signals,
+            responder: QueryResponder::default(),
+            scroll: 0,
+        }
+    }
+
+    /// Latest reported working directory, converted to a Windows path.
+    pub fn cwd_windows(&self) -> Option<String> {
+        let s = self.signals.lock().ok()?;
+        s.cwd.as_deref().map(crate::cwd::msys_to_windows)
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll
+    }
+
+    /// Scroll back by `lines`, clamped by vt100 to the real history length.
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_add(lines);
+        self.apply_scroll();
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
+        self.apply_scroll();
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll = 0;
+        self.apply_scroll();
+    }
+
+    fn apply_scroll(&mut self) {
+        self.parser.screen_mut().set_scrollback(self.scroll);
+        // vt100 clamps to the available history, so read back what it accepted
+        // rather than trusting our own counter.
+        self.scroll = self.parser.screen().scrollback();
+    }
+
+    /// New output should snap the view back to the live screen, exactly as a
+    /// terminal does - otherwise typing while scrolled back looks frozen.
+    pub fn follow_output(&mut self) {
+        if self.scroll != 0 {
+            self.scroll_to_bottom();
+        }
     }
 
     pub fn cursor(&self) -> (u16, u16) {

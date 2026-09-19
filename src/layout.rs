@@ -113,6 +113,11 @@ impl Layout {
         self.focus
     }
 
+    /// The raw tree, for persistence.
+    pub fn root_snapshot(&self) -> Node {
+        self.root.clone()
+    }
+
     pub fn panes(&self) -> Vec<PaneId> {
         let mut v = Vec::new();
         self.root.leaves(&mut v);

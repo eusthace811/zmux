@@ -51,6 +51,20 @@ pub fn find_git_bash() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Write the shell-integration rcfile once per daemon and return its path.
+fn ensure_rcfile() -> Result<std::path::PathBuf> {
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("zmux");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("zmux.bashrc");
+    // Rewrite every time: a stale copy from an older build would silently
+    // change shell behaviour in ways that are painful to diagnose.
+    std::fs::write(&path, crate::cwd::RCFILE.as_bytes())?;
+    Ok(path)
+}
+
 pub enum PtyEvent {
     Output(Vec<u8>),
     Exited(i32),
@@ -105,7 +119,20 @@ impl Pane {
     /// emits `ESC[6n` during startup. Leave it unanswered and the shell never
     /// finishes initialising and teardown deadlocks. Reproduced on Windows 11
     /// build 26200 (DESIGN.md §2.5).
-    pub fn spawn<F>(cols: u16, rows: u16, mut on_output: F) -> Result<(Self, Receiver<PtyEvent>)>
+    pub fn spawn<F>(cols: u16, rows: u16, on_output: F) -> Result<(Self, Receiver<PtyEvent>)>
+    where
+        F: FnMut(&[u8]) -> Vec<u8> + Send + 'static,
+    {
+        Self::spawn_in(cols, rows, None, on_output)
+    }
+
+    /// Spawn with an explicit starting directory.
+    pub fn spawn_in<F>(
+        cols: u16,
+        rows: u16,
+        cwd: Option<&std::path::Path>,
+        mut on_output: F,
+    ) -> Result<(Self, Receiver<PtyEvent>)>
     where
         F: FnMut(&[u8]) -> Vec<u8> + Send + 'static,
     {
@@ -121,9 +148,33 @@ impl Pane {
         // which startup files run. herdr's windows_login_shell_args does the
         // same (`pane.rs:1856`).
         let mut cmd = CommandBuilder::new(&shell);
-        cmd.arg("-l");
-        if let Ok(cwd) = std::env::current_dir() {
-            cmd.cwd(cwd);
+        // Shell integration for OSC 7 cwd reporting.
+        //
+        // NOTE: deliberately NOT `-l`. A login shell ignores --rcfile, so the
+        // two are mutually exclusive; cwd::RCFILE does the login shell's work
+        // instead. Long options must also precede short ones - `bash -l
+        // --rcfile X` is rejected outright with "--: invalid option".
+        //
+        // If the rcfile cannot be written we fall back to a plain login shell:
+        // losing cwd tracking is much better than losing the user's profile.
+        match ensure_rcfile() {
+            Ok(rc) => {
+                cmd.arg("--rcfile");
+                cmd.arg(&rc);
+                cmd.arg("-i");
+            }
+            Err(e) => {
+                eprintln!("[pty] no shell integration ({e}); falling back to a login shell");
+                cmd.arg("-l");
+            }
+        }
+        match cwd {
+            Some(d) if d.is_dir() => cmd.cwd(d),
+            _ => {
+                if let Ok(d) = std::env::current_dir() {
+                    cmd.cwd(d);
+                }
+            }
         }
 
         let mut child = pair

@@ -168,6 +168,7 @@ fn attach(session: String) -> Result<()> {
                         ipc::write_msg(&mut stream, &ClientMsg::Detach)?;
                         break;
                     }
+                    Prefix::Scroll => scroll_mode(&mut stream)?,
                     Prefix::Command(cmd) => {
                         ipc::write_msg(&mut stream, &ClientMsg::Command(cmd))?;
                     }
@@ -183,11 +184,19 @@ fn attach(session: String) -> Result<()> {
                         ipc::write_msg(&mut stream, &ClientMsg::Input { data: bytes })?;
                     }
                 }
-                Event::Mouse(m) => {
-                    if matches!(m.kind, event::MouseEventKind::Down(event::MouseButton::Left)) {
+                Event::Mouse(m) => match m.kind {
+                    event::MouseEventKind::Down(event::MouseButton::Left) => {
                         ipc::write_msg(&mut stream, &ClientMsg::Click { x: m.column, y: m.row })?;
                     }
-                }
+                    // Wheel scrolls history directly - no mode to enter.
+                    event::MouseEventKind::ScrollUp => {
+                        ipc::write_msg(&mut stream, &ClientMsg::Command(Cmd::ScrollUp))?;
+                    }
+                    event::MouseEventKind::ScrollDown => {
+                        ipc::write_msg(&mut stream, &ClientMsg::Command(Cmd::ScrollDown))?;
+                    }
+                    _ => {}
+                },
                 Event::Resize(c, r) => {
                     ipc::write_msg(&mut stream, &ClientMsg::Resize { cols: c, rows: r })?;
                 }
@@ -249,6 +258,8 @@ enum Prefix {
     Detach,
     Command(Cmd),
     Literal,
+    /// Enter scroll mode: keys drive history until q/Esc/Enter leaves it.
+    Scroll,
     Ignore,
 }
 
@@ -268,6 +279,8 @@ fn read_prefix_command() -> Result<Prefix> {
         KeyCode::Char('%') => Prefix::Command(Cmd::SplitHorizontal),
         KeyCode::Char('"') => Prefix::Command(Cmd::SplitVertical),
         KeyCode::Char('x') => Prefix::Command(Cmd::ClosePane),
+        KeyCode::Char('[') => Prefix::Scroll,
+        KeyCode::PageUp => Prefix::Command(Cmd::ScrollPageUp),
         KeyCode::Left if ctrl => Prefix::Command(Cmd::ResizeLeft),
         KeyCode::Right if ctrl => Prefix::Command(Cmd::ResizeRight),
         KeyCode::Up if ctrl => Prefix::Command(Cmd::ResizeUp),
@@ -278,6 +291,49 @@ fn read_prefix_command() -> Result<Prefix> {
         KeyCode::Down => Prefix::Command(Cmd::FocusDown),
         _ => Prefix::Ignore,
     })
+}
+
+/// Scroll mode: arrows and page keys move through history; q, Esc or Enter
+/// leave it and snap back to live output.
+///
+/// Blocking here keeps the mode explicit and avoids threading a mode flag
+/// through the main loop, at the cost of not repainting while scrolling - the
+/// daemon still pushes frames, which the next loop iteration drains.
+fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<()> {
+    loop {
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        let cmd = match event::read()? {
+            Event::Key(k) => match k.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+                    ipc::write_msg(stream, &ClientMsg::Command(Cmd::ScrollToBottom))?;
+                    return Ok(());
+                }
+                KeyCode::Up | KeyCode::Char('k') => Cmd::ScrollUp,
+                KeyCode::Down | KeyCode::Char('j') => Cmd::ScrollDown,
+                KeyCode::PageUp | KeyCode::Char(' ') => Cmd::ScrollPageUp,
+                KeyCode::PageDown => Cmd::ScrollPageDown,
+                KeyCode::Home => Cmd::ScrollPageUp,
+                KeyCode::End => {
+                    ipc::write_msg(stream, &ClientMsg::Command(Cmd::ScrollToBottom))?;
+                    return Ok(());
+                }
+                _ => continue,
+            },
+            Event::Mouse(m) => match m.kind {
+                event::MouseEventKind::ScrollUp => Cmd::ScrollUp,
+                event::MouseEventKind::ScrollDown => Cmd::ScrollDown,
+                _ => continue,
+            },
+            Event::Resize(c, r) => {
+                ipc::write_msg(stream, &ClientMsg::Resize { cols: c, rows: r })?;
+                continue;
+            }
+            _ => continue,
+        };
+        ipc::write_msg(stream, &ClientMsg::Command(cmd))?;
+    }
 }
 
 /// Minimal key encoder.
