@@ -334,13 +334,23 @@ impl Session {
     /// A pane's process exited: remove it, and end the session if it was last.
     pub fn pane_exited(&self, id: PaneId) -> bool {
         let _g = lock(&self.geometry);
+        // A manual close can race an already-queued Exited for the same pane.
+        // Without this check set_focus(id) fails, its result is ignored, and
+        // close_focused() removes whichever pane happens to be FOCUSED -
+        // killing a live pane and orphaning it in the pane map.
+        if !lock(&self.layout).panes().contains(&id) {
+            lock(&self.panes).remove(&id);
+            return false;
+        }
         if lock(&self.layout).len() <= 1 {
             return true;
         }
         {
             let mut l = lock(&self.layout);
             let previous = l.focus();
-            l.set_focus(id);
+            if !l.set_focus(id) {
+                return false; // vanished between the check and here
+            }
             l.close_focused();
             // Keep the user's focus where it was unless it was the dead pane.
             if previous != id {
@@ -517,7 +527,8 @@ impl Session {
     /// Register a client. The caller must send it a full snapshot before
     /// forwarding anything from the returned queue.
     pub fn attach(&self, cols: u16, rows: u16) -> (u64, Receiver<ServerMsg>) {
-        let (cols, rows) = clamp_size(cols, rows);
+        // Raw, for the same reason as set_client_size; apply_size filters and
+        // then clamps the surviving minimum.
         let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE);
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
         self.lock_clients().push(Client { id, tx, cols, rows, lagged: false, needs_full: true });
@@ -535,7 +546,9 @@ impl Session {
     }
 
     pub fn set_client_size(&self, id: u64, cols: u16, rows: u16) {
-        let (cols, rows) = clamp_size(cols, rows);
+        // Store the RAW size. Clamping here made the "ignore degenerate
+        // clients" filter in apply_size dead code: a minimised client
+        // reporting 0x0 became 8x3 and pinned every other viewport.
         {
             let mut cs = self.lock_clients();
             if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
@@ -565,6 +578,7 @@ impl Session {
                     .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
             };
             let Some((cols, rows)) = next else { return }; // no usable client: keep current
+            let (cols, rows) = clamp_size(cols, rows);
             let mut s = lock(&self.size);
             if *s == (cols, rows) {
                 false
@@ -670,11 +684,29 @@ impl Session {
         // structural changes, so a plain `cd` before shutdown was lost.
         self.save_state();
         // Take `geometry` so a concurrent split cannot insert a pane AFTER the
-        // map is drained, which would leave a ConPTY outside teardown.
-        let _g = lock(&self.geometry);
-        let panes: Vec<_> = lock(&self.panes).drain().map(|(_, p)| p).collect();
-        for p in panes {
-            p.pty.close();
+        // map is drained, leaving a ConPTY outside teardown. Released before
+        // closing.
+        let panes: Vec<_> = {
+            let _g = lock(&self.geometry);
+            lock(&self.panes).drain().map(|(_, p)| p).collect()
+        };
+        // Close OFF-THREAD and wait with a bound. ClosePseudoConsole can wait
+        // indefinitely before Win11 24H2, and doing it inline here wedged
+        // `kill`, idle exit and last-pane exit - the daemon would never die.
+        let handles: Vec<_> = panes
+            .into_iter()
+            .map(|p| std::thread::spawn(move || p.pty.close()))
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for h in handles {
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                eprintln!("[session] a ConPTY did not close within 5s; exiting anyway");
+            }
         }
     }
 }

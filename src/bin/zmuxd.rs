@@ -252,11 +252,48 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
         let _ = in_tx.send(ClientMsg::Detach);
     });
 
+    // OUTBOUND on its own thread too.
+    //
+    // Writing frames from the serve loop deadlocks against a client that stops
+    // reading: the daemon blocks filling the pipe with frames while that
+    // client blocks trying to send input, and neither side drains. Verified -
+    // it wedged a stress test. The read path must keep running however slow
+    // the peer is, so writes get their own thread. If that thread wedges only
+    // this connection suffers; the session and other clients stay responsive.
+    let mut wstream = stream.try_clone()?;
+    let writer = std::thread::spawn(move || {
+        while let Ok(msg) = outbox.recv() {
+            let stop = matches!(msg, ServerMsg::PaneExited { .. } | ServerMsg::ShuttingDown);
+            if ipc::write_msg(&mut wstream, &msg).is_err() || stop {
+                return;
+            }
+        }
+    });
+
     let result = (|| -> Result<()> {
         loop {
-            while let Ok(msg) = in_rx.try_recv() {
+            // Blocking recv with a timeout: the writer thread owns the socket
+            // now, so this loop only has to service inbound messages.
+            let msg = match in_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(m) => m,
+                Err(RecvTimeoutError::Timeout) => {
+                    if !session.running.load(Ordering::Relaxed) || writer.is_finished() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            };
+            {
                 match msg {
-                    ClientMsg::Input { data } => session.write_focused(&data)?,
+                    // A rejected oversized input closes this connection rather
+                    // than taking the session down.
+                    ClientMsg::Input { data } => {
+                        if let Err(e) = session.write_focused(&data) {
+                            eprintln!("[zmuxd] rejecting input from client {id}: {e}");
+                            return Ok(());
+                        }
+                    }
                     // Commands publish to EVERY client rather than writing a
                     // frame to this one stream. Two reasons: a split or a
                     // focus change is session state that other attached
@@ -273,30 +310,15 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     }
                     ClientMsg::Resize { cols, rows } => session.set_client_size(id, cols, rows),
                     ClientMsg::Detach => {
-                        let _ = ipc::write_msg(&mut stream, &ServerMsg::Detached);
+                        session.detach(id);
                         return Ok(());
                     }
                     ClientMsg::Shutdown => {
                         session.shutdown();
-                        let _ = ipc::write_msg(&mut stream, &ServerMsg::ShuttingDown);
                         return Ok(());
                     }
                     ClientMsg::Hello { .. } => {}
                 }
-            }
-            match outbox.recv_timeout(Duration::from_millis(16)) {
-                Ok(msg) => {
-                    let stop = matches!(msg, ServerMsg::PaneExited { .. } | ServerMsg::ShuttingDown);
-                    ipc::write_msg(&mut stream, &msg)?;
-                    if stop {
-                        return Ok(());
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return Ok(()),
-            }
-            if !session.running.load(Ordering::Relaxed) {
-                return Ok(());
             }
         }
     })();

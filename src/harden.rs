@@ -35,10 +35,15 @@ pub fn restrict_dll_search_path() {
         }
         // SAFETY: a documented Win32 call taking a flags word.
         if unsafe { SetDefaultDllDirectories(SYSTEM32_ONLY) } == 0 {
+            // FAIL CLOSED. This control exists to prevent arbitrary code
+            // execution; continuing without it would walk straight into the
+            // hijack path it was added to close.
             eprintln!(
-                "[zmux] warning: could not restrict the DLL search path; \
-                 a planted conpty.dll could be loaded"
+                "[zmux] fatal: could not restrict the DLL search path \
+                 (error {}); refusing to start.",
+                std::io::Error::last_os_error()
             );
+            std::process::exit(1);
         }
     }
 }

@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–5 complete. 72 tests passing, clippy clean.
+Phases 0–5 complete. 81 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -96,3 +96,20 @@ rendered grid. They need no console, so they run from WSL too.
 
 `cargo run --example dump -- <session>` prints a live session's screen as text,
 which is the quickest way to see what a running session actually looks like.
+
+`tests/stress.rs` covers the adversarial cases: a client that stops reading,
+sustained output, attach/detach churn, many splits, and malformed input.
+
+## Known limitations
+
+- **Pre-24H2 `ClosePseudoConsole`** can block; teardown is bounded and gives up
+  rather than hanging, so a pane may be abandoned rather than reaped.
+- **A client that handshakes and then stops reading wedges itself** - the pipe
+  fills with frames it never drains. The daemon drops it and stays healthy,
+  which is what matters, but that client will not recover.
+- **No server identity check on connect.** The DACL restricts who can use the
+  pipe and the name is SID-keyed, but a local process could still pre-create
+  the name. `FILE_FLAG_FIRST_PIPE_INSTANCE` would close this; `interprocess`
+  does not expose it.
+- **Session names are sanitised lossily**, so `a/b` and `a_b` collide.
+- **Queues are bounded by message count, not bytes.**

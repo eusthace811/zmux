@@ -112,6 +112,12 @@ fn send_or_abort<T>(tx: &SyncSender<T>, mut msg: T, closing: &AtomicBool) -> boo
 /// Owns one ConPTY. `Send + Sync` so every attached connection can write to it
 /// without taking ownership - the session outlives any single client.
 pub struct Pane {
+    /// The child, kept so `close()` can terminate it.
+    ///
+    /// Closing the pseudoconsole is supposed to take the shell with it, but in
+    /// practice shells survived and accumulated as orphaned bash.exe processes
+    /// across runs. Teardown now kills explicitly rather than trusting that.
+    child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
     /// `Option` so `close()` can TAKE it and drop the pseudoconsole.
     ///
     /// This is load-bearing: the reader thread blocks in `read()` until the
@@ -211,7 +217,7 @@ impl Pane {
             }
         }
 
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| anyhow::anyhow!("spawn {}: {e}", shell.display()))?;
@@ -253,21 +259,58 @@ impl Pane {
             }
         });
 
+        let child = Arc::new(Mutex::new(Some(child)));
+        let waiter_child = Arc::clone(&child);
         let waiter_closing = Arc::clone(&closing);
         let waiter = std::thread::spawn(move || {
-            let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
-            send_or_abort(&exit_tx, PtyEvent::Exited(code), &waiter_closing);
+            // Poll rather than block in wait(): close() needs the same handle
+            // to kill the child, and a blocking wait would hold it forever.
+            loop {
+                {
+                    let mut guard = match waiter_child.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    match guard.as_mut() {
+                        None => return,
+                        Some(c) => match c.try_wait() {
+                            Ok(Some(status)) => {
+                                let code = status.exit_code() as i32;
+                                drop(guard);
+                                send_or_abort(&exit_tx, PtyEvent::Exited(code), &waiter_closing);
+                                return;
+                            }
+                            Ok(None) => {}
+                            Err(_) => return,
+                        },
+                    }
+                }
+                if waiter_closing.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         });
 
-        Ok((
-            Self {
+        let pane = Self {
                 master: Mutex::new(Some(pair.master)),
+                child: Mutex::new(None), // replaced below
                 writer,
-                closing,
-                threads: Mutex::new(vec![reader, waiter]),
-            },
-            events,
-        ))
+            closing,
+            threads: Mutex::new(vec![reader, waiter]),
+        };
+        // Hand the shared child handle to the pane so close() can kill it.
+        {
+            let mut slot = match pane.child.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            *slot = match child.lock() {
+                Ok(mut c) => c.take(),
+                Err(p) => p.into_inner().take(),
+            };
+        }
+        Ok((pane, events))
     }
 
     /// Tear the ConPTY down deliberately.
@@ -281,8 +324,23 @@ impl Pane {
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.flush();
         }
-        // Drop the master FIRST. That closes the pseudoconsole, which is what
-        // makes the blocked reader return so the join below can complete.
+        // Kill the child FIRST. Closing the pseudoconsole is supposed to take
+        // the shell with it, but shells were surviving and piling up as
+        // orphaned bash.exe processes. Killing explicitly also unblocks the
+        // reader promptly.
+        {
+            let mut c = match self.child.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(child) = c.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            *c = None;
+        }
+        // Then drop the master, closing the pseudoconsole, which is what makes
+        // any blocked reader return so the join below can complete.
         {
             let mut m = match self.master.lock() {
                 Ok(g) => g,

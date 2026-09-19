@@ -151,6 +151,12 @@ impl Frame {
         if d.base_revision != self.revision || d.cols != self.cols || d.rows != self.rows {
             return false;
         }
+        // Concurrent publishers can snapshot at N, pause, and emit a delta
+        // claiming base N+1 -> revision N. Checking the base alone would
+        // accept it and walk the client's revision backwards.
+        if d.revision < d.base_revision {
+            return false;
+        }
         let w = self.cols as usize;
         // Validate EVERY row before mutating any of them. Checking as we go
         // would leave the frame half-updated when a later row is malformed -

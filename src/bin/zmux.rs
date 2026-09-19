@@ -147,8 +147,10 @@ fn attach(session: String) -> Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     // Frames arrive on their own thread; the main loop owns input and drawing.
-    // Bounded: if the UI thread stalls, queued frames must not grow without
-    // limit. Dropping the oldest is correct here - only the newest matters.
+    // Bounded so a stalled UI cannot grow this without limit. Note this
+    // BLOCKS the reader when full rather than dropping - which is what we
+    // want, because the daemon then sees us as slow and can act, whereas
+    // silently discarding frames would desynchronise the delta chain.
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<ServerMsg>(128);
     let mut rstream = stream.try_clone()?;
     std::thread::spawn(move || {
@@ -168,6 +170,11 @@ fn attach(session: String) -> Result<()> {
         // Input. Ctrl-b is the prefix, as in tmux.
         if event::poll(Duration::from_millis(8))? {
             match event::read()? {
+                // Drop releases FIRST. Windows reports press and release, and
+                // prefix handling used to run before the encoder's release
+                // filter - so the Ctrl-b RELEASE was read as a doubled prefix
+                // and sent a literal Ctrl-b to the pane.
+                Event::Key(k) if matches!(k.kind, event::KeyEventKind::Release) => {}
                 Event::Key(k) if is_prefix(&k, &cfg) => match read_prefix_command(&cfg)? {
                     Prefix::Detach => {
                         ipc::write_msg(&mut stream, &ClientMsg::Detach)?;
@@ -301,6 +308,10 @@ fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
         return Ok(Prefix::Ignore);
     }
     let Event::Key(k) = event::read()? else { return Ok(Prefix::Ignore) };
+    if matches!(k.kind, event::KeyEventKind::Release) {
+        // The release of the prefix key itself; wait for a real press.
+        return read_prefix_command(cfg);
+    }
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     Ok(match k.code {
         KeyCode::Char('d') => Prefix::Detach,
@@ -337,6 +348,8 @@ fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<bool> 
             continue;
         }
         let cmd = match event::read()? {
+            // Releases would scroll twice per keypress.
+            Event::Key(k) if matches!(k.kind, event::KeyEventKind::Release) => continue,
             Event::Key(k) => match k.code {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
                     return Ok(ipc::write_msg(stream,

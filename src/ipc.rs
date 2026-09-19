@@ -73,8 +73,18 @@ fn windows_user_sid() -> Option<String> {
             CloseHandle(token);
             return None;
         }
-        let mut buf = vec![0u8; need as usize];
-        let ok = GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr(), need, &mut need) != 0;
+        // Back the buffer with pointer-aligned storage. A Vec<u8> guarantees
+        // only byte alignment, so reading a PSID out of it is undefined
+        // behaviour even though it happens to work on x86.
+        let words = (need as usize).div_ceil(std::mem::size_of::<usize>()).max(1);
+        let mut buf: Vec<usize> = vec![0; words];
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_USER,
+            buf.as_mut_ptr() as *mut u8,
+            need,
+            &mut need,
+        ) != 0;
         CloseHandle(token);
         if !ok {
             return None;

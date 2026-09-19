@@ -41,18 +41,25 @@ if [ -z "$__ZMUX_INIT" ]; then
   elif [ -f "$HOME/.profile" ]; then . "$HOME/.profile"
   fi
 
-  # Interactive startup, unless a profile above already pulled it in.
-  [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
-  [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+  # Interactive startup, but ONLY if a profile above did not already pull it
+  # in - double-sourcing re-runs profile side effects (PATH appends, ssh-agent
+  # launches) a second time.
+  if ! declare -F __zmux_bashrc_loaded >/dev/null 2>&1; then
+    [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
+    [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+  fi
 fi
 
+# Percent-encode per UTF-8 BYTE. Encoding code points instead means a
+# non-ASCII directory never round-trips.
 __zmux_urlencode() {
   local s="$1" o="" i c
+  local LC_ALL=C
   for (( i=0; i<${#s}; i++ )); do
     c="${s:$i:1}"
     case "$c" in
       [-_.~a-zA-Z0-9/]) o+="$c" ;;
-      *) printf -v c '%%%02X' "'$c"; o+="$c" ;;
+      *) o+=$(printf '%s' "$c" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g') ;;
     esac
   done
   printf '%s' "$o"
@@ -90,13 +97,25 @@ pub fn parse_osc7(payload: &str) -> Option<String> {
 }
 
 fn percent_decode(s: &str) -> String {
+    // Operate on BYTES throughout. The previous version sliced the &str by
+    // byte offsets, so a payload like "%Aé" cut a multi-byte character in half
+    // and panicked - inside the PTY reader thread, where any pane could
+    // trigger it just by printing an escape sequence.
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
+    let hex = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
                 i += 3;
                 continue;
             }
@@ -171,6 +190,16 @@ mod tests {
     fn decodes_non_ascii() {
         // "café" percent-encoded as UTF-8.
         assert_eq!(parse_osc7("file://h/c/caf%C3%A9").as_deref(), Some("/c/café"));
+    }
+
+    /// A pane can emit any OSC 7 it likes, and this ran on the PTY reader
+    /// thread - a panic here took a pane's output with it.
+    #[test]
+    fn malformed_percent_escapes_do_not_panic() {
+        for payload in ["file://h/c/%Aé", "file://h/c/%", "file://h/c/%ZZ", "file://h/c/%A"] {
+            let _ = parse_osc7(payload);
+        }
+        assert_eq!(parse_osc7("file://h/c/a%").as_deref(), Some("/c/a%"));
     }
 
     #[test]
