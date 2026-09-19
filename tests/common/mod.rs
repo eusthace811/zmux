@@ -123,6 +123,9 @@ impl Drop for Daemon {
 pub struct Client {
     stream: interprocess::local_socket::Stream,
     rx: Receiver<ServerMsg>,
+    /// Reassembled view, so tests see whole screens whether the daemon sent a
+    /// full frame or just the changed rows.
+    frame: Option<Frame>,
 }
 
 impl Client {
@@ -146,7 +149,23 @@ impl Client {
                 }
             }
         });
-        Self { stream, rx }
+        Self { stream, rx, frame: None }
+    }
+
+    /// Fold a message into the running view. Returns the screen if it changed.
+    fn absorb(&mut self, msg: ServerMsg) -> Option<String> {
+        match msg {
+            ServerMsg::Frame(f) => {
+                let t = text_of(&f);
+                self.frame = Some(f);
+                Some(t)
+            }
+            ServerMsg::Delta(d) => {
+                let f = self.frame.as_mut()?;
+                f.apply_delta(&d).then(|| text_of(f))
+            }
+            _ => None,
+        }
     }
 
     pub fn send(&mut self, msg: &ClientMsg) {
@@ -179,13 +198,14 @@ impl Client {
         let mut last = String::new();
         while Instant::now() < deadline {
             match self.rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(ServerMsg::Frame(f)) => {
-                    last = text_of(&f);
-                    if pred(&last) {
-                        return Some(last);
+                Ok(msg) => {
+                    if let Some(screen) = self.absorb(msg) {
+                        last = screen;
+                        if pred(&last) {
+                            return Some(last);
+                        }
                     }
                 }
-                Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }

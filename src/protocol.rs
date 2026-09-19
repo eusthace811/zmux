@@ -84,6 +84,70 @@ pub enum ServerMsg {
     // --- appended after v1 shipped. Append-only. ---
     /// Daemon is shutting down.
     ShuttingDown,
+    // --- appended. Append-only. ---
+    /// Only the rows that changed since `base_revision`.
+    ///
+    /// Typing changes one or two rows out of thirty, so sending the whole grid
+    /// every tick is almost all waste. A client whose current revision is not
+    /// `base_revision` must discard the delta and wait for a full frame.
+    Delta(FrameDelta),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameDelta {
+    pub base_revision: u64,
+    pub revision: u64,
+    pub cols: u16,
+    pub rows: u16,
+    /// (row index, that row's cells).
+    pub rows_changed: Vec<(u16, Vec<Cell>)>,
+    pub cursor: Option<(u16, u16)>,
+}
+
+impl Frame {
+    /// Rows that differ from `prev`, or `None` when the geometry changed and a
+    /// delta would be meaningless.
+    pub fn delta_from(&self, prev: &Frame) -> Option<FrameDelta> {
+        if prev.cols != self.cols || prev.rows != self.rows {
+            return None;
+        }
+        let w = self.cols as usize;
+        let mut rows_changed = Vec::new();
+        for r in 0..self.rows {
+            let a = &self.cells[r as usize * w..(r as usize + 1) * w];
+            let b = &prev.cells[r as usize * w..(r as usize + 1) * w];
+            if a != b {
+                rows_changed.push((r, a.to_vec()));
+            }
+        }
+        Some(FrameDelta {
+            base_revision: prev.revision,
+            revision: self.revision,
+            cols: self.cols,
+            rows: self.rows,
+            rows_changed,
+            cursor: self.cursor,
+        })
+    }
+
+    /// Apply a delta in place. Returns false if it does not apply to us, in
+    /// which case the caller must wait for a full frame rather than render
+    /// something half-updated.
+    pub fn apply_delta(&mut self, d: &FrameDelta) -> bool {
+        if d.base_revision != self.revision || d.cols != self.cols || d.rows != self.rows {
+            return false;
+        }
+        let w = self.cols as usize;
+        for (r, cells) in &d.rows_changed {
+            if (*r as usize) >= self.rows as usize || cells.len() != w {
+                return false;
+            }
+            self.cells[*r as usize * w..(*r as usize + 1) * w].clone_from_slice(cells);
+        }
+        self.cursor = d.cursor;
+        self.revision = d.revision;
+        true
+    }
 }
 
 /// One cell of the composited screen. Mirrors what a ratatui `Cell` carries,

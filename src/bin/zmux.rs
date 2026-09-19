@@ -214,6 +214,16 @@ fn attach(session: String) -> Result<()> {
                         latest = Some(f);
                     }
                 }
+                Ok(ServerMsg::Delta(d)) => {
+                    // A delta that does not apply is discarded rather than
+                    // rendered half-updated; the daemon sends a full frame to
+                    // any client it knows is out of sync.
+                    if let Some(f) = latest.as_mut() {
+                        if f.apply_delta(&d) {
+                            seen_revision = f.revision;
+                        }
+                    }
+                }
                 Ok(ServerMsg::PaneExited { code }) => {
                     drop(_guard);
                     println!("session ended (exit code {code})");

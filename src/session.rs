@@ -38,6 +38,9 @@ struct Client {
     rows: u16,
     /// Set once the client has fallen too far behind to keep.
     lagged: bool,
+    /// A newly attached client, or one whose delta did not apply, needs a
+    /// whole frame before deltas mean anything.
+    needs_full: bool,
 }
 
 pub struct Session {
@@ -50,6 +53,8 @@ pub struct Session {
     pub revision: Arc<AtomicU64>,
     /// Current composited size, i.e. the smallest attached viewport.
     size: Mutex<(u16, u16)>,
+    /// Last frame sent to clients, as the base for deltas.
+    last_published: Mutex<Option<Frame>>,
     /// Serialises every geometry mutation.
     ///
     /// apply_size previously read the client list, released the lock, then
@@ -104,6 +109,7 @@ impl Session {
             running: Arc::new(AtomicBool::new(true)),
             revision: Arc::new(AtomicU64::new(0)),
             size: Mutex::new((cols, rows)),
+            last_published: Mutex::new(None),
             geometry: Mutex::new(()),
             events_tx,
         });
@@ -393,6 +399,8 @@ impl Session {
         }
         drop(panes);
         self.revision.fetch_add(1, Ordering::Relaxed);
+        // Geometry changed, so no delta can describe the transition.
+        *lock(&self.last_published) = None;
     }
 
     /// Public reflow: takes the geometry lock, then republishes so attached
@@ -406,10 +414,42 @@ impl Session {
         self.publish();
     }
 
-    /// Compose once and send to every client.
+    /// Compose once, then send each client either a full frame or just the
+    /// rows that changed.
+    ///
+    /// Typing changes one or two rows out of thirty, so a full grid per tick is
+    /// almost entirely waste.
     pub fn publish(&self) {
         let frame = self.snapshot();
-        self.broadcast(&ServerMsg::Frame(frame));
+        let delta = {
+            let last = lock(&self.last_published);
+            last.as_ref().and_then(|prev| frame.delta_from(prev))
+        };
+        let full = ServerMsg::Frame(frame.clone());
+        let msg_delta = delta.map(ServerMsg::Delta);
+
+        {
+            let mut cs = self.lock_clients();
+            for c in cs.iter_mut() {
+                let msg = match (&msg_delta, c.needs_full) {
+                    (Some(d), false) => d,
+                    _ => {
+                        c.needs_full = false;
+                        &full
+                    }
+                };
+                match c.tx.try_send(msg.clone()) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        c.lagged = true;
+                        eprintln!("[zmuxd] dropping client {} - {CLIENT_QUEUE} frames behind", c.id);
+                    }
+                    Err(TrySendError::Disconnected(_)) => c.lagged = true,
+                }
+            }
+            cs.retain(|c| !c.lagged);
+        }
+        *lock(&self.last_published) = Some(frame);
     }
 
     // --- clients -----------------------------------------------------------
@@ -424,7 +464,7 @@ impl Session {
         let (cols, rows) = clamp_size(cols, rows);
         let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE);
         let id = self.next_client.fetch_add(1, Ordering::Relaxed);
-        self.lock_clients().push(Client { id, tx, cols, rows, lagged: false });
+        self.lock_clients().push(Client { id, tx, cols, rows, lagged: false, needs_full: true });
         self.apply_size();
         (id, rx)
     }
