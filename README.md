@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–5 complete. 57 tests passing.
+Phases 0–5 complete. 72 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -15,6 +15,8 @@ Phases 0–5 complete. 57 tests passing.
 | cwd tracking | OSC 7; new panes inherit the focused pane's directory |
 | Multi-client | several clients on one session, sized to the smallest |
 | Config | `%APPDATA%\zmux\config.toml`, all optional |
+| Keys | xterm encoding: Alt, F1–F12, modified navigation, application cursor mode |
+| Wire | row deltas, not a full grid per frame |
 
 ## Use
 
@@ -58,7 +60,7 @@ zmux kill work          terminate a session
 | `src/cwd.rs` | OSC 7 parsing and the bash integration snippet. |
 | `src/config.rs` | `config.toml`. |
 
-## Four things that will bite you if you change them
+## Five things that will bite you if you change them
 
 **1. Terminal query replies are mandatory.** ConPTY is created with
 `PSEUDOCONSOLE_INHERIT_CURSOR` and emits `ESC[6n` at startup. Unanswered, the
@@ -77,6 +79,11 @@ options must also precede short ones — `bash -l --rcfile X` is rejected.
 
 **4. `close()` must drop the pty master before joining.** The reader thread
 blocks in `read()` until the pseudoconsole closes. Joining first deadlocks.
+
+**5. `harden::restrict_dll_search_path()` runs before anything else.**
+`portable-pty` probes for `conpty.dll` by bare name, and unlike `kernel32.dll`
+that is not a KnownDLL — a planted file would execute in-process. A test proves
+the mitigation rather than assuming it.
 
 ## Tests
 
