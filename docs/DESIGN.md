@@ -789,6 +789,12 @@ Two choices worth recording:
   brightest thing on screen, competing with the shell output they exist to
   separate. Grey 240 puts them behind it.
 
+The bar names the focused pane by its POSITION in the current window, not by
+`PaneId`. Ids come from an allocator that never reuses a number, so after a
+few splits and closes the bar said "2 panes | pane 7" - a number with nothing
+on screen to match it. It is left out entirely when the window holds one
+pane, where it could only ever say "pane 1" next to "1 pane".
+
 The active window is marked twice, by colour and by the `*` the bar already
 carried. Cheap redundancy: the colour is what you actually see, and the
 marker keeps the bar legible if the colour does not survive.

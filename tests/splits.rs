@@ -82,7 +82,7 @@ fn closing_a_pane_returns_its_space_and_keeps_the_session() {
     assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some());
 
     c.cmd(Cmd::ClosePane);
-    let screen = c.wait_for(20, |t| t.contains("1 pane |"))
+    let screen = c.wait_for(20, |t| t.contains("1 pane "))
         .expect("pane count never returned to one");
     assert!(!screen.contains('│'), "divider still drawn after close:\n{screen}");
 

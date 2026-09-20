@@ -127,7 +127,7 @@ fn many_splits_then_closing_them_all_ends_with_one_working_pane() {
         std::thread::sleep(Duration::from_millis(350));
     }
     assert!(
-        c.wait_for(25, |t| t.contains("1 pane |")).is_some(),
+        c.wait_for(25, |t| t.contains("1 pane ")).is_some(),
         "panes did not all close"
     );
 

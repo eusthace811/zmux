@@ -770,7 +770,14 @@ impl Session {
     fn status_line(&self) -> Vec<Span> {
         let (panes, focus, windows, current) = {
             let w = lock(&self.windows);
-            (w.current().len(), w.current().focus().0, w.len(), w.index())
+            let l = w.current();
+            // The bar names the focused pane by POSITION in this window, not
+            // by `PaneId`: ids come from an allocator that never reuses a
+            // number, so after a few splits and closes the bar would say
+            // "pane 7" of two.
+            let ids = l.panes();
+            let pos = ids.iter().position(|id| *id == l.focus()).map_or(0, |i| i + 1);
+            (ids.len(), pos, w.len(), w.index())
         };
         status_spans(
             &self.name,

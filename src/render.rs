@@ -83,6 +83,11 @@ fn width_of(spans: &[Span]) -> usize {
 
 /// Build the status line.
 ///
+/// `focus` is the focused pane's POSITION in the current window, counting
+/// from 1, or 0 when it cannot be placed. It is deliberately not the `PaneId`:
+/// that is an allocator counter, so after a few splits and closes the bar read
+/// "2 panes | pane 7" and invited you to look for panes 3 to 6.
+///
 /// Pure, so the degradation ladder can be tested at every width without
 /// starting a daemon and a shell - it used to be reachable only through a live
 /// session, so only the widest rung was ever exercised.
@@ -92,7 +97,7 @@ pub fn status_spans(
     windows: usize,
     current: usize,
     panes: usize,
-    focus: u32,
+    focus: usize,
     scrolled: bool,
     width: usize,
 ) -> Vec<Span> {
@@ -126,8 +131,13 @@ pub fn status_spans(
     let tail = |v: &mut Vec<Span>| {
         list(v);
         v.push(span(Role::Info, format!("{panes} pane{plural} ")));
-        v.push(span(Role::Sep, "| "));
-        v.push(span(Role::Info, format!("pane {focus} ")));
+        // With one pane there is nothing to be focused BUT that pane, so
+        // saying so was pure noise - and next to the count it read as two
+        // numbers that disagreed.
+        if panes > 1 && focus > 0 {
+            v.push(span(Role::Sep, "| "));
+            v.push(span(Role::Info, format!("pane {focus} ")));
+        }
         alert(v);
     };
 
@@ -392,28 +402,53 @@ mod tests {
         spans.iter().map(|s| s.text.as_str()).collect()
     }
 
-    /// Three windows, on the second, showing two panes with pane 7 focused.
+    /// Three windows, on the second, showing two panes with the second one
+    /// focused.
     fn at(width: usize) -> String {
-        plain(&status_spans("work", 3, 1, 2, 7, false, width))
+        plain(&status_spans("work", 3, 1, 2, 2, false, width))
     }
 
     #[test]
     fn a_single_window_shows_no_window_list() {
         // The list would be a constant "0*", which tells you nothing.
-        assert_eq!(plain(&status_spans("work", 1, 0, 1, 1, false, 80)), " work | 1 pane | pane 1 ");
+        assert_eq!(plain(&status_spans("work", 1, 0, 1, 1, false, 80)), " work | 1 pane ");
+    }
+
+    /// "1 pane | pane 1" read as two numbers that disagreed. With one pane
+    /// there is nothing else it could be focused on.
+    #[test]
+    fn one_pane_is_not_also_announced_as_the_focused_one() {
+        let s = plain(&status_spans("work", 1, 0, 1, 1, false, 80));
+        assert_eq!(s.matches("pane").count(), 1, "the bar says it twice: {s}");
     }
 
     #[test]
     fn several_windows_mark_the_current_one() {
-        assert_eq!(plain(&status_spans("work", 3, 1, 2, 7, false, 80)),
-                   " work | 0 1* 2 | 2 panes | pane 7 ");
+        assert_eq!(plain(&status_spans("work", 3, 1, 2, 2, false, 80)),
+                   " work | 0 1* 2 | 2 panes | pane 2 ");
+    }
+
+    /// The focused pane is a POSITION in this window. The caller passing a
+    /// `PaneId` is what produced "2 panes | pane 7" - a number with nothing
+    /// on screen to match it.
+    #[test]
+    fn the_focused_pane_is_numbered_within_the_window() {
+        let s = plain(&status_spans("work", 1, 0, 3, 3, false, 80));
+        assert!(s.ends_with("3 panes | pane 3 "), "{s}");
+    }
+
+    /// A focus that cannot be placed is left out rather than shown as pane 0.
+    #[test]
+    fn an_unplaceable_focus_is_simply_not_shown() {
+        let s = plain(&status_spans("work", 1, 0, 2, 0, false, 80));
+        assert_eq!(s, " work | 2 panes ");
     }
 
     /// The window you are on is the one thing on the bar you must be able to
     /// find at a glance, so it is the only window drawn in its own colours.
     #[test]
     fn only_the_current_window_gets_the_active_role() {
-        let spans = status_spans("work", 3, 1, 2, 7, false, 80);
+        let spans = status_spans("work", 3, 1, 2, 2, false, 80);
         let active: Vec<&str> = spans
             .iter()
             .filter(|s| s.role == Role::ActiveWindow)
