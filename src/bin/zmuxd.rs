@@ -14,7 +14,7 @@ use interprocess::TryClone as _;
 
 use zmux::ipc;
 use zmux::layout::{Dir, Nav, PaneId};
-use zmux::protocol::{Cmd, ClientMsg, Query, ServerMsg, PROTOCOL_VERSION};
+use zmux::protocol::{Cmd, ClientMsg, Query, ServerMsg, Target, PROTOCOL_VERSION};
 use zmux::pty::PtyEvent;
 use zmux::session::{Outbound, Session};
 
@@ -345,7 +345,26 @@ fn serve_control(
                 Ok(false) => ServerMsg::Refused { reason: format!("no pane {pane}") },
                 Err(e) => ServerMsg::Refused { reason: e.to_string() },
             },
+            // Resolve, then act on the ID. A target that does not resolve is
+            // refused by name, so a caller can tell "no such pane" from "that
+            // pane went away" - and never has its input redirected.
+            ClientMsg::InputAt { target, data, paste, enter } => {
+                match session.resolve(&target) {
+                    Some(id) => match session.write_to(id, &data, paste, enter) {
+                        Ok(true) => ServerMsg::Info(session.info()),
+                        Ok(false) => ServerMsg::Refused { reason: gone(&target) },
+                        Err(e) => ServerMsg::Refused { reason: e.to_string() },
+                    },
+                    None => ServerMsg::Refused { reason: unknown(&target) },
+                }
+            }
             ClientMsg::Query(Query::Info) => ServerMsg::Info(session.info()),
+            ClientMsg::Query(Query::CaptureAt { target, lines }) => {
+                match session.resolve(&target).and_then(|id| session.capture_from(id, lines)) {
+                    Some(text) => ServerMsg::Capture { text },
+                    None => ServerMsg::Refused { reason: unknown(&target) },
+                }
+            }
             ClientMsg::Query(Query::Capture { pane, lines }) => {
                 match session.capture(pane.map(usize::from), lines) {
                     Some(text) => ServerMsg::Capture { text },
@@ -371,6 +390,26 @@ fn serve_control(
         ipc::write_msg(&mut stream, &reply)?;
     }
     Ok(())
+}
+
+/// How a target that resolves to nothing is reported.
+///
+/// Named back at the caller in their own words - `@7`, `reviewer`, `3` - so
+/// the message says which of their arguments was wrong, rather than making
+/// them guess which pane the daemon thought they meant.
+fn unknown(t: &Target) -> String {
+    match t {
+        Target::Focused => "no focused pane".into(),
+        Target::Position(p) => format!("no pane at position {p} in the current window"),
+        Target::Id(id) => format!("no pane with id @{id}"),
+        Target::Name(n) => format!("no pane named '{n}'"),
+    }
+}
+
+/// The pane resolved and then exited before the write landed. A different
+/// answer from `unknown`: the caller's target was right, it is just too late.
+fn gone(t: &Target) -> String {
+    format!("{} - it exited before the write landed", unknown(t))
 }
 
 fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) -> Result<()> {
@@ -554,7 +593,8 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     ClientMsg::Hello { .. }
                     | ClientMsg::Control { .. }
                     | ClientMsg::Query(_)
-                    | ClientMsg::InputTo { .. } => {}
+                    | ClientMsg::InputTo { .. }
+                    | ClientMsg::InputAt { .. } => {}
                 }
             }
         }

@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 /// this costs a version rather than a corrupt frame.
 /// v7 added `Frame::mouse` and `FrameDelta::mouse` - the same kind of struct
 /// change - and `ClientMsg::Mouse`, which is only an appended variant.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v8 is the agent-coordination surface (DESIGN.md §12). `PaneInfo` gained
+/// `window`, and `SessionInfo` gained `focus_id` - struct fields again, so
+/// again a version. `Target`, `InputAt` and `Query::CaptureAt` are appended.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -98,10 +101,98 @@ pub enum ClientMsg {
     /// Supersedes `Click`, which could only say "focus what is here" and so
     /// could never reach a program that wanted the mouse for itself.
     Mouse(MouseIn),
+    // --- appended. Append-only. ---
+    /// Write to a pane named by `Target`, which unlike `InputTo` can reach a
+    /// pane in a window that is not on screen, and can name one by an id that
+    /// does not move when the layout does.
+    ///
+    /// Supersedes `InputTo`. That one still answers - variants are
+    /// append-only - but it can only say "the Nth pane of whatever window is
+    /// current", which is the wrong handle for anything long-running.
+    InputAt {
+        target: Target,
+        data: Vec<u8>,
+        /// Wrap the payload in a bracketed paste, IF the program in that pane
+        /// has asked for one. Only the daemon's vt100 state knows whether it
+        /// has, which is why this is a request rather than a decision.
+        paste: bool,
+        /// Append Enter, in the SAME write as the text. A program that reads
+        /// a line must not be able to see the text without the newline that
+        /// submits it.
+        enter: bool,
+    },
+}
+
+/// Which pane a control command means.
+///
+/// `Position` is what the status bar shows and what a human would say, and it
+/// is what the older commands take. It is also the one that MOVES: closing a
+/// pane renumbers every pane after it, so anything that outlives a single
+/// round trip should hold an `Id` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Target {
+    /// Wherever the user's keystrokes are going.
+    Focused,
+    /// 1-based position within the CURRENT window.
+    Position(u8),
+    /// The daemon's stable handle. Never reused, and valid in any window,
+    /// including one that is not on screen. This is what `ZMUX_PANE` holds.
+    Id(u32),
+    /// A name the pane reported for itself. Unique among live panes.
+    Name(String),
+}
+
+/// Longest name a pane may claim. Long enough to be descriptive, short enough
+/// that a status bar and an error message can both show it whole.
+pub const MAX_NAME_CHARS: usize = 32;
+
+impl Target {
+    /// Parse the `-p` argument: `3` a position, `@3` an id, `current` this
+    /// pane, anything else a name.
+    ///
+    /// Positions are bare digits and names may not start with one, so the two
+    /// cannot collide. `current` is reserved for the same reason.
+    pub fn parse(s: &str, current: Option<u32>) -> Result<Self, String> {
+        if s == "current" {
+            return current.map(Target::Id).ok_or_else(|| {
+                "`-p current` needs ZMUX_PANE, which is set only inside a zmux pane"
+                    .to_string()
+            });
+        }
+        if let Some(rest) = s.strip_prefix('@') {
+            return rest.parse().map(Target::Id).map_err(|_| format!("'{s}' is not a pane id"));
+        }
+        if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
+            let n: u8 = s.parse().map_err(|_| format!("'{s}' is not a pane position"))?;
+            if n == 0 {
+                return Err("pane positions start at 1".into());
+            }
+            return Ok(Target::Position(n));
+        }
+        if !is_valid_name(s) {
+            return Err(format!(
+                "'{s}' is not a pane position (1), an id (@1) or a name                  (a-z, then a-z 0-9 _ -, up to {MAX_NAME_CHARS})"
+            ));
+        }
+        Ok(Target::Name(s.to_string()))
+    }
+}
+
+/// herdr's rule (`skills/herdr/SKILL.md`), and for its reason: a name has to be
+/// typeable, unambiguous against a position, and safe in a shell argument.
+pub fn is_valid_name(s: &str) -> bool {
+    let mut cs = s.chars();
+    cs.next().is_some_and(|c| c.is_ascii_lowercase())
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && s.chars().count() <= MAX_NAME_CHARS
+        && s != "current"
 }
 
 /// What a control connection can ask for. Append-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Copy` any more: `Target::Name` owns a string. Nothing passed one by
+/// value in a hot path, so this costs nothing but a few `&`s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Query {
     /// Windows, panes, focus and geometry.
     Info,
@@ -111,6 +202,13 @@ pub enum Query {
     /// `lines` keeps only that many lines from the bottom; 0 means all of
     /// them. Only what is on screen: scrollback is not captured.
     Capture { pane: Option<u8>, lines: u16 },
+    // --- appended. Append-only. ---
+    /// The visible screen of the pane named by `Target`.
+    ///
+    /// Supersedes `Capture`, for the same reason `InputAt` supersedes
+    /// `InputTo`: a position cannot name a pane in a background window, and
+    /// does not survive the layout changing under it.
+    CaptureAt { target: Target, lines: u16 },
 }
 
 /// The answer to `Query::Info`, and to every control mutation - a caller sees
@@ -131,21 +229,38 @@ pub struct SessionInfo {
     /// 0-based, exactly what the status bar shows and `SelectWindow` takes.
     pub window: usize,
     pub windows: usize,
-    /// 1-based position of the focused pane within `panes`, 0 if there is
-    /// none.
+    /// 1-based position of the focused pane WITHIN ITS WINDOW, 0 if there is
+    /// none. Not an index into `panes`, which now spans every window.
     pub focus: usize,
-    /// The current window's panes, in the order the status bar counts them.
+    /// `PaneInfo::id` of the focused pane, 0 if there is none.
+    ///
+    /// The unambiguous handle. `focus` needs `window` beside it to mean
+    /// anything now that `panes` is not one window's worth, and a caller that
+    /// wants "where are the keystrokes going" should not have to pair two
+    /// fields and scan a list to find out.
+    pub focus_id: u32,
+    /// EVERY pane in the session, each tagged with the window it is in,
+    /// ordered by window and then by the position the status bar counts.
+    ///
+    /// This used to be the current window only, which made a background
+    /// window's panes unreachable and undiscoverable - you had to switch to a
+    /// window, moving the user's screen, merely to find out what was in it.
     pub panes: Vec<PaneInfo>,
 }
 
 /// One pane of the current window.
 ///
-/// `position` is what every control command takes, because it is what the
-/// status bar shows. `id` is the daemon's internal handle: stable for the
-/// pane's lifetime and never reused, but meaningless to a user.
+/// `position` is what a human would say, because it is what the status bar
+/// shows - but it is scoped to one window and it MOVES when a pane closes.
+/// `id` is the daemon's handle: stable for the pane's lifetime, never reused,
+/// valid in any window, and what `ZMUX_PANE` holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub position: usize,
+    /// 0-based index of the window this pane is in, matching the status bar
+    /// and `select-window`. `position` is within THIS window, so the two are
+    /// needed together - or `id` on its own.
+    pub window: usize,
     pub id: u32,
     pub cols: u16,
     pub rows: u16,

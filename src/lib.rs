@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod keys;
 pub mod layout;
 pub mod mouse;
+pub mod paste;
 pub mod protocol;
 pub mod persist;
 pub mod pty;

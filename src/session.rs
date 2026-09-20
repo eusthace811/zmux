@@ -18,8 +18,8 @@ use anyhow::{bail, Result};
 use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::windows::{Closed, Windows};
 use crate::protocol::{
-    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, ServerMsg, SessionInfo, MAX_INPUT_BYTES,
-    MAX_PANES,
+    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, ServerMsg, SessionInfo, Target,
+    MAX_INPUT_BYTES, MAX_PANES,
 };
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
@@ -313,7 +313,7 @@ impl Session {
 
         // Feed vt100, then answer device queries. Answering is MANDATORY:
         // ConPTY emits ESC[6n at startup and deadlocks if ignored (§2.5).
-        let (pty, events) = Pane::spawn_with(cols.max(1), rows.max(1), cwd.as_deref(), &self.cfg, move |chunk| {
+        let (pty, events) = Pane::spawn_with(cols.max(1), rows.max(1), cwd.as_deref(), &self.cfg, Some(id.0), move |chunk| {
             let mut t = lock(&feed);
             t.parser.process(chunk);
             let cur = t.cursor();
@@ -389,19 +389,8 @@ impl Session {
     /// snap the pane back to the live screen: a control caller typing into a
     /// background pane has no business yanking the user's scrollback view.
     pub fn write_pane(&self, position: usize, data: &[u8]) -> Result<bool> {
-        if data.len() > MAX_INPUT_BYTES {
-            bail!("input of {} bytes exceeds MAX_INPUT_BYTES", data.len());
-        }
         let Some(id) = self.pane_at_position(position) else { return Ok(false) };
-        let pty = {
-            let panes = lock(&self.panes);
-            match panes.get(&id) {
-                Some(p) => Arc::clone(&p.pty),
-                None => return Ok(false),
-            }
-        };
-        pty.write_input(data)?;
-        Ok(true)
+        self.write_to(id, data, false, false)
     }
 
     /// Resolve a 1-based position in the current window to a pane.
@@ -410,25 +399,106 @@ impl Session {
         lock(&self.windows).current().panes().get(i).copied()
     }
 
+    /// Resolve a control caller's `Target` to a pane, or `None` if there is
+    /// no such pane.
+    ///
+    /// `None` is ALWAYS refused by the caller rather than redirected to
+    /// something nearby (DESIGN.md §11). A target that no longer resolves
+    /// usually means the pane exited, and quietly picking a different one
+    /// types somebody's command into the wrong shell.
+    pub fn resolve(&self, target: &Target) -> Option<PaneId> {
+        match target {
+            Target::Focused => Some(self.focus()),
+            Target::Position(p) => self.pane_at_position(*p as usize),
+            // Any window, not just the visible one - and checked against the
+            // live tree rather than the pane map, so an id belonging to a
+            // pane that has exited does not resolve.
+            Target::Id(id) => {
+                let id = PaneId::from_raw(*id);
+                lock(&self.windows).panes().contains(&id).then_some(id)
+            }
+            Target::Name(want) => {
+                let ids = lock(&self.windows).panes();
+                let panes = lock(&self.panes);
+                ids.into_iter().find(|id| {
+                    panes.get(id).is_some_and(|p| lock(&p.term).name().as_deref() == Some(want))
+                })
+            }
+        }
+    }
+
+    /// Write to a pane by id, leaving focus and the pane's scroll position
+    /// alone. False when the pane went away first.
+    ///
+    /// `paste` wraps the payload in a bracketed paste, but only when the
+    /// program in that pane has actually asked for one - which only this
+    /// side knows, because only this side holds the vt100 state. `enter`
+    /// appends the newline IN THE SAME WRITE, so a program reading a line
+    /// cannot observe the text without the byte that submits it.
+    pub fn write_to(&self, id: PaneId, data: &[u8], paste: bool, enter: bool) -> Result<bool> {
+        if data.len() > MAX_INPUT_BYTES {
+            bail!("input of {} bytes exceeds MAX_INPUT_BYTES", data.len());
+        }
+        let (pty, bracketed) = {
+            let panes = lock(&self.panes);
+            match panes.get(&id) {
+                Some(p) => {
+                    let bracketed = lock(&p.term).parser.screen().bracketed_paste();
+                    (Arc::clone(&p.pty), bracketed)
+                }
+                None => return Ok(false),
+            }
+        };
+        let payload = crate::paste::wrap(data, paste && bracketed, enter);
+        if payload.len() > MAX_INPUT_BYTES {
+            bail!("input of {} bytes exceeds MAX_INPUT_BYTES once wrapped", payload.len());
+        }
+        // Lock released before writing: a blocked write must not stall the
+        // whole session.
+        pty.write_input(&payload)?;
+        Ok(true)
+    }
+
+    /// The visible screen of one pane by id, as text. See `capture`.
+    pub fn capture_from(&self, id: PaneId, lines: u16) -> Option<String> {
+        let panes = lock(&self.panes);
+        let text = lock(&panes.get(&id)?.term).parser.screen().contents();
+        if lines == 0 {
+            return Some(text);
+        }
+        let rows: Vec<&str> = text.lines().collect();
+        let keep = rows.len().saturating_sub(lines as usize);
+        Some(rows[keep..].join("\n"))
+    }
+
     /// Everything a control caller needs to decide what to do next.
+    ///
+    /// EVERY window's panes, not just the visible one. A background window's
+    /// shells keep running (§9), so a caller that cannot see them cannot work
+    /// with them - and switching windows to find out what is in one moves the
+    /// user's screen, which is exactly what a background caller must not do.
+    /// Each pane says which window it is in; `position` stays within that
+    /// window, so it still means what the status bar shows.
     pub fn info(&self) -> SessionInfo {
         let (cols, rows) = self.size();
         let area = self.area(cols, rows);
-        let (window, windows, layout) = {
+        let (window, layouts) = {
             let w = lock(&self.windows);
-            (w.index(), w.len(), w.current().clone())
+            (w.index(), w.all().to_vec())
         };
-        let (rects, _) = layout.compute(area);
-        let focus_id = layout.focus();
+        let windows = layouts.len();
+        let focused = layouts.get(window).map(Layout::focus);
         let mut focus = 0;
         let panes = lock(&self.panes);
-        let list = layout
-            .panes()
-            .into_iter()
-            .enumerate()
-            .map(|(i, id)| {
+        let mut list = Vec::new();
+        for (w, layout) in layouts.iter().enumerate() {
+            // Every window composites into the same area - only one is on
+            // screen, but a hidden one's panes are sized as though it were,
+            // because that is the size its ptys are actually at.
+            let (rects, _) = layout.compute(area);
+            for (i, id) in layout.panes().into_iter().enumerate() {
                 let position = i + 1;
-                if id == focus_id {
+                if w == window && Some(id) == focused {
                     focus = position;
                 }
                 let rect = rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r);
@@ -440,8 +510,9 @@ impl Session {
                     }
                     None => (None, crate::term::Activity::default()),
                 };
-                PaneInfo {
+                list.push(PaneInfo {
                     position,
+                    window: w,
                     id: id.0,
                     cols: rect.map_or(0, |r| r.w),
                     rows: rect.map_or(0, |r| r.h),
@@ -449,10 +520,19 @@ impl Session {
                     command: activity.command,
                     busy: activity.busy,
                     last_exit: activity.last_exit,
-                }
-            })
-            .collect();
-        SessionInfo { session: self.name.clone(), cols, rows, window, windows, focus, panes: list }
+                });
+            }
+        }
+        SessionInfo {
+            session: self.name.clone(),
+            cols,
+            rows,
+            window,
+            windows,
+            focus,
+            focus_id: focused.map_or(0, |id| id.0),
+            panes: list,
+        }
     }
 
     /// The visible screen of one pane, as text.
@@ -469,14 +549,7 @@ impl Session {
             Some(p) => self.pane_at_position(p)?,
             None => self.focus(),
         };
-        let panes = lock(&self.panes);
-        let text = lock(&panes.get(&id)?.term).parser.screen().contents();
-        if lines == 0 {
-            return Some(text);
-        }
-        let rows: Vec<&str> = text.lines().collect();
-        let keep = rows.len().saturating_sub(lines as usize);
-        Some(rows[keep..].join("\n"))
+        self.capture_from(id, lines)
     }
 
     pub fn split(&self, dir: Dir) -> Result<Option<PaneId>> {

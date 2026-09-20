@@ -85,12 +85,21 @@ impl Daemon {
     /// control connection is not registered as a client, so polling one does
     /// not disturb the session's size or its idle timer.
     /// How many panes the current window holds, right now.
+    ///
+    /// `info().panes` spans every window, so this filters. A test that means
+    /// "the visible layout" must say so, or creating a window silently
+    /// changes what it is asserting.
     pub fn panes(&self) -> usize {
+        panes_in_current(&Control::open(&self.session).info())
+    }
+
+    /// Every pane in the session, whichever window shows it.
+    pub fn all_panes(&self) -> usize {
         Control::open(&self.session).info().panes.len()
     }
 
     pub fn wait_for_panes(&self, n: usize, secs: u64) -> bool {
-        self.wait_until(secs, |i| i.panes.len() == n)
+        self.wait_until(secs, |i| panes_in_current(i) == n)
     }
 
 
@@ -327,6 +336,11 @@ impl Client {
 }
 
 /// A control connection: request in, one reply out, no frames.
+/// Panes of the window that is on screen.
+pub fn panes_in_current(i: &zmux::protocol::SessionInfo) -> usize {
+    i.panes.iter().filter(|p| p.window == i.window).count()
+}
+
 pub struct Control {
     stream: interprocess::local_socket::Stream,
 }
@@ -361,6 +375,50 @@ impl Control {
         match self.ask(&ClientMsg::Query(zmux::protocol::Query::Capture { pane, lines: 0 })) {
             ServerMsg::Capture { text } => text,
             other => panic!("expected Capture, got {other:?}"),
+        }
+    }
+
+    /// Capture by `Target`, which unlike a position can reach a pane in a
+    /// window that is not on screen.
+    pub fn capture_at(&mut self, target: zmux::protocol::Target) -> String {
+        let q = zmux::protocol::Query::CaptureAt { target, lines: 0 };
+        match self.ask(&ClientMsg::Query(q)) {
+            ServerMsg::Capture { text } => text,
+            other => panic!("expected Capture, got {other:?}"),
+        }
+    }
+
+    /// Type into the pane `target` names, without moving anybody's focus.
+    pub fn input_at(&mut self, target: zmux::protocol::Target, text: &str, enter: bool) {
+        let msg = ClientMsg::InputAt {
+            target,
+            data: text.as_bytes().to_vec(),
+            paste: false,
+            enter,
+        };
+        match self.ask(&msg) {
+            ServerMsg::Info(_) => {}
+            other => panic!("input was refused: {other:?}"),
+        }
+    }
+
+    /// Poll a target's screen until it matches.
+    pub fn wait_at(
+        &mut self,
+        secs: u64,
+        target: zmux::protocol::Target,
+        pred: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            let text = self.capture_at(target.clone());
+            if pred(&text) {
+                return Some(text);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 

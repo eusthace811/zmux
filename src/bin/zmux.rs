@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use zmux::ipc;
-use zmux::protocol::{Cmd, ClientMsg, Frame, Query, ServerMsg, PROTOCOL_VERSION};
+use zmux::protocol::{Cmd, ClientMsg, Frame, Query, ServerMsg, Target, PROTOCOL_VERSION};
 use zmux::render::{paint, paint_cursor, paint_overlay};
 
 /// Every host mouse-reporting mode we know how to turn off.
@@ -123,8 +123,11 @@ Driving a session without attaching (for scripts and agents):
   zmux send <session> <command> [n]      one command; `send` alone lists them
   zmux keys <session> [-p N] <text>      type text, no Enter
   zmux run  <session> [-p N] <command>   type it and press Enter
-  zmux capture <session> [-p N] [-n N]   a pane's visible screen, as text
-  -p N chooses a pane by its position in the current window (default: focused)
+  zmux capture <session> [-p T] [-n N]   a pane's visible screen, as text
+
+  -p chooses the pane: N its position in the current window, @N its id (which
+     never moves), a name it reported, or `current` for the pane you are in.
+     Default: whichever pane has the focus.
 ";
 
 /// The names `zmux send` accepts, printed when it is given none.
@@ -166,12 +169,24 @@ fn session_arg(args: &[String], sub: &str) -> Result<String> {
     args.get(1).cloned().with_context(|| format!("usage: zmux {sub} <session> ..."))
 }
 
-/// Pull an optional leading `-p N` / `--pane N` off the argument list.
-fn take_pane(args: &[String]) -> Result<(Option<u8>, &[String])> {
+/// The pane this process is running in, if it is running in one.
+///
+/// Set per pane by the daemon (`Pane::PANE_ENV_VAR`), which is what lets a
+/// script say `-p current` without first working out where it is.
+fn current_pane() -> Option<u32> {
+    std::env::var(zmux::pty::Pane::PANE_ENV_VAR).ok()?.trim().parse().ok()
+}
+
+fn parse_target(s: &str) -> Result<Target> {
+    Target::parse(s, current_pane()).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Pull an optional leading `-p T` / `--pane T` off the argument list.
+fn take_pane(args: &[String]) -> Result<(Option<Target>, &[String])> {
     match args.first().map(String::as_str) {
         Some("-p" | "--pane") => {
-            let n = args.get(1).and_then(|v| v.parse().ok()).context("-p needs a pane number")?;
-            Ok((Some(n), &args[2..]))
+            let v = args.get(1).context("-p needs a pane: N, @N, a name, or `current`")?;
+            Ok((Some(parse_target(v)?), &args[2..]))
         }
         _ => Ok((None, args)),
     }
@@ -183,8 +198,8 @@ fn take_pane(args: &[String]) -> Result<(Option<u8>, &[String])> {
 /// Reading only a LEADING `-p` meant `capture s -n 20 -p 2` quietly dropped
 /// the `-p` and answered with the focused pane - the same silent wrong answer
 /// that an out-of-range position is refused to avoid.
-fn capture_args(args: &[String]) -> Result<(Option<u8>, u16)> {
-    const USAGE: &str = "usage: zmux capture <session> [-p N] [-n LINES]";
+fn capture_args(args: &[String]) -> Result<(Option<Target>, u16)> {
+    const USAGE: &str = "usage: zmux capture <session> [-p T] [-n LINES]";
     let (mut pane, mut lines) = (None, 0u16);
     let mut rest = args;
     while let Some(flag) = rest.first().map(String::as_str) {
@@ -193,9 +208,9 @@ fn capture_args(args: &[String]) -> Result<(Option<u8>, u16)> {
         if !matches!(flag, "-p" | "--pane" | "-n" | "--lines") {
             bail!("unexpected argument '{flag}'\n{USAGE}");
         }
-        let value = rest.get(1).with_context(|| format!("{flag} needs a number\n{USAGE}"))?;
+        let value = rest.get(1).with_context(|| format!("{flag} needs a value\n{USAGE}"))?;
         match flag {
-            "-p" | "--pane" => pane = Some(value.parse().context(USAGE)?),
+            "-p" | "--pane" => pane = Some(parse_target(value)?),
             _ => lines = value.parse().context(USAGE)?,
         }
         rest = &rest[2..];
@@ -400,13 +415,20 @@ fn main() -> Result<()> {
             if rest.is_empty() {
                 bail!("usage: zmux {} <session> [-p N] <text>", args[0]);
             }
-            let mut data = unescape(&rest.join(" "));
-            if enter {
-                data.push(b'\r');
-            }
+            let data = unescape(&rest.join(" "));
+            // No `-p` still means `Input`, not `InputAt { Focused }`. The two
+            // differ: `Input` snaps the pane back to live output, because it
+            // stands in for the user typing. A `-p` write is background work
+            // by definition and must not yank anybody's scrollback view.
             let msg = match pane {
-                Some(p) => ClientMsg::InputTo { pane: p, data },
-                None => ClientMsg::Input { data },
+                Some(target) => ClientMsg::InputAt { target, data, paste: false, enter },
+                None => {
+                    let mut data = data;
+                    if enter {
+                        data.push(b'\r');
+                    }
+                    ClientMsg::Input { data }
+                }
             };
             print_info(request(&session, &msg)?)?;
             return Ok(());
@@ -414,7 +436,9 @@ fn main() -> Result<()> {
         Some("capture") => {
             let session = session_arg(&args, "capture")?;
             let (pane, lines) = capture_args(&args[2..])?;
-            let reply = request(&session, &ClientMsg::Query(Query::Capture { pane, lines }))?;
+            let target = pane.unwrap_or(Target::Focused);
+            let reply =
+                request(&session, &ClientMsg::Query(Query::CaptureAt { target, lines }))?;
             let ServerMsg::Capture { text } = reply else { bail!("unexpected reply: {reply:?}") };
             println!("{text}");
             return Ok(());
@@ -844,7 +868,7 @@ mod tests {
 
         let args = a(&["-p", "2", "cargo", "test"]);
         let (pane, rest) = take_pane(&args).unwrap();
-        assert_eq!(pane, Some(2));
+        assert_eq!(pane, Some(Target::Position(2)));
         assert_eq!(rest, &args[2..]);
 
         // No flag: every argument is text, and nothing is consumed.
@@ -853,25 +877,47 @@ mod tests {
         assert_eq!(pane, None);
         assert_eq!(rest, &args[..]);
 
-        // A flag with no number is an error, not a silently ignored flag -
+        // A flag with no value is an error, not a silently ignored flag -
         // otherwise `-p` alone would type "-p" into the focused pane.
         assert!(take_pane(&a(&["-p"])).is_err());
-        assert!(take_pane(&a(&["-p", "x"])).is_err());
         // Beyond a u8 there is no such pane anyway (MAX_PANES is 64).
         assert!(take_pane(&a(&["-p", "300"])).is_err());
+        // Position 0 does not exist; the bar counts from 1.
+        assert!(take_pane(&a(&["-p", "0"])).is_err());
+        // Capitals are not a legal name, so this is a typo, not a pane.
+        assert!(take_pane(&a(&["-p", "Reviewer"])).is_err());
+    }
+
+    /// The four things `-p` accepts, and why they cannot be confused: a
+    /// position is bare digits, an id is prefixed, and a name may not start
+    /// with a digit.
+    #[test]
+    fn a_pane_can_be_named_by_position_id_or_name() {
+        assert_eq!(Target::parse("3", None), Ok(Target::Position(3)));
+        assert_eq!(Target::parse("@3", None), Ok(Target::Id(3)));
+        assert_eq!(Target::parse("reviewer", None), Ok(Target::Name("reviewer".into())));
+        assert_eq!(Target::parse("current", Some(9)), Ok(Target::Id(9)));
+        // `current` outside a pane has no answer, and guessing one would type
+        // into whichever pane happened to have the focus.
+        assert!(Target::parse("current", None).is_err());
+        // Reserved, so `-p current` can never be ambiguous.
+        assert!(!zmux::protocol::is_valid_name("current"));
     }
 
     #[test]
     fn capture_takes_its_flags_in_either_order() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
+        let pos = |n| Some(Target::Position(n));
         assert_eq!(capture_args(&a(&[])).unwrap(), (None, 0));
-        assert_eq!(capture_args(&a(&["-p", "2"])).unwrap(), (Some(2), 0));
+        assert_eq!(capture_args(&a(&["-p", "2"])).unwrap(), (pos(2), 0));
         assert_eq!(capture_args(&a(&["-n", "20"])).unwrap(), (None, 20));
-        assert_eq!(capture_args(&a(&["-p", "2", "-n", "20"])).unwrap(), (Some(2), 20));
+        assert_eq!(capture_args(&a(&["-p", "2", "-n", "20"])).unwrap(), (pos(2), 20));
         // The order that used to lose the pane silently.
-        assert_eq!(capture_args(&a(&["-n", "20", "-p", "2"])).unwrap(), (Some(2), 20));
-        assert_eq!(capture_args(&a(&["--pane", "3", "--lines", "5"])).unwrap(), (Some(3), 5));
+        assert_eq!(capture_args(&a(&["-n", "20", "-p", "2"])).unwrap(), (pos(2), 20));
+        assert_eq!(capture_args(&a(&["--pane", "3", "--lines", "5"])).unwrap(), (pos(3), 5));
+        // An id reaches a pane in a window that is not on screen.
+        assert_eq!(capture_args(&a(&["-p", "@12"])).unwrap(), (Some(Target::Id(12)), 0));
     }
 
     /// Answering with the WRONG pane is worse than answering with an error,

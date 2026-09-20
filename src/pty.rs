@@ -193,6 +193,23 @@ impl Pane {
         Self::spawn_in(cols, rows, None, on_output)
     }
 
+    /// Environment a pane gets on top of the daemon's own.
+    ///
+    /// `ZMUX` and `ZMUX_SESSION` are set on the daemon process and reach
+    /// every pane by inheritance, because they are the same for all of them.
+    /// `ZMUX_PANE` cannot be: it is what makes one pane distinguishable
+    /// from another, which is what `-p current` and a self-report need.
+    ///
+    /// The pane ID, deliberately, not the position. A position is what the
+    /// status bar shows, but it renumbers the moment a pane closes - so a
+    /// shell that read its own position at startup would be telling a caller
+    /// to type into somebody else's pane an hour later. IDs are never reused.
+    ///
+    /// No `ZMUX_WINDOW` for that same reason: closing a window shifts every
+    /// index after it. A pane's window is a question for `zmux info`, which
+    /// answers it fresh.
+    pub const PANE_ENV_VAR: &'static str = "ZMUX_PANE";
+
     /// Spawn with an explicit starting directory.
     pub fn spawn_in<F>(
         cols: u16,
@@ -203,7 +220,7 @@ impl Pane {
     where
         F: FnMut(&[u8]) -> Vec<u8> + Send + 'static,
     {
-        Self::spawn_with(cols, rows, cwd, &crate::config::Config::load(), on_output)
+        Self::spawn_with(cols, rows, cwd, &crate::config::Config::load(), None, on_output)
     }
 
     pub fn spawn_with<F>(
@@ -211,6 +228,7 @@ impl Pane {
         rows: u16,
         cwd: Option<&std::path::Path>,
         cfg: &crate::config::Config,
+        pane_id: Option<u32>,
         mut on_output: F,
     ) -> Result<(Self, Receiver<PtyEvent>)>
     where
@@ -233,6 +251,9 @@ impl Pane {
         // which startup files run. herdr's windows_login_shell_args does the
         // same (`pane.rs:1856`).
         let mut cmd = pane_command(&shell);
+        if let Some(id) = pane_id {
+            cmd.env(Self::PANE_ENV_VAR, id.to_string());
+        }
         // Shell integration for OSC 7 cwd reporting.
         //
         // NOTE: deliberately NOT `-l`. A login shell ignores --rcfile, so the

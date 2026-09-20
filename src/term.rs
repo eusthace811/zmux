@@ -127,6 +127,10 @@ pub struct Signals {
     /// then the window title is the only clue about what is running, and it
     /// is a poor one - Git Bash points it at the directory.
     pub integrated: bool,
+    /// A name the pane claimed for itself, so a caller can say `reviewer`
+    /// instead of tracking an id. Set by the report channel (DESIGN.md §12),
+    /// and cleared when the command that claimed it ends.
+    pub name: Option<String>,
 }
 
 /// What a pane is doing. One lock, every fact the bar and `info` need.
@@ -289,6 +293,11 @@ impl Term {
             last_exit: s.last_exit,
             title: if s.integrated { None } else { s.title.as_deref().and_then(sanitise) },
         }
+    }
+
+    /// The name this pane claimed for itself, if it claimed one.
+    pub fn name(&self) -> Option<String> {
+        self.signals.lock().ok()?.name.clone()
     }
 
     /// Latest reported working directory, converted to a Windows path.
