@@ -176,22 +176,26 @@ fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEve
     }
 }
 
-/// Whether a command that CREATES something managed to.
+/// Whether a command that CREATES something managed to, and what it made.
 ///
 /// `Ok(None)` is the session declining - no room, or already at `MAX_PANES` -
 /// and `Err` is the shell refusing to start. Neither may end the connection
 /// (see `apply`), but both are things a caller has to be told.
-fn refusal<T>(outcome: Result<Option<T>>, what: &str) -> Option<String> {
+fn created<T>(outcome: Result<Option<T>>, what: &str, id: impl Fn(&T) -> PaneId) -> Applied {
     match outcome {
-        Ok(Some(_)) => None,
-        Ok(None) => Some(format!(
+        Ok(Some(v)) => Ok(Some(id(&v).0)),
+        Ok(None) => Err(format!(
             "{what} refused: too small to divide, or the session is at its pane limit"
         )),
-        Err(e) => Some(format!("{what} failed: {e}")),
+        Err(e) => Err(format!("{what} failed: {e}")),
     }
 }
 
-/// Run one client command. `Some(reason)` when it could not be carried out.
+/// What a command did: the pane it created, or why it could not run.
+type Applied = std::result::Result<Option<u32>, String>;
+
+/// Run one client command. `Err(reason)` when it could not be carried out,
+/// `Ok(Some(id))` when it created a pane.
 ///
 /// Never an `Err`, on purpose. Creating a pane can fail - the shell may not
 /// start under resource pressure - and propagating that ended the CONNECTION,
@@ -204,76 +208,87 @@ fn refusal<T>(outcome: Result<Option<T>>, what: &str) -> Option<String> {
 /// the wrong-shell accident an out-of-range `-p` is refused to avoid. Only
 /// the commands that create or destroy report one: a focus command that does
 /// nothing at the edge of the screen is not a failure, it is the edge.
-fn apply(session: &Arc<Session>, cmd: Cmd) -> Option<String> {
+fn apply(session: &Arc<Session>, cmd: Cmd) -> Applied {
     match cmd {
-        Cmd::SplitHorizontal => refusal(session.split(Dir::Horizontal), "split"),
-        Cmd::SplitVertical => refusal(session.split(Dir::Vertical), "split"),
-        Cmd::NewWindow => refusal(session.new_window(), "new window"),
-        Cmd::ClosePane => (!session.close_focused())
-            .then(|| "cannot close the session's last pane".to_string()),
+        Cmd::SplitHorizontal => created(session.split(Dir::Horizontal), "split", |id| *id),
+        Cmd::SplitVertical => created(session.split(Dir::Vertical), "split", |id| *id),
+        Cmd::SplitHorizontalBackground => {
+            created(session.split_background(Dir::Horizontal), "split", |id| *id)
+        }
+        Cmd::SplitVerticalBackground => {
+            created(session.split_background(Dir::Vertical), "split", |id| *id)
+        }
+        Cmd::NewWindow => created(session.new_window(), "new window", |(_, id)| *id),
+        Cmd::ClosePane => {
+            if session.close_focused() {
+                Ok(None)
+            } else {
+                Err("cannot close the session's last pane".to_string())
+            }
+        }
         Cmd::FocusLeft => {
             session.focus_dir(Nav::Left);
-            None
+            Ok(None)
         }
         Cmd::FocusRight => {
             session.focus_dir(Nav::Right);
-            None
+            Ok(None)
         }
         Cmd::FocusUp => {
             session.focus_dir(Nav::Up);
-            None
+            Ok(None)
         }
         Cmd::FocusDown => {
             session.focus_dir(Nav::Down);
-            None
+            Ok(None)
         }
         Cmd::ResizeLeft => {
             session.resize_focused(Nav::Left, 2);
-            None
+            Ok(None)
         }
         Cmd::ResizeRight => {
             session.resize_focused(Nav::Right, 2);
-            None
+            Ok(None)
         }
         Cmd::ResizeUp => {
             session.resize_focused(Nav::Up, 1);
-            None
+            Ok(None)
         }
         Cmd::ResizeDown => {
             session.resize_focused(Nav::Down, 1);
-            None
+            Ok(None)
         }
         Cmd::ScrollUp => {
             session.scroll_focused(Some(1));
-            None
+            Ok(None)
         }
         Cmd::ScrollDown => {
             session.scroll_focused(Some(-1));
-            None
+            Ok(None)
         }
         Cmd::ScrollPageUp => {
             session.scroll_focused(Some(10));
-            None
+            Ok(None)
         }
         Cmd::ScrollPageDown => {
             session.scroll_focused(Some(-10));
-            None
+            Ok(None)
         }
         Cmd::ScrollToBottom => {
             session.scroll_focused(None);
-            None
+            Ok(None)
         }
         Cmd::NextWindow => {
             session.next_window();
-            None
+            Ok(None)
         }
         Cmd::PrevWindow => {
             session.prev_window();
-            None
+            Ok(None)
         }
         Cmd::SelectWindow(i) => {
             session.select_window(i as usize);
-            None
+            Ok(None)
         }
     }
 }
@@ -308,7 +323,7 @@ fn serve_control(
                 // pump may already have sent attached clients the
                 // intermediate layout. Skipping the repaint would leave a
                 // pane on their screen that no longer exists.
-                Some(reason) => {
+                Err(reason) => {
                     session.publish();
                     ServerMsg::Refused { reason }
                 }
@@ -318,8 +333,13 @@ fn serve_control(
                 // would describe where THEY went, not what this command did.
                 // The gap cannot be closed entirely without a lock spanning
                 // both, so `panes[].id` is the identifier that survives it.
-                None => {
-                    let info = session.info();
+                Ok(made) => {
+                    let mut info = session.info();
+                    // The one fact the snapshot cannot carry on its own: a
+                    // background split leaves `focus` on the OLD pane, so
+                    // without this the caller has no way to name what it just
+                    // made except by diffing, which races the user.
+                    info.created = made;
                     session.publish();
                     ServerMsg::Info(info)
                 }
@@ -563,7 +583,7 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     ClientMsg::Command(cmd) => {
                         // Someone attached can see for themselves that nothing
                         // happened, so the reason only goes to the log.
-                        if let Some(reason) = apply(&session, cmd) {
+                        if let Err(reason) = apply(&session, cmd) {
                             eprintln!("[zmuxd] {reason}");
                         }
                         session.publish();

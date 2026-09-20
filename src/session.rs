@@ -532,6 +532,9 @@ impl Session {
             focus,
             focus_id: focused.map_or(0, |id| id.0),
             panes: list,
+            // Filled in by whoever ran a creating command; `info` on its own
+            // created nothing.
+            created: None,
         }
     }
 
@@ -552,7 +555,23 @@ impl Session {
         self.capture_from(id, lines)
     }
 
+    /// Split the focused pane and move the focus into the new one, as
+    /// `C-b %` does.
     pub fn split(&self, dir: Dir) -> Result<Option<PaneId>> {
+        self.split_with(dir, false)
+    }
+
+    /// Split WITHOUT moving the focus, for a caller working in the
+    /// background while somebody else uses the session.
+    ///
+    /// This is what makes an agent's pane non-disruptive. A split that takes
+    /// the focus moves the user's cursor mid-sentence, so a helper that needs
+    /// a pane of its own could only get one by interrupting them.
+    pub fn split_background(&self, dir: Dir) -> Result<Option<PaneId>> {
+        self.split_with(dir, true)
+    }
+
+    fn split_with(&self, dir: Dir, keep_focus: bool) -> Result<Option<PaneId>> {
         let _g = lock(&self.geometry);
         // shutdown() drains the pane map under this same lock. A command that
         // arrives after that drain would create a ConPTY nothing owns and
@@ -578,6 +597,9 @@ impl Session {
         // to catch this matched the old pane's own prompt on the composited
         // screen, so it passed either way.
         let inherit = self.focused_cwd();
+        // Whose focus to put back. Read before the split, because
+        // `Layout::split` moves it to the new pane.
+        let was_focused = keep_focus.then(|| self.focus());
         let accepted = lock(&self.windows).current_mut().split(dir, area, new_id).is_some();
         if !accepted {
             eprintln!("[session] split refused: area {}x{} too small", area.w, area.h);
@@ -606,6 +628,13 @@ impl Session {
             // next start.
             self.save_state();
             return Err(e);
+        }
+        // Inside the geometry lock and BEFORE the reflow, so no frame is
+        // ever composited with the focus on the new pane. Publishing that
+        // intermediate state would flash the user's cursor across the screen
+        // and back, which is the whole thing this avoids.
+        if let Some(prev) = was_focused {
+            lock(&self.windows).current_mut().set_focus(prev);
         }
         self.reflow_locked();
         drop(_g);
@@ -674,7 +703,8 @@ impl Session {
     /// Create a window with one pane and switch to it.
     ///
     /// `Ok(None)` means the session is already at `MAX_PANES`.
-    pub fn new_window(&self) -> Result<Option<usize>> {
+    /// Create a window and switch to it. `Some((index, first pane))`.
+    pub fn new_window(&self) -> Result<Option<(usize, PaneId)>> {
         let _g = lock(&self.geometry);
         // See split(): no pane may be created after shutdown's drain.
         if !self.running.load(Ordering::Relaxed) {
@@ -698,7 +728,7 @@ impl Session {
         self.reflow_locked();
         drop(_g);
         self.save_state();
-        Ok(Some(index))
+        Ok(Some((index, id)))
     }
 
     pub fn next_window(&self) -> bool {

@@ -165,3 +165,101 @@ fn writing_by_target_moves_neither_focus_nor_scroll() {
     let after = c.info();
     assert_eq!(after.focus_id, before.focus_id, "a background write moved the focus");
 }
+
+/// A pane made for background work must not move the user's cursor. A split
+/// that takes the focus interrupts whatever they were typing.
+#[test]
+fn a_background_split_leaves_the_focus_alone_and_says_what_it_made() {
+    let d = Daemon::start("zmux-test-bg-split");
+    let mut c = Control::open(&d.session);
+    let before = c.info();
+
+    let made = match c.ask(&ClientMsg::Command(Cmd::SplitVerticalBackground)) {
+        ServerMsg::Info(i) => {
+            assert_eq!(i.focus_id, before.focus_id, "a background split moved the focus");
+            i.created.expect("a background split did not say which pane it created")
+        }
+        other => panic!("split refused: {other:?}"),
+    };
+    assert!(d.wait_for_panes(2, 10), "the split never appeared");
+
+    let after = c.info();
+    assert_eq!(after.focus_id, before.focus_id, "the focus moved after the fact");
+    assert_ne!(made, before.focus_id, "`created` named the pane we started in");
+    assert!(after.panes.iter().any(|p| p.id == made), "`created` names no live pane");
+
+    // And the new pane is a real shell that can be driven by that id.
+    c.input_at(Target::Id(made), "echo NEW_PANE_OK", true);
+    assert!(c
+        .wait_at(20, Target::Id(made), |t| t.matches("NEW_PANE_OK").count() >= 2)
+        .is_some(), "the pane `created` named is not a working shell");
+    assert_eq!(c.info().focus_id, before.focus_id, "driving it moved the focus");
+}
+
+/// A focus-taking split still takes the focus. The background one is an
+/// addition, not a change of behaviour.
+#[test]
+fn an_ordinary_split_still_moves_the_focus() {
+    let d = Daemon::start("zmux-test-fg-split");
+    let mut c = Control::open(&d.session);
+    let before = c.info().focus_id;
+    match c.ask(&ClientMsg::Command(Cmd::SplitVertical)) {
+        ServerMsg::Info(i) => {
+            assert_ne!(i.focus_id, before, "`C-b \"` stopped moving the focus");
+            assert_eq!(i.created, Some(i.focus_id), "a split should name what it made");
+        }
+        other => panic!("split refused: {other:?}"),
+    }
+}
+
+/// A prompt goes in as one block. `bash -c 'read -r x'` with bracketed paste
+/// on is the smallest program that can tell the difference: pasted, the
+/// newline inside the text is data; typed, it ends the read.
+#[test]
+fn a_multi_line_prompt_reaches_a_program_as_one_paste() {
+    let d = Daemon::start("zmux-test-paste");
+    let mut c = Control::open(&d.session);
+
+    // Turn bracketed paste on, then read one "line" - which, inside a paste,
+    // is everything up to the end marker.
+    c.input_at(Target::Focused, "printf '\\033[?2004h'; read -r line; printf 'GOT[%s]\\n' \"$line\"", true);
+    std::thread::sleep(std::time::Duration::from_millis(900));
+
+    let msg = ClientMsg::InputAt {
+        target: Target::Focused,
+        data: b"alpha bravo".to_vec(),
+        paste: true,
+        enter: true,
+    };
+    assert!(matches!(c.ask(&msg), ServerMsg::Info(_)), "the paste was refused");
+
+    let screen = c
+        .wait_at(20, Target::Focused, |t| t.contains("GOT["))
+        .expect("the program never finished its read");
+    assert!(
+        screen.contains("GOT[alpha bravo]"),
+        "the paste markers reached the program as text, or the text was mangled:\n{screen}"
+    );
+}
+
+/// `paste` is a request, not an instruction. A program that never asked for
+/// bracketed paste must not be handed the markers as literal characters.
+#[test]
+fn a_program_that_did_not_ask_for_a_paste_never_sees_the_markers() {
+    let d = Daemon::start("zmux-test-no-paste");
+    let mut c = Control::open(&d.session);
+
+    let msg = ClientMsg::InputAt {
+        target: Target::Focused,
+        data: b"echo PLAIN_OK".to_vec(),
+        paste: true,
+        enter: true,
+    };
+    assert!(matches!(c.ask(&msg), ServerMsg::Info(_)));
+
+    let screen = c
+        .wait_at(20, Target::Focused, |t| t.matches("PLAIN_OK").count() >= 2)
+        .expect("the shell never ran the command");
+    assert!(!screen.contains("200~"), "paste markers were typed at a plain shell:\n{screen}");
+    assert!(!screen.contains("201~"), "paste markers were typed at a plain shell:\n{screen}");
+}

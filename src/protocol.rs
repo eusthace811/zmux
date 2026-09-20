@@ -246,6 +246,18 @@ pub struct SessionInfo {
     /// window's panes unreachable and undiscoverable - you had to switch to a
     /// window, moving the user's screen, merely to find out what was in it.
     pub panes: Vec<PaneInfo>,
+    /// The pane this command created, if it created one.
+    ///
+    /// A focus-taking split announces itself through `focus`; a background
+    /// one cannot, because the whole point is that the focus did not move.
+    /// Diffing the pane list against a previous `info` would race the user,
+    /// so the daemon says it outright.
+    ///
+    /// NOTE for anyone tempted to tidy this with `skip_serializing_if`:
+    /// bincode 2 goes through the `Serialize` impl, so a skipped field is
+    /// skipped ON THE WIRE and the decoder then reads the next field's bytes
+    /// as this one. It stays a plain `Option`, and JSON shows `null`.
+    pub created: Option<u32>,
 }
 
 /// One pane of the current window.
@@ -343,6 +355,16 @@ pub enum Cmd {
     /// Indices are what the status bar shows and what `C-b <digit>` sends, so
     /// they are 0-based - `C-b 1` is the second window, as the bar says.
     SelectWindow(u8),
+    // --- appended. Append-only. ---
+    /// Split, but leave the focus where the user had it.
+    ///
+    /// No key is bound to these: someone at the keyboard splitting a pane
+    /// wants to be in it. They exist for a caller making a pane to work in
+    /// while somebody else is typing. `SessionInfo::created` says which pane
+    /// appeared, because with the focus unmoved nothing else in the reply
+    /// can.
+    SplitHorizontalBackground,
+    SplitVerticalBackground,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

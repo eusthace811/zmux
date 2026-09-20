@@ -121,8 +121,9 @@ zmux - tmux-style panes for Windows
 Driving a session without attaching (for scripts and agents):
   zmux info <session>                    layout, windows, focus, as JSON
   zmux send <session> <command> [n]      one command; `send` alone lists them
-  zmux keys <session> [-p N] <text>      type text, no Enter
-  zmux run  <session> [-p N] <command>   type it and press Enter
+  zmux keys <session> [-p T] <text>      type text, no Enter
+  zmux run  <session> [-p T] [--paste] <command>
+                                           type it and press Enter
   zmux capture <session> [-p T] [-n N]   a pane's visible screen, as text
 
   -p chooses the pane: N its position in the current window, @N its id (which
@@ -133,16 +134,21 @@ Driving a session without attaching (for scripts and agents):
 /// The names `zmux send` accepts, printed when it is given none.
 const CMD_NAMES: &str = "\
 commands for `zmux send <session> <command>`:
-  split-h  split-v  close
+  split-h  split-v  split-h-bg  split-v-bg  close
   focus-left  focus-right  focus-up  focus-down
   resize-left  resize-right  resize-up  resize-down
   new-window  next-window  prev-window  select-window <index>
-  scroll-up  scroll-down  page-up  page-down  scroll-bottom";
+  scroll-up  scroll-down  page-up  page-down  scroll-bottom
+
+the -bg splits leave the focus where the user had it, and the reply's
+`created` field names the pane they made.";
 
 fn parse_cmd(name: &str, arg: Option<&str>) -> Option<Cmd> {
     Some(match name {
         "split-h" => Cmd::SplitHorizontal,
         "split-v" => Cmd::SplitVertical,
+        "split-h-bg" => Cmd::SplitHorizontalBackground,
+        "split-v-bg" => Cmd::SplitVerticalBackground,
         "close" => Cmd::ClosePane,
         "focus-left" => Cmd::FocusLeft,
         "focus-right" => Cmd::FocusRight,
@@ -412,8 +418,15 @@ fn main() -> Result<()> {
             let enter = args[0] == "run";
             let session = session_arg(&args, &args[0])?;
             let (pane, rest) = take_pane(&args[2..])?;
+            // After `-p`, so `run -p 2 --paste ...` reads the way it is
+            // written. A prompt for a TUI goes in as ONE block, or every
+            // newline in it submits a fragment.
+            let (paste, rest) = match rest.first().map(String::as_str) {
+                Some("--paste") => (true, &rest[1..]),
+                _ => (false, rest),
+            };
             if rest.is_empty() {
-                bail!("usage: zmux {} <session> [-p N] <text>", args[0]);
+                bail!("usage: zmux {} <session> [-p T] [--paste] <text>", args[0]);
             }
             let data = unescape(&rest.join(" "));
             // No `-p` still means `Input`, not `InputAt { Focused }`. The two
@@ -421,7 +434,10 @@ fn main() -> Result<()> {
             // stands in for the user typing. A `-p` write is background work
             // by definition and must not yank anybody's scrollback view.
             let msg = match pane {
-                Some(target) => ClientMsg::InputAt { target, data, paste: false, enter },
+                Some(target) => ClientMsg::InputAt { target, data, paste, enter },
+                None if paste => {
+                    ClientMsg::InputAt { target: Target::Focused, data, paste: true, enter }
+                }
                 None => {
                     let mut data = data;
                     if enter {
@@ -942,10 +958,12 @@ mod tests {
         let names: Vec<&str> = CMD_NAMES
             .lines()
             .skip(1)
+            // The list ends at the blank line; what follows is prose.
+            .take_while(|l| !l.trim().is_empty())
             .flat_map(str::split_whitespace)
             .filter(|w| !w.starts_with('<'))
             .collect();
-        assert!(names.len() >= 19, "the list looks empty: {names:?}");
+        assert!(names.len() >= 21, "the list looks empty: {names:?}");
         for n in names {
             assert!(parse_cmd(n, Some("0")).is_some(), "`send` advertises '{n}' but cannot parse it");
         }
