@@ -65,7 +65,7 @@ zmux config             write a commented default config, print its path
 | `src/cwd.rs` | OSC 7 parsing and the bash integration snippet. |
 | `src/config.rs` | `config.toml`. |
 
-## Six things that will bite you if you change them
+## Seven things that will bite you if you change them
 
 **1. Terminal query replies are mandatory.** ConPTY is created with
 `PSEUDOCONSOLE_INHERIT_CURSOR` and emits `ESC[6n` at startup. Unanswered, the
@@ -90,7 +90,14 @@ blocks in `read()` until the pseudoconsole closes. Joining first deadlocks.
 that is not a KnownDLL — a planted file would execute in-process. A test proves
 the mitigation rather than assuming it.
 
-**6. The waiter thread and `close()` share ONE child handle.** They used to
+**6. A ConPTY eats the first byte written after a resize.** Not ours: measured
+at the pty layer with no daemon and no query replies in flight, 4 of 16
+resizes lost it and 0 of 16 did with a sacrificial NUL. It needs a pause after
+the resize, so it lands exactly on someone who splits a pane and then types.
+`Pane::resize` spends one NUL — the conventional terminal no-op filler — every
+time. Remove it and every fourth split eats a keystroke.
+
+**7. The waiter thread and `close()` share ONE child handle.** They used to
 hold separate slots, and the constructor filled `Pane::child` by *taking* the
 child out of the waiter's — so the waiter found `None` on its first tick and
 returned, and `PtyEvent::Exited` could never fire for any pane. Typing `exit`

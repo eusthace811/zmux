@@ -47,9 +47,13 @@ fn splitting_gives_two_independent_shells() {
         "focus never moved back to the original pane"
     );
     c.input("echo LEFT:$SPLITVAR:\r");
-    let screen = c
-        .wait_for(20, |t| t.contains("LEFT::"))
-        .expect("the original pane shares a shell with the new one");
+    let screen = match c.wait_for(20, |t| t.contains("LEFT::")) {
+        Some(s) => s,
+        None => panic!(
+            "the original pane never answered; screen was:\n{}",
+            c.current(2).unwrap_or_default()
+        ),
+    };
     assert!(
         !screen.contains("LEFT:right:"),
         "both panes are the same shell:\n{screen}"

@@ -117,15 +117,9 @@ fn windows_user_sid() -> Option<String> {
 /// `FILE_FLAG_FIRST_PIPE_INSTANCE` would do the same job, but `interprocess`
 /// does not expose it.
 pub struct SessionLock {
-    #[cfg(windows)]
     handle: *mut core::ffi::c_void,
 }
 
-// The handle is only ever closed on drop, from the thread that owns the value.
-#[cfg(windows)]
-unsafe impl Send for SessionLock {}
-
-#[cfg(windows)]
 impl Drop for SessionLock {
     fn drop(&mut self) {
         extern "system" {
@@ -138,7 +132,6 @@ impl Drop for SessionLock {
 }
 
 /// Claim the right to serve `session`, or `None` if another daemon holds it.
-#[cfg(windows)]
 pub fn claim_session(session: &str) -> Option<SessionLock> {
     use widestring::U16CString;
 

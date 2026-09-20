@@ -380,10 +380,30 @@ impl Pane {
         Ok(())
     }
 
+    /// Resize the pseudoconsole.
+    ///
+    /// Then write one NUL, which ConPTY eats.
+    ///
+    /// After a resize, the FIRST byte written to the pty some time later is
+    /// swallowed - `echo` arrives at the shell as `cho`. Measured at this
+    /// layer with no daemon involved and no terminal-query replies in flight:
+    /// 4 of 16 resizes lost it, 0 of 16 with this byte. It needs a pause
+    /// after the resize, so it lands exactly on the user who splits a pane
+    /// and then types - which is everyone.
+    ///
+    /// NUL is the conventional terminal no-op filler: readline binds it to
+    /// set-mark (no output) and full-screen programs ignore it. Spending one
+    /// on every resize is worth not losing a keystroke every fourth split.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let m = self.master.lock().map_err(|_| anyhow::anyhow!("master poisoned"))?;
-        let Some(m) = m.as_ref() else { return Ok(()) }; // already closed
-        m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .map_err(|e| anyhow::anyhow!("resize: {e}"))
+        {
+            let m = self.master.lock().map_err(|_| anyhow::anyhow!("master poisoned"))?;
+            let Some(m) = m.as_ref() else { return Ok(()) }; // already closed
+            m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+                .map_err(|e| anyhow::anyhow!("resize: {e}"))?;
+        }
+        // The master lock is released first: the write below takes the
+        // writer lock, and there is no reason to hold both.
+        let _ = self.write_input(b"\0");
+        Ok(())
     }
 }
