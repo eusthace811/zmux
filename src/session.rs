@@ -20,7 +20,7 @@ use crate::windows::{Closed, Windows};
 use crate::protocol::{clamp_size, Frame, ServerMsg, MAX_INPUT_BYTES, MAX_PANES};
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
-use crate::render::{composite, frame_from_screen, pane_area_with};
+use crate::render::{composite, frame_from_screen, pane_area_with, status_spans, Span};
 use crate::term::Term;
 
 use crate::config::Config;
@@ -126,54 +126,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     }
-}
-
-/// Build the status line.
-///
-/// Free and pure so the degradation ladder can be tested at every width
-/// without starting a daemon and a shell - it used to be reachable only
-/// through a live session, so only the widest rung was ever exercised.
-#[allow(clippy::too_many_arguments)]
-fn status_text(
-    name: &str,
-    windows: usize,
-    current: usize,
-    panes: usize,
-    focus: u32,
-    scrolled: bool,
-    width: usize,
-) -> String {
-    let scrolled = if scrolled { " | SCROLL" } else { "" };
-    let plural = if panes == 1 { "" } else { "s" };
-
-    // Both window forms appear only once there IS more than one window. With
-    // a single window they would be a constant "0*" and "0/1" taking space
-    // from the parts that actually vary on a narrow terminal.
-    let (wins, wshort) = if windows > 1 {
-        let list = (0..windows)
-            .map(|i| if i == current { format!("{i}*") } else { i.to_string() })
-            .collect::<Vec<_>>()
-            .join(" ");
-        (format!("{list} | "), format!("{current}/{windows} | "))
-    } else {
-        (String::new(), String::new())
-    };
-
-    // Drop the least useful parts first rather than letting the whole line be
-    // truncated. On a narrow pane the old format showed a clipped session name
-    // and nothing else - the pane count, which is what you actually need, fell
-    // off the end. Which window you are on outranks the pane count: getting
-    // lost between windows is worse than not knowing how many panes this one
-    // holds.
-    [
-        format!(" {name} | {wins}{panes} pane{plural} | pane {focus}{scrolled} "),
-        format!(" {wins}{panes} pane{plural} | pane {focus}{scrolled} "),
-        format!(" {wshort}{panes}p{scrolled} "),
-    ]
-    .into_iter()
-    .find(|s| s.chars().count() <= width)
-    // Nothing fits; this is the shortest thing that is still true.
-    .unwrap_or_else(|| format!(" {panes}p{scrolled} "))
 }
 
 impl Session {
@@ -523,6 +475,11 @@ impl Session {
         self.switch_window(|w| w.select_previous())
     }
 
+    /// Jump straight to a window by index, as `C-b <digit>` does.
+    pub fn select_window(&self, index: usize) -> bool {
+        self.switch_window(move |w| w.select(index))
+    }
+
     /// Change which window is composited.
     ///
     /// `reflow_locked` is what makes this correct rather than just convenient:
@@ -810,12 +767,12 @@ impl Session {
         }
     }
 
-    fn status_line(&self) -> String {
+    fn status_line(&self) -> Vec<Span> {
         let (panes, focus, windows, current) = {
             let w = lock(&self.windows);
             (w.current().len(), w.current().focus().0, w.len(), w.index())
         };
-        status_text(
+        status_spans(
             &self.name,
             windows,
             current,
@@ -907,68 +864,6 @@ impl Session {
             } else {
                 eprintln!("[session] a ConPTY did not close within 5s; exiting anyway");
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::status_text;
-
-    /// Three windows, on the second, showing two panes with pane 7 focused.
-    fn at(width: usize) -> String {
-        status_text("work", 3, 1, 2, 7, false, width)
-    }
-
-    #[test]
-    fn a_single_window_shows_no_window_list() {
-        // The list would be a constant "0*", which tells you nothing.
-        assert_eq!(status_text("work", 1, 0, 1, 1, false, 80), " work | 1 pane | pane 1 ");
-    }
-
-    #[test]
-    fn several_windows_mark_the_current_one() {
-        assert_eq!(status_text("work", 3, 1, 2, 7, false, 80), " work | 0 1* 2 | 2 panes | pane 7 ");
-    }
-
-    #[test]
-    fn scrolling_is_flagged() {
-        let s = status_text("work", 1, 0, 1, 1, true, 80);
-        assert!(s.ends_with("| SCROLL "), "{s}");
-    }
-
-    #[test]
-    fn the_session_name_goes_first_when_it_will_not_fit() {
-        let full = at(80);
-        let narrower = at(full.chars().count() - 1);
-        assert!(!narrower.contains("work"), "the name should have been dropped: {narrower}");
-        assert!(narrower.contains("0 1* 2"), "the window list must survive: {narrower}");
-        assert!(narrower.contains("2 panes"), "{narrower}");
-    }
-
-    #[test]
-    fn the_window_position_outlives_the_pane_count() {
-        // Getting lost between windows is worse than not knowing how many
-        // panes the current one holds.
-        let s = at(12);
-        assert_eq!(s, " 1/3 | 2p ");
-    }
-
-    #[test]
-    fn something_true_is_always_returned_however_narrow() {
-        for width in 0..40 {
-            let s = at(width);
-            assert!(s.contains("2p") || s.contains("2 pane"), "width {width}: {s}");
-        }
-    }
-
-    /// A wider terminal must never produce a shorter line: if it did, the
-    /// ladder would be skipping a rung.
-    #[test]
-    fn the_ladder_never_gets_longer_as_the_terminal_narrows() {
-        let widths: Vec<usize> = (0..60).map(|w| at(w).chars().count()).collect();
-        for pair in widths.windows(2) {
-            assert!(pair[0] <= pair[1], "a wider terminal produced a shorter line: {widths:?}");
         }
     }
 }

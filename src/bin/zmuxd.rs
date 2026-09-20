@@ -229,6 +229,9 @@ fn apply(session: &Arc<Session>, cmd: Cmd) {
         Cmd::PrevWindow => {
             session.prev_window();
         }
+        Cmd::SelectWindow(i) => {
+            session.select_window(i as usize);
+        }
     }
 }
 

@@ -106,6 +106,41 @@ fn next_and_previous_wrap_around() {
     );
 }
 
+/// `C-b <digit>` jumps straight to a window by the number the status bar
+/// shows, without walking through the ones in between.
+#[test]
+fn a_digit_jumps_straight_to_that_window() {
+    let d = Daemon::start("zmux-test-win-digit");
+    let mut c = d.attach_ready(120, 30);
+    echo_mark(&mut c, "DIGITZERO");
+    assert!(c.wait_for(25, |t| t.contains("DIGITZERO")).is_some(), "window 0 never ran anything");
+
+    c.cmd(Cmd::NewWindow);
+    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+    c.cmd(Cmd::NewWindow);
+    assert!(c.wait_for(25, |t| t.contains("0 1 2*")).is_some(), "no third window");
+
+    // Two windows back in one keystroke, not two.
+    c.cmd(Cmd::SelectWindow(0));
+    let screen = c
+        .wait_for(20, |t| t.contains("0* 1 2"))
+        .expect("the digit did not select window 0");
+    assert!(
+        screen.contains("DIGITZERO"),
+        "landed somewhere, but not on the window that has window 0's output:\n{screen}"
+    );
+
+    // And a window that does not exist leaves you where you are, rather than
+    // clamping onto some other window.
+    c.cmd(Cmd::SelectWindow(7));
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let after = c.current(3).expect("a screen");
+    assert!(
+        after.contains("0* 1 2"),
+        "selecting a window that does not exist moved us:\n{after}"
+    );
+}
+
 #[test]
 fn splits_belong_to_one_window_only() {
     let d = Daemon::start("zmux-test-win-splits");

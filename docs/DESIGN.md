@@ -686,8 +686,8 @@ Windows build. Those three answers determine whether the design still holds.
 ## 9. Windows
 
 Several independent screenfuls of panes in one session: `C-b c` creates one,
-`C-b n` / `C-b p` cycle. tmux's model, reduced to the smallest thing that
-works.
+`C-b n` / `C-b p` cycle, `C-b <digit>` jumps. tmux's model, reduced to the
+smallest thing that works.
 
 ### A window IS a layout
 
@@ -698,8 +698,14 @@ for it would have bought nothing. Windows are addressed by position, which is
 also what the status bar shows.
 
 The cost is that closing a window renumbers the ones after it, where tmux
-leaves a gap. Accepted: it keeps indices contiguous and there is no
-`C-b <digit>` binding whose target could shift underneath the user.
+leaves a gap — so `C-b <digit>` addresses a position, not an identity, and a
+window closing elsewhere shifts what a digit means. Accepted: indices stay
+contiguous, and the status bar always shows the current numbering, so the
+digit to press is on screen rather than remembered.
+
+An out-of-range digit is IGNORED rather than clamped. `C-b 7` with three
+windows means "go to seven"; landing on the third instead would move you off
+the window you were working in, which is worse than doing nothing.
 
 ### Panes never move
 
@@ -760,9 +766,32 @@ file.
 
 ### Wire
 
-`PROTOCOL_VERSION` 3 appends `Cmd::{NewWindow, NextWindow, PrevWindow}`. The
-handshake rejects a mismatch, so a v3 client meeting a v2 daemon is refused
-cleanly rather than failing to decode mid-stream.
+`PROTOCOL_VERSION` 3 appends `Cmd::{NewWindow, NextWindow, PrevWindow}`, and
+4 appends `Cmd::SelectWindow(u8)`. The handshake rejects a mismatch, so a v4
+client meeting a v3 daemon is refused cleanly rather than failing to decode
+mid-stream.
+
+### The status bar and the dividers are ours to colour
+
+`render.rs` owns every cell we draw ourselves. The session says what a run of
+status text MEANS — `Role::{Name, Sep, Info, Window, ActiveWindow, Alert}` —
+and `render.rs` alone decides what a role looks like, so the palette lives in
+one place and the width ladder stays a pure function of the text.
+
+Two choices worth recording:
+
+- **Fixed 256-colour indices, not 0–15.** A colour scheme remaps the first
+  sixteen, so chrome built from them looks different in every Git Bash theme
+  and can come out invisible — "white" painted onto a light background. The
+  greys from 236 up and the accents (24 deep blue for the session name, 214
+  amber for the window you are on) are stable whatever the scheme.
+- **The dividers recede.** Drawn in the default foreground they were the
+  brightest thing on screen, competing with the shell output they exist to
+  separate. Grey 240 puts them behind it.
+
+The active window is marked twice, by colour and by the `*` the bar already
+carried. Cheap redundancy: the colour is what you actually see, and the
+marker keeps the bar legible if the colour does not survive.
 
 
 ---

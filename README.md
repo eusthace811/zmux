@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 126 tests passing, clippy clean.
+Phases 0–6 complete. 134 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -42,6 +42,7 @@ zmux config             write a commented default config, print its path
 | `C-b %` / `C-b "` | split left/right, top/bottom |
 | `C-b c` | new window |
 | `C-b n` / `C-b p` | next / previous window (wraps) |
+| `C-b 0`…`C-b 9` | jump to that window — the numbers in the status bar |
 | `C-b x` | close pane — and its window, if it was the last one |
 | `C-b <arrow>` | move focus |
 | `C-b C-<arrow>` | resize |
@@ -137,8 +138,9 @@ sustained output, attach/detach churn, many splits, and malformed input.
   pipe. The client compares the name it asked for against the one the daemon
   reports and refuses the mismatch, so a collision is an error rather than
   silently joining the wrong session.
-- **Windows are positional**, so closing one renumbers those after it. tmux
-  leaves a gap instead. There are no window names and no `C-b <digit>`.
+- **Windows are positional**, so closing one renumbers those after it — and
+  `C-b <digit>` renumbers with them. tmux leaves a gap instead. There are no
+  window names, and only the first ten windows have a digit.
 - **Queues are bounded by message count, not bytes.**
 
 ## One more thing that will bite you

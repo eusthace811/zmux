@@ -73,6 +73,7 @@ In a session (Ctrl-b is the prefix):
   C-b x          close pane          C-b \"          split top/bottom
   C-b <arrow>    move focus          C-b C-<arrow>  resize
   C-b c          new window          C-b n / C-b p  next / previous window
+  C-b 0..9       jump to that window (the numbers in the status bar)
   C-b C-b        send a literal Ctrl-b";
 
 fn main() -> Result<()> {
@@ -340,6 +341,11 @@ fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
         KeyCode::Char('c') => Prefix::Command(Cmd::NewWindow),
         KeyCode::Char('n') => Prefix::Command(Cmd::NextWindow),
         KeyCode::Char('p') => Prefix::Command(Cmd::PrevWindow),
+        // Digits jump to a window by the index the status bar shows. Only one
+        // digit, as in tmux: beyond nine windows, `C-b n` is the way.
+        KeyCode::Char(c @ '0'..='9') => {
+            Prefix::Command(Cmd::SelectWindow(c as u8 - b'0'))
+        }
         KeyCode::Char('[') => Prefix::Scroll,
         KeyCode::PageUp => Prefix::Command(Cmd::ScrollPageUp),
         KeyCode::Left if ctrl => Prefix::Command(Cmd::ResizeLeft),

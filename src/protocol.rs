@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 /// then fail to decode the new variant, so the version MUST move with the wire.
 /// v3 added the window commands: a v3 client sending `Cmd::NewWindow` to a v2
 /// daemon would be a decode error mid-stream, which the handshake catches first.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4 added `Cmd::SelectWindow`, for the same reason.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -79,6 +80,12 @@ pub enum Cmd {
     NewWindow,
     NextWindow,
     PrevWindow,
+    // --- appended. Append-only. ---
+    /// Switch to the window at this index, ignored if there is none.
+    ///
+    /// Indices are what the status bar shows and what `C-b <digit>` sends, so
+    /// they are 0-based - `C-b 1` is the second window, as the bar says.
+    SelectWindow(u8),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

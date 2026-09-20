@@ -9,6 +9,159 @@ use ratatui::style::{Color, Modifier, Style};
 use crate::protocol::{Cell, Frame, COLOR_INDEXED, COLOR_RESET, MOD_BOLD, MOD_DIM, MOD_ITALIC,
                       MOD_REVERSE, MOD_UNDERLINE};
 
+// ---------------------------------------------------------------------------
+// Chrome: the status bar and dividers we draw ourselves
+// ---------------------------------------------------------------------------
+
+/// Pack a 256-colour palette index the way `protocol::Cell` stores colours.
+const fn idx(i: u8) -> u32 {
+    COLOR_INDEXED | i as u32
+}
+
+// Fixed palette indices rather than the terminal's 0-15, which a colour scheme
+// remaps: the chrome then looks the same whatever the user's Git Bash theme
+// is, and cannot come out invisible because the scheme painted, say, "white"
+// onto a light background. 236+ are greys from the 256-colour cube.
+const BAR_BG: u32 = idx(236);
+const SEP_FG: u32 = idx(240);
+const INFO_FG: u32 = idx(250);
+const WINDOW_FG: u32 = idx(245);
+const NAME_FG: u32 = idx(231);
+const NAME_BG: u32 = idx(24);
+const ACTIVE_FG: u32 = idx(235);
+const ACTIVE_BG: u32 = idx(214);
+const ALERT_FG: u32 = idx(214);
+/// Dividers recede. They are structure, not content - drawn in the default
+/// foreground they were the brightest thing on the screen.
+const DIVIDER_FG: u32 = idx(240);
+
+/// What a run of status-bar text MEANS. The session says what it is; this
+/// module alone decides what it looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The session name.
+    Name,
+    /// Punctuation between the parts.
+    Sep,
+    /// Counts and identifiers.
+    Info,
+    /// A window you are not on.
+    Window,
+    /// The window you are on.
+    ActiveWindow,
+    /// Something that wants noticing, like being scrolled off the live view.
+    Alert,
+}
+
+impl Role {
+    fn style(self) -> (u32, u32, u16) {
+        match self {
+            Role::Name => (NAME_FG, NAME_BG, MOD_BOLD),
+            Role::Sep => (SEP_FG, BAR_BG, 0),
+            Role::Info => (INFO_FG, BAR_BG, 0),
+            Role::Window => (WINDOW_FG, BAR_BG, 0),
+            Role::ActiveWindow => (ACTIVE_FG, ACTIVE_BG, MOD_BOLD),
+            Role::Alert => (ALERT_FG, BAR_BG, MOD_BOLD),
+        }
+    }
+}
+
+/// One run of status-bar text with its role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub role: Role,
+}
+
+fn span(role: Role, text: impl Into<String>) -> Span {
+    Span { role, text: text.into() }
+}
+
+fn width_of(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.text.chars().count()).sum()
+}
+
+/// Build the status line.
+///
+/// Pure, so the degradation ladder can be tested at every width without
+/// starting a daemon and a shell - it used to be reachable only through a live
+/// session, so only the widest rung was ever exercised.
+#[allow(clippy::too_many_arguments)]
+pub fn status_spans(
+    name: &str,
+    windows: usize,
+    current: usize,
+    panes: usize,
+    focus: u32,
+    scrolled: bool,
+    width: usize,
+) -> Vec<Span> {
+    let plural = if panes == 1 { "" } else { "s" };
+
+    // The window list appears only once there IS more than one window. With a
+    // single window it would be a constant "0*" taking space from the parts
+    // that actually vary on a narrow terminal.
+    let list = |v: &mut Vec<Span>| {
+        if windows > 1 {
+            for i in 0..windows {
+                // The digit is also the key that jumps there: `C-b <digit>`.
+                // The `*` is belt and braces - the colour says the same thing,
+                // and this keeps it legible if one of them is lost.
+                let (role, mark) = if i == current {
+                    (Role::ActiveWindow, "*")
+                } else {
+                    (Role::Window, "")
+                };
+                v.push(span(role, format!("{i}{mark} ")));
+            }
+            v.push(span(Role::Sep, "| "));
+        }
+    };
+    let alert = |v: &mut Vec<Span>| {
+        if scrolled {
+            v.push(span(Role::Sep, "| "));
+            v.push(span(Role::Alert, "SCROLL "));
+        }
+    };
+    let tail = |v: &mut Vec<Span>| {
+        list(v);
+        v.push(span(Role::Info, format!("{panes} pane{plural} ")));
+        v.push(span(Role::Sep, "| "));
+        v.push(span(Role::Info, format!("pane {focus} ")));
+        alert(v);
+    };
+
+    // Drop the least useful parts first rather than letting the whole line be
+    // truncated. On a narrow pane the old format showed a clipped session name
+    // and nothing else - the pane count, which is what you actually need, fell
+    // off the end. Which window you are on outranks the pane count: getting
+    // lost between windows is worse than not knowing how many panes this one
+    // holds.
+    let mut full = vec![span(Role::Name, format!(" {name} ")), span(Role::Sep, "| ")];
+    tail(&mut full);
+
+    let mut without_name = vec![span(Role::Sep, " ")];
+    tail(&mut without_name);
+
+    let mut short = vec![span(Role::Sep, " ")];
+    if windows > 1 {
+        short.push(span(Role::ActiveWindow, format!("{current}/{windows} ")));
+        short.push(span(Role::Sep, "| "));
+    }
+    short.push(span(Role::Info, format!("{panes}p ")));
+    alert(&mut short);
+
+    for rung in [full, without_name, short] {
+        if width_of(&rung) <= width {
+            return rung;
+        }
+    }
+    // Nothing fits; this is the shortest thing that is still true.
+    let mut last = vec![span(Role::Info, format!(" {panes}p "))];
+    alert(&mut last);
+    last
+}
+
 fn pack(c: vt100::Color) -> u32 {
     match c {
         vt100::Color::Default => COLOR_RESET,
@@ -125,11 +278,9 @@ fn blit(dst: &mut Frame, src: &Frame, at: LRect) {
     }
 }
 
-fn put(dst: &mut Frame, x: u16, y: u16, ch: char, mods: u16) {
+fn put(dst: &mut Frame, x: u16, y: u16, cell: Cell) {
     if x < dst.cols && y < dst.rows {
-        let c = &mut dst.cells[y as usize * dst.cols as usize + x as usize];
-        c.ch = ch;
-        c.mods = mods;
+        dst.cells[y as usize * dst.cols as usize + x as usize] = cell;
     }
 }
 
@@ -141,23 +292,34 @@ fn draw_dividers(dst: &mut Frame, dividers: &[Divider]) {
         };
         for row in 0..d.rect.h {
             for col in 0..d.rect.w {
-                put(dst, d.rect.x + col, d.rect.y + row, ch, 0);
+                let cell = Cell { ch, fg: DIVIDER_FG, bg: COLOR_RESET, mods: 0 };
+                put(dst, d.rect.x + col, d.rect.y + row, cell);
             }
         }
     }
 }
 
-/// One-line status bar along the bottom.
-fn draw_status(dst: &mut Frame, text: &str) {
+/// One-line status bar along the bottom, painted span by span.
+fn draw_status(dst: &mut Frame, spans: &[Span]) {
     if dst.rows == 0 {
         return;
     }
     let y = dst.rows - 1;
+    // Fill first: the bar is a continuous band across the width, so the part
+    // past the text has to carry the background too.
     for x in 0..dst.cols {
-        put(dst, x, y, ' ', MOD_REVERSE);
+        put(dst, x, y, Cell { ch: ' ', fg: INFO_FG, bg: BAR_BG, mods: 0 });
     }
-    for (i, ch) in text.chars().take(dst.cols as usize).enumerate() {
-        put(dst, i as u16, y, ch, MOD_REVERSE);
+    let mut x = 0u16;
+    for span in spans {
+        let (fg, bg, mods) = span.role.style();
+        for ch in span.text.chars() {
+            if x >= dst.cols {
+                return;
+            }
+            put(dst, x, y, Cell { ch, fg, bg, mods });
+            x += 1;
+        }
     }
 }
 
@@ -187,7 +349,7 @@ pub fn composite(
     rows: u16,
     layout: &Layout,
     pane_frame: impl Fn(PaneId) -> Option<Frame>,
-    status: Option<&str>,
+    status: Option<&[Span]>,
 ) -> Frame {
     let mut out = Frame::blank(cols, rows);
     let area = pane_area_with(cols, rows, status.is_some());
@@ -214,9 +376,135 @@ pub fn composite(
     if let Some((_, r)) = panes.iter().find(|(p, _)| *p == focus) {
         highlight_focus(&mut out, *r);
     }
-    if let Some(text) = status {
-        draw_status(&mut out, text);
+    if let Some(spans) = status {
+        draw_status(&mut out, spans);
     }
     out.cursor = cursor;
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The text the bar shows, ignoring how it is coloured.
+    fn plain(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Three windows, on the second, showing two panes with pane 7 focused.
+    fn at(width: usize) -> String {
+        plain(&status_spans("work", 3, 1, 2, 7, false, width))
+    }
+
+    #[test]
+    fn a_single_window_shows_no_window_list() {
+        // The list would be a constant "0*", which tells you nothing.
+        assert_eq!(plain(&status_spans("work", 1, 0, 1, 1, false, 80)), " work | 1 pane | pane 1 ");
+    }
+
+    #[test]
+    fn several_windows_mark_the_current_one() {
+        assert_eq!(plain(&status_spans("work", 3, 1, 2, 7, false, 80)),
+                   " work | 0 1* 2 | 2 panes | pane 7 ");
+    }
+
+    /// The window you are on is the one thing on the bar you must be able to
+    /// find at a glance, so it is the only window drawn in its own colours.
+    #[test]
+    fn only_the_current_window_gets_the_active_role() {
+        let spans = status_spans("work", 3, 1, 2, 7, false, 80);
+        let active: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.role == Role::ActiveWindow)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(active, vec!["1* "], "{spans:?}");
+    }
+
+    #[test]
+    fn scrolling_is_flagged() {
+        let spans = status_spans("work", 1, 0, 1, 1, true, 80);
+        assert!(plain(&spans).ends_with("| SCROLL "), "{spans:?}");
+        assert!(spans.iter().any(|s| s.role == Role::Alert), "SCROLL must stand out: {spans:?}");
+    }
+
+    #[test]
+    fn the_session_name_goes_first_when_it_will_not_fit() {
+        let full = at(80);
+        let narrower = at(full.chars().count() - 1);
+        assert!(!narrower.contains("work"), "the name should have been dropped: {narrower}");
+        assert!(narrower.contains("0 1* 2"), "the window list must survive: {narrower}");
+        assert!(narrower.contains("2 panes"), "{narrower}");
+    }
+
+    #[test]
+    fn the_window_position_outlives_the_pane_count() {
+        // Getting lost between windows is worse than not knowing how many
+        // panes the current one holds.
+        let s = at(12);
+        assert_eq!(s, " 1/3 | 2p ");
+    }
+
+    #[test]
+    fn something_true_is_always_returned_however_narrow() {
+        for width in 0..40 {
+            let s = at(width);
+            assert!(s.contains("2p") || s.contains("2 pane"), "width {width}: {s}");
+        }
+    }
+
+    /// A wider terminal must never produce a shorter line: if it did, the
+    /// ladder would be skipping a rung.
+    #[test]
+    fn the_ladder_never_gets_longer_as_the_terminal_narrows() {
+        let widths: Vec<usize> = (0..60).map(|w| at(w).chars().count()).collect();
+        for pair in widths.windows(2) {
+            assert!(pair[0] <= pair[1], "a wider terminal produced a shorter line: {widths:?}");
+        }
+    }
+
+    fn cell_at(f: &Frame, x: u16, y: u16) -> &Cell {
+        &f.cells[y as usize * f.cols as usize + x as usize]
+    }
+
+    /// The bar is a band, not just coloured text: the empty right-hand end
+    /// carries the background too, or the line looks like it stops mid-screen.
+    #[test]
+    fn the_status_bar_is_painted_across_the_whole_width() {
+        let mut f = Frame::blank(40, 3);
+        let spans = status_spans("w", 1, 0, 1, 1, false, 40);
+        let text = width_of(&spans) as u16;
+        draw_status(&mut f, &spans);
+        for x in 0..40 {
+            let c = cell_at(&f, x, 2);
+            assert_ne!(c.bg, COLOR_RESET, "column {x} fell through to the pane background");
+            if x >= text {
+                assert_eq!(c.bg, BAR_BG, "the empty end of the bar: {c:?}");
+            }
+        }
+    }
+
+    /// Text past the last column must be dropped, not wrapped onto the panes.
+    #[test]
+    fn a_status_line_longer_than_the_screen_is_clipped() {
+        let mut f = Frame::blank(6, 2);
+        let long = vec![span(Role::Info, "0123456789")];
+        draw_status(&mut f, &long);
+        assert_eq!((0..6).map(|x| cell_at(&f, x, 1).ch).collect::<String>(), "012345");
+        // The row above is still blank - nothing spilled upwards.
+        assert!((0..6).all(|x| cell_at(&f, x, 0).ch == ' '));
+    }
+
+    #[test]
+    fn dividers_are_drawn_in_their_own_colour() {
+        let mut f = Frame::blank(9, 4);
+        let dividers = [Divider { dir: Dir::Horizontal, rect: LRect::new(4, 0, 1, 3) }];
+        draw_dividers(&mut f, &dividers);
+        for y in 0..3 {
+            let c = cell_at(&f, 4, y);
+            assert_eq!(c.ch, '│');
+            assert_eq!(c.fg, DIVIDER_FG, "a divider must not be the brightest thing on screen");
+        }
+    }
 }

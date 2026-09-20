@@ -150,6 +150,20 @@ impl Windows {
         true
     }
 
+    /// Switch to the window at `i`. False when there is no such window, or
+    /// when it is already the current one.
+    ///
+    /// An out-of-range index is IGNORED rather than clamped: `C-b 7` with
+    /// three windows means "go to seven", and landing somewhere else instead
+    /// would move you off the window you were working in.
+    pub fn select(&mut self, i: usize) -> bool {
+        if i >= self.list.len() || i == self.current {
+            return false;
+        }
+        self.current = i;
+        true
+    }
+
     /// Remove `id` from whichever window holds it, dropping that window if it
     /// was its last pane.
     ///
@@ -222,6 +236,34 @@ mod tests {
         assert!(!w.select_next(), "nothing to cycle to");
         assert!(!w.select_previous());
         assert_eq!(w.index(), 0);
+    }
+
+    #[test]
+    fn selecting_a_window_by_index_jumps_to_it() {
+        let mut w = Windows::new(one(1));
+        w.push(one(2));
+        w.push(one(3)); // on window 2
+        assert!(w.select(0));
+        assert_eq!(w.index(), 0);
+        assert_eq!(w.current().focus(), PaneId(1));
+    }
+
+    #[test]
+    fn selecting_the_current_window_changes_nothing() {
+        let mut w = Windows::new(one(1));
+        w.push(one(2));
+        assert!(!w.select(1), "no switch, so nothing to repaint or persist");
+        assert_eq!(w.index(), 1);
+    }
+
+    /// `C-b 7` with three windows must leave you where you are. Clamping would
+    /// silently move you off the window you were working in.
+    #[test]
+    fn selecting_a_window_that_does_not_exist_is_ignored() {
+        let mut w = Windows::new(one(1));
+        w.push(one(2));
+        assert!(!w.select(9));
+        assert_eq!(w.index(), 1, "an absent window must not move us");
     }
 
     #[test]
