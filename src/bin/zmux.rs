@@ -13,7 +13,7 @@ use ratatui::Terminal;
 
 use zmux::ipc;
 use zmux::protocol::{
-    Cmd, ClientMsg, Frame, PaneState, Query, Report, ServerMsg, Target, PROTOCOL_VERSION,
+    Cmd, ClientMsg, Frame, PaneState, Query, Report, ServerMsg, Source, Target, PROTOCOL_VERSION,
 };
 use zmux::render::{paint, paint_cursor, paint_overlay};
 
@@ -126,7 +126,10 @@ Driving a session without attaching (for scripts and agents):
   zmux keys <session> [-p T] <text>      type text, no Enter
   zmux run  <session> [-p T] [--paste] <command>
                                            type it and press Enter
-  zmux capture <session> [-p T] [-n N]   a pane's visible screen, as text
+  zmux capture <session> [-p T] [-n N] [--source screen|recent|unwrapped]
+                                           read a pane; `unwrapped` for a
+                                           transcript, `screen` for what is
+                                           on screen (the default)
   zmux report [<session>] [-p T] --state idle|working|blocked|done
                                            say what this pane is doing
   zmux report --check                    prove the report channel works
@@ -209,24 +212,33 @@ fn take_pane(args: &[String]) -> Result<(Option<Target>, &[String])> {
 /// Reading only a LEADING `-p` meant `capture s -n 20 -p 2` quietly dropped
 /// the `-p` and answered with the focused pane - the same silent wrong answer
 /// that an out-of-range position is refused to avoid.
-fn capture_args(args: &[String]) -> Result<(Option<Target>, u16)> {
-    const USAGE: &str = "usage: zmux capture <session> [-p T] [-n LINES]";
-    let (mut pane, mut lines) = (None, 0u16);
+fn capture_args(args: &[String]) -> Result<(Option<Target>, u16, Source)> {
+    const USAGE: &str =
+        "usage: zmux capture <session> [-p T] [-n LINES] [--source screen|recent|unwrapped]";
+    let (mut pane, mut lines, mut source) = (None, 0u16, Source::Screen);
     let mut rest = args;
     while let Some(flag) = rest.first().map(String::as_str) {
         // Recognise the flag BEFORE asking for its value, or an argument that
         // is not a flag at all comes back as "nonsense needs a number".
-        if !matches!(flag, "-p" | "--pane" | "-n" | "--lines") {
+        if !matches!(flag, "-p" | "--pane" | "-n" | "--lines" | "--source") {
             bail!("unexpected argument '{flag}'\n{USAGE}");
         }
         let value = rest.get(1).with_context(|| format!("{flag} needs a value\n{USAGE}"))?;
         match flag {
             "-p" | "--pane" => pane = Some(parse_target(value)?),
+            "--source" => {
+                source = match value.as_str() {
+                    "screen" => Source::Screen,
+                    "recent" => Source::Recent,
+                    "unwrapped" | "recent-unwrapped" => Source::RecentUnwrapped,
+                    other => bail!("'{other}' is not a source\n{USAGE}"),
+                }
+            }
             _ => lines = value.parse().context(USAGE)?,
         }
         rest = &rest[2..];
     }
-    Ok((pane, lines))
+    Ok((pane, lines, source))
 }
 
 /// Backslash escapes, so control keys are reachable without a key-name
@@ -456,10 +468,10 @@ fn main() -> Result<()> {
         }
         Some("capture") => {
             let session = session_arg(&args, "capture")?;
-            let (pane, lines) = capture_args(&args[2..])?;
+            let (pane, lines, source) = capture_args(&args[2..])?;
             let target = pane.unwrap_or(Target::Focused);
-            let reply =
-                request(&session, &ClientMsg::Query(Query::CaptureAt { target, lines }))?;
+            let q = Query::CaptureAt { target, lines, source };
+            let reply = request(&session, &ClientMsg::Query(q))?;
             let ServerMsg::Capture { text } = reply else { bail!("unexpected reply: {reply:?}") };
             println!("{text}");
             return Ok(());
@@ -1108,15 +1120,24 @@ mod tests {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         let pos = |n| Some(Target::Position(n));
-        assert_eq!(capture_args(&a(&[])).unwrap(), (None, 0));
-        assert_eq!(capture_args(&a(&["-p", "2"])).unwrap(), (pos(2), 0));
-        assert_eq!(capture_args(&a(&["-n", "20"])).unwrap(), (None, 20));
-        assert_eq!(capture_args(&a(&["-p", "2", "-n", "20"])).unwrap(), (pos(2), 20));
+        let screen = Source::Screen;
+        assert_eq!(capture_args(&a(&[])).unwrap(), (None, 0, screen));
+        assert_eq!(capture_args(&a(&["-p", "2"])).unwrap(), (pos(2), 0, screen));
+        assert_eq!(capture_args(&a(&["-n", "20"])).unwrap(), (None, 20, screen));
+        assert_eq!(capture_args(&a(&["-p", "2", "-n", "20"])).unwrap(), (pos(2), 20, screen));
         // The order that used to lose the pane silently.
-        assert_eq!(capture_args(&a(&["-n", "20", "-p", "2"])).unwrap(), (pos(2), 20));
-        assert_eq!(capture_args(&a(&["--pane", "3", "--lines", "5"])).unwrap(), (pos(3), 5));
+        assert_eq!(capture_args(&a(&["-n", "20", "-p", "2"])).unwrap(), (pos(2), 20, screen));
+        assert_eq!(
+            capture_args(&a(&["--pane", "3", "--lines", "5"])).unwrap(),
+            (pos(3), 5, screen)
+        );
         // An id reaches a pane in a window that is not on screen.
-        assert_eq!(capture_args(&a(&["-p", "@12"])).unwrap(), (Some(Target::Id(12)), 0));
+        assert_eq!(capture_args(&a(&["-p", "@12"])).unwrap(), (Some(Target::Id(12)), 0, screen));
+        assert_eq!(
+            capture_args(&a(&["--source", "unwrapped"])).unwrap(),
+            (None, 0, Source::RecentUnwrapped)
+        );
+        assert!(capture_args(&a(&["--source", "everything"])).is_err());
     }
 
     /// Answering with the WRONG pane is worse than answering with an error,

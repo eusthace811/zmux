@@ -389,8 +389,11 @@ fn serve_control(
                 None => ServerMsg::Refused { reason: unknown(&target) },
             },
             ClientMsg::Query(Query::Info) => ServerMsg::Info(session.info()),
-            ClientMsg::Query(Query::CaptureAt { target, lines }) => {
-                match session.resolve(&target).and_then(|id| session.capture_from(id, lines)) {
+            ClientMsg::Query(Query::CaptureAt { target, lines, source }) => {
+                match session
+                    .resolve(&target)
+                    .and_then(|id| session.capture_from(id, lines, source))
+                {
                     Some(text) => ServerMsg::Capture { text },
                     None => ServerMsg::Refused { reason: unknown(&target) },
                 }

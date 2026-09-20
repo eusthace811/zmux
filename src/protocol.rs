@@ -44,6 +44,13 @@ pub const MIN_USABLE_ROWS: u16 = 3;
 /// larger is a bug or an attack.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 
+/// Most lines one `capture` will return, whatever it was asked for.
+///
+/// A pane may hold a million rows of scrollback (`Config::scrollback`), and
+/// building that into one `String` on the daemon's heap to push down a pipe
+/// is a memory spike a caller can ask for by typing a large number.
+pub const MAX_CAPTURE_LINES: usize = 10_000;
+
 /// Largest number of panes one session will tile.
 pub const MAX_PANES: usize = 64;
 
@@ -299,7 +306,26 @@ pub enum Query {
     /// Supersedes `Capture`, for the same reason `InputAt` supersedes
     /// `InputTo`: a position cannot name a pane in a background window, and
     /// does not survive the layout changing under it.
-    CaptureAt { target: Target, lines: u16 },
+    CaptureAt { target: Target, lines: u16, source: Source },
+}
+
+/// How much of a pane to read, and in what shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// The rows on screen, and only those. What the user can see.
+    #[default]
+    Screen,
+    /// Recent output including scrollback, so a long answer that has already
+    /// scrolled past is still readable.
+    Recent,
+    /// `Recent`, with rows that only ended because they ran out of width
+    /// joined back together.
+    ///
+    /// The one to use for a transcript. A pane is as wide as its share of the
+    /// window, so a 60-column pane breaks every long line - and those breaks
+    /// are an artefact of the layout, not of what was written.
+    RecentUnwrapped,
 }
 
 /// The answer to `Query::Info`, and to every control mutation - a caller sees

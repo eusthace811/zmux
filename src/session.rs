@@ -18,9 +18,15 @@ use anyhow::{bail, Result};
 use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::windows::{Closed, Windows};
 use crate::protocol::{
-    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, ServerMsg, SessionInfo, Target,
+    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, ServerMsg, SessionInfo, Source, Target,
     MAX_INPUT_BYTES, MAX_PANES,
 };
+
+/// How much history a `Recent` read returns when the caller named no count.
+///
+/// Enough to hold an agent's last answer, small enough that omitting `-n` is
+/// not a way to ask for the entire scrollback by accident.
+const DEFAULT_RECENT_LINES: usize = 200;
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
 use crate::render::{composite, frame_from_screen, pane_area_with, status_spans, BarState, Span};
@@ -470,10 +476,24 @@ impl Session {
         panes.get(&id).is_some_and(|p| lock(&p.term).record(r))
     }
 
-    /// The visible screen of one pane by id, as text. See `capture`.
-    pub fn capture_from(&self, id: PaneId, lines: u16) -> Option<String> {
+    /// Read one pane by id. See `capture` for the position-based version.
+    ///
+    /// `Source::Screen` is what the user can see. The other two reach into
+    /// scrollback, which means moving the pane's scroll offset and putting it
+    /// back - done entirely under the pane's own `Term` lock, so nobody can
+    /// observe the intermediate state and nobody's terminal jumps.
+    pub fn capture_from(&self, id: PaneId, lines: u16, source: Source) -> Option<String> {
         let panes = lock(&self.panes);
-        let text = lock(&panes.get(&id)?.term).parser.screen().contents();
+        let mut term = lock(&panes.get(&id)?.term);
+        if source != Source::Screen {
+            // 0 means "as much as you have" for the screen; for history it
+            // has to mean something bounded, or a caller that omitted the
+            // count gets the whole million-row buffer.
+            let want = if lines == 0 { DEFAULT_RECENT_LINES } else { lines as usize };
+            return Some(term.read_recent(want, source == Source::RecentUnwrapped));
+        }
+        let text = term.parser.screen().contents();
+        drop(term);
         if lines == 0 {
             return Some(text);
         }
@@ -571,7 +591,7 @@ impl Session {
             Some(p) => self.pane_at_position(p)?,
             None => self.focus(),
         };
-        self.capture_from(id, lines)
+        self.capture_from(id, lines, Source::Screen)
     }
 
     /// Split the focused pane and move the focus into the new one, as

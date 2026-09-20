@@ -381,7 +381,11 @@ impl Control {
     /// Capture by `Target`, which unlike a position can reach a pane in a
     /// window that is not on screen.
     pub fn capture_at(&mut self, target: zmux::protocol::Target) -> String {
-        let q = zmux::protocol::Query::CaptureAt { target, lines: 0 };
+        let q = zmux::protocol::Query::CaptureAt {
+            target,
+            lines: 0,
+            source: zmux::protocol::Source::Screen,
+        };
         match self.ask(&ClientMsg::Query(q)) {
             ServerMsg::Capture { text } => text,
             other => panic!("expected Capture, got {other:?}"),

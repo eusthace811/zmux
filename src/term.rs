@@ -491,6 +491,91 @@ impl Term {
         }
     }
 
+    /// The last `lines` rows this pane produced, INCLUDING scrollback.
+    ///
+    /// Reading history means moving vt100's scrollback offset, which is the
+    /// pane's own user-visible state - so it is put back before the lock is
+    /// released. Every other reader of this screen takes the same mutex, so
+    /// nobody can observe the offset mid-read, and the user's scroll position
+    /// is exactly where they left it. That is why `capture` could only ever
+    /// see the visible rows before: without one lock covering both, borrowing
+    /// the scroll position makes somebody's terminal jump.
+    ///
+    /// `unwrap` joins a row to the next when the first only ended because it
+    /// ran out of width. A transcript read at 60 columns is otherwise full of
+    /// breaks that are an artefact of the pane's size, not of the text.
+    pub fn read_recent(&mut self, lines: usize, unwrap: bool) -> String {
+        let saved = self.scroll;
+        let (rows, cols) = self.parser.screen().size();
+        let rows = rows.max(1) as usize;
+        let want = lines.clamp(1, crate::protocol::MAX_CAPTURE_LINES);
+
+        // How far back the history actually goes. `set_scrollback` clamps, so
+        // asking for more than exists and reading the answer back is the only
+        // way to find out - and much better than trusting a count of our own.
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let oldest = self.parser.screen().scrollback();
+
+        // Offsets from the oldest window we need down to the live screen. An
+        // offset of k shows the `rows` rows ending k rows above the bottom,
+        // so stepping down by `rows` moves a whole screenful - except the
+        // last step, which is short whenever `want` is not a multiple.
+        let mut offsets = vec![oldest.min(want.saturating_sub(rows))];
+        while *offsets.last().expect("seeded above") > 0 {
+            offsets.push(offsets.last().expect("seeded above").saturating_sub(rows));
+        }
+
+        let mut out: Vec<(String, bool)> = Vec::new();
+        let mut previous: Option<usize> = None;
+        for k in offsets {
+            self.parser.screen_mut().set_scrollback(k);
+            let screen = self.parser.screen();
+            let window: Vec<(String, bool)> = screen
+                .rows(0, cols)
+                .enumerate()
+                .map(|(i, text)| (text, screen.row_wrapped(i as u16)))
+                .collect();
+            // Moving down by d rows reveals exactly d new rows at the bottom.
+            // Taking the whole window each time would repeat the rest.
+            let fresh = match previous {
+                None => window.len(),
+                Some(p) => p.saturating_sub(k).min(window.len()),
+            };
+            // Keep the LAST `fresh` rows of this window; the ones above them
+            // are the window before it, already collected.
+            let skip = window.len() - fresh;
+            out.extend(window.into_iter().skip(skip));
+            previous = Some(k);
+        }
+
+        // Restore through the same path scrolling uses, so `scroll` and
+        // vt100 cannot end up disagreeing about where the user is.
+        self.scroll = saved;
+        self.apply_scroll();
+
+        // Trailing blanks are the unused bottom of the live screen, not
+        // output. Without this every read ends in a wall of empty lines.
+        while out.last().is_some_and(|(t, _)| t.trim().is_empty()) {
+            out.pop();
+        }
+        let keep = out.len().saturating_sub(want);
+        let out = &out[keep..];
+
+        if !unwrap {
+            return out.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join("\n");
+        }
+        let mut joined = String::new();
+        for (i, (text, wrapped)) in out.iter().enumerate() {
+            joined.push_str(text);
+            // A wrapped row continues into the next, so the break between
+            // them is the pane's width talking, not the text.
+            if i + 1 < out.len() && !wrapped {
+                joined.push('\n');
+            }
+        }
+        joined
+    }
+
     pub fn cursor(&self) -> (u16, u16) {
         self.parser.screen().cursor_position()
     }

@@ -4,7 +4,9 @@
 mod common;
 use common::{Control, Daemon};
 
-use zmux::protocol::{ClientMsg, Cmd, PaneState, Query, Report, ServerMsg, Target};
+use zmux::protocol::{
+    ClientMsg, Cmd, PaneState, Query, Report, ServerMsg, Source, Target,
+};
 
 /// A pane has to be able to say which pane it is, or `-p current` and every
 /// self-report are guesswork. The id, not the position - positions renumber.
@@ -129,7 +131,8 @@ fn a_target_that_does_not_resolve_is_refused_not_redirected() {
             ),
             other => panic!("{target:?} was not refused: {other:?}"),
         }
-        match c.ask(&ClientMsg::Query(Query::CaptureAt { target: target.clone(), lines: 0 })) {
+        let q = Query::CaptureAt { target: target.clone(), lines: 0, source: Source::Screen };
+        match c.ask(&ClientMsg::Query(q)) {
             ServerMsg::Refused { .. } => {}
             other => panic!("capture of {target:?} was not refused: {other:?}"),
         }
@@ -488,5 +491,99 @@ fn wait_for_state(
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Reading an agent's answer means reading past the visible rows - and doing
+/// it without the user's pane jumping, which is why `capture` could only see
+/// the screen before.
+#[test]
+fn recent_reads_past_the_visible_screen_without_moving_it() {
+    let d = Daemon::start("zmux-test-scrollback");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    // Comfortably more than one screenful.
+    c.input_at(Target::Focused, "for i in $(seq 1 120); do echo LINE_$i; done", true);
+    assert!(c
+        .wait_at(20, Target::Focused, |t| t.contains("LINE_120"))
+        .is_some(), "the output never appeared");
+
+    let screen = c.capture_at(Target::Id(id));
+    assert!(!screen.contains("LINE_1\n"), "120 lines fit on screen; the test proves nothing");
+
+    let recent = capture_source(&mut c, id, 300, Source::Recent);
+    assert!(recent.contains("LINE_5"), "scrollback was not read:\n{recent}");
+    assert!(recent.contains("LINE_120"), "the live screen was lost:\n{recent}");
+    // In order, and each line once.
+    assert_eq!(recent.matches("LINE_42\n").count(), 1, "a row was collected twice");
+    let at5 = recent.find("LINE_5\n").expect("LINE_5");
+    let at90 = recent.find("LINE_90\n").expect("LINE_90");
+    assert!(at5 < at90, "history came back out of order");
+
+    // Fewer lines means the LAST lines, not the first.
+    let tail = capture_source(&mut c, id, 5, Source::Recent);
+    assert!(tail.contains("LINE_120"), "a short read lost the newest output:\n{tail}");
+    assert!(!tail.contains("LINE_5\n"), "a short read returned too much:\n{tail}");
+}
+
+/// The reason `capture` refused to read history for so long: doing it moves
+/// the pane's scroll position, which is the user's own state.
+#[test]
+fn reading_history_leaves_the_users_scroll_position_alone() {
+    let d = Daemon::start("zmux-test-scroll-restore");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    c.input_at(Target::Focused, "for i in $(seq 1 80); do echo ROW_$i; done", true);
+    assert!(c.wait_at(20, Target::Focused, |t| t.contains("ROW_80")).is_some());
+
+    // Scroll back, the way a user reading their own output would.
+    for _ in 0..3 {
+        assert!(matches!(c.ask(&ClientMsg::Command(Cmd::ScrollPageUp)), ServerMsg::Info(_)));
+    }
+    let before = c.capture_at(Target::Id(id));
+    assert!(!before.contains("ROW_80"), "the scroll did not move the view");
+
+    // A background read of the whole history.
+    let _ = capture_source(&mut c, id, 300, Source::RecentUnwrapped);
+
+    let after = c.capture_at(Target::Id(id));
+    assert_eq!(after, before, "reading history moved the user's view");
+}
+
+/// A pane is as wide as its share of the window, so a long line comes back
+/// broken at that width. Those breaks are the layout talking, not the text.
+#[test]
+fn unwrapped_joins_a_line_the_pane_was_too_narrow_to_hold() {
+    let d = Daemon::start("zmux-test-unwrap");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+    let cols = c.info().panes[0].cols as usize;
+    assert!(cols > 10, "the pane has no width to overflow");
+
+    // One logical line, comfortably wider than the pane.
+    let word = "x".repeat(cols * 2 + 5);
+    c.input_at(Target::Focused, &format!("echo START_{word}_END"), true);
+    assert!(c.wait_at(20, Target::Focused, |t| t.contains("_END")).is_some());
+
+    let wrapped = capture_source(&mut c, id, 50, Source::Recent);
+    let joined = capture_source(&mut c, id, 50, Source::RecentUnwrapped);
+    let whole = format!("START_{word}_END");
+    assert!(
+        !wrapped.lines().any(|l| l.contains(&whole)),
+        "the pane was wide enough after all; the test proves nothing"
+    );
+    assert!(
+        joined.lines().any(|l| l.contains(&whole)),
+        "soft wraps were not joined; the line is still in pieces"
+    );
+}
+
+fn capture_source(c: &mut Control, id: u32, lines: u16, source: Source) -> String {
+    let q = Query::CaptureAt { target: Target::Id(id), lines, source };
+    match c.ask(&ClientMsg::Query(q)) {
+        ServerMsg::Capture { text } => text,
+        other => panic!("expected Capture, got {other:?}"),
     }
 }
