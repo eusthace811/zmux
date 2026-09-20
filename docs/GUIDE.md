@@ -11,18 +11,46 @@ PowerShell, no WSL — see [Troubleshooting](#troubleshooting).
 
 ## Install for global use
 
-From the repo, in WSL or in Git Bash — the script works out which host it is
-on:
+Everything runs from the repo folder — the one holding `Cargo.toml` and the
+`x` script. The script works out which host it is on; you only have to be in
+the right directory.
+
+**On this machine** the repo lives under your WSL home, so open a **WSL**
+shell:
 
 ```bash
-./x install            # build --release, then copy both binaries to ~/bin
+# /home/<you>/projects/Experiments/zmux/zmux
+cd ~/projects/Experiments/zmux/zmux
+
+# build --release, then copy both binaries to ~/bin
+./x install
+```
+
+then, in a **Git Bash** window:
+
+```bash
 hash -r
 zmux --help
 ```
 
-Run from WSL it installs into the **Windows** home (`C:\Users\<you>\bin`),
-which is the `~/bin` Git Bash sees — the shells run on Windows, so that is the
-only home that matters.
+Run from WSL, `./x` compiles with the *Windows* cargo and installs into the
+**Windows** home (`C:\Users\<you>\bin`), which is the `~/bin` Git Bash sees —
+the shells run on Windows, so that is the only home that matters.
+
+**On the work laptop** there is no WSL: the repo sits on the Windows disk and
+Git Bash does the whole job, from the folder you cloned into —
+
+```bash
+cd ~/projects/zmux       # i.e. C:\Users\<you>\projects\zmux
+./x install
+hash -r
+```
+
+Do **not** run `./x install` from Git Bash against the WSL copy of the repo
+(`//wsl.localhost/Ubuntu/home/...`): cargo would put `target/` on the 9p
+share, which has no file locks, and the build fails part-way. From Git Bash,
+build a repo that lives on the Windows disk; from WSL, `./x` already takes
+care of it.
 
 `~/bin` is on Git Bash's `PATH` already (it exports `$HOME/bin:$PATH`
 unconditionally, in `/etc/profile.d/env.sh`), so `hash -r` is only there to
@@ -30,10 +58,13 @@ clear bash's memory of a command it could not find before. To install
 somewhere else — a shared tools folder, say — name it:
 
 ```bash
-./x install /c/Tools/zmux
+./x install /mnt/c/Tools/zmux     # from WSL
+./x install /c/Tools/zmux         # the same folder, named from Git Bash
 ```
 
-and add that folder to `PATH` yourself; the script prints the line to add. To
+Name it the way the shell you are in names it, or you will get a directory
+somewhere you did not mean. Then add that folder to `PATH` yourself; the
+script prints the line to add. To
 reach `zmux` from `cmd` or PowerShell as well, add the folder to the Windows
 `PATH` (System Properties → Environment Variables → `Path`).
 
@@ -51,6 +82,9 @@ letting the build fail with *Access is denied*.
 ---
 
 ## Everyday use
+
+Once installed these need no particular directory — run them from any Git
+Bash window, wherever you happen to be:
 
 ```bash
 zmux                    # attach to "default", creating it if needed
