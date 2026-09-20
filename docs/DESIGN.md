@@ -595,11 +595,22 @@ MSVC toolchain. Three facts make that work, each found by hitting it:
 ./x clippy            # anything else is passed through to cargo
 ```
 
-`./x` also runs on the work laptop, where there is no WSL: it checks `uname`
-and, under Git Bash, uses plain `cargo` with plain paths — none of the three
-facts above apply when the host is already Windows. The Windows home comes
-from `%USERPROFILE%` rather than a hardcoded name, so nothing in the script
-assumes this machine; `ZMUX_WINHOME` overrides it.
+`./x` also runs under Git Bash, where `uname` says `MINGW`. On the work
+laptop, with the repo on a Windows disk, none of the three facts above apply
+and it uses plain `cargo` with plain paths. On *this* machine you can also
+open the WSL repo from Git Bash, over `//wsl.localhost/...`, and fact 2 comes
+back with a second edge to it:
+
+4. Those `//` paths reach `link.exe`, which reads a leading `/` as the start
+   of an option: every object file is discarded as *LNK4044: unrecognized
+   option* and the link dies with *LNK1561: entry point must be defined*. So
+   `x` converts the manifest with `cygpath -w` (giving `\\wsl.localhost\...`,
+   which cannot be mistaken for a switch) and, seeing a `//` repo path, sends
+   `target/` to the same Windows-local directory the WSL branch uses. The two
+   hosts then share one build cache.
+
+The Windows home comes from `%USERPROFILE%` rather than a hardcoded name, so
+nothing in the script assumes this machine; `ZMUX_WINHOME` overrides it.
 
 `install` copies **both** binaries, because the client starts the daemon by
 looking next to itself, and refuses to run while a `zmux` process is alive —

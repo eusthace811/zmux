@@ -43,14 +43,18 @@ hash -r
 zmux --help
 ```
 
-Git Bash can reach the repo itself over the WSL share, which is useful for
-reading the source or running `git` from the Windows side:
+Git Bash can build the very same repo over the WSL share, if you would
+rather stay in one window — `./x` notices and does the right thing:
 
 ```bash
 cd //wsl.localhost/Ubuntu/home/<you>/projects/Experiments/zmux/zmux
+./x install
+hash -r
 ```
 
-Reach it, yes — but do not build there; see the warning below.
+Either shell produces the same binaries, and both keep `target/` in
+`C:\Users\<you>\.zmux-target`, so they share one build cache: whichever you
+run second only rebuilds what changed.
 
 **On the work laptop** there is no WSL: the repo sits on the Windows disk and
 Git Bash does the whole job, from the folder you cloned into —
@@ -61,12 +65,12 @@ cd /c/Users/<you>/projects/zmux      # wherever you cloned it
 hash -r
 ```
 
-Do **not** run `./x install` from Git Bash against the WSL copy of the repo
-(the `//wsl.localhost/...` path above): cargo would put `target/` on the 9p
-share, which has no file locks, and the build fails part-way. From Git Bash,
-build a repo that lives on the Windows disk; from WSL, `./x` already takes
-care of it — it compiles with the Windows cargo and keeps `target/` on `C:`
-for exactly this reason.
+What `./x` is protecting you from, either way, is `target/` landing on the
+WSL share. Plain `cargo build` there fails twice over: the 9p share has no
+file locks, and the `//wsl.localhost/...` object paths reach `link.exe`,
+which reads a leading `/` as the start of an option — *LNK4044: unrecognized
+option*, then *LNK1561: entry point must be defined*. If you see that, you
+ran `cargo` directly; run `./x` instead.
 
 `~/bin` is on Git Bash's `PATH` already (it exports `$HOME/bin:$PATH`
 unconditionally, in `/etc/profile.d/env.sh`), so `hash -r` is only there to

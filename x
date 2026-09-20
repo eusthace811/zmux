@@ -10,8 +10,13 @@
 #                  Windows-local.
 #               3. WSL does not forward env vars to Windows processes without
 #                  WSLENV.
-#   Git Bash  Everything is already Windows-native: plain cargo, plain paths.
-#             This is the work laptop, where there is no WSL.
+#   Git Bash  Native cargo. Two cases:
+#               - repo on a Windows disk (the work laptop): nothing to do.
+#               - repo on the WSL share: same target/ rule as above, and for
+#                 a second reason. A //wsl.localhost/... path reaches link.exe,
+#                 which reads the leading / as the start of an option, ignores
+#                 every .o as an "unrecognized option" (LNK4044) and then dies
+#                 with LNK1561, entry point must be defined.
 #
 #   ./x test | build | release | clippy | fmt | run   (anything else -> cargo)
 #   ./x install [dir]      build --release and copy both binaries to dir
@@ -44,8 +49,22 @@ if [ "$HOST" = wsl ]; then
   TASKLIST=/mnt/c/Windows/System32/tasklist.exe
 else
   CARGO=cargo
-  MANIFEST="$HERE/Cargo.toml"
-  RELEASE_DIR="${CARGO_TARGET_DIR:-$HERE/target}/release"
+  # Hand cargo a real Windows path: cygpath turns //wsl.localhost/... into
+  # \\wsl.localhost\..., which link.exe cannot mistake for an option.
+  MANIFEST="$(cygpath -w "$HERE/Cargo.toml")"
+  if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    TARGET_U="$(cygpath -u "$CARGO_TARGET_DIR")"
+  else
+    case "$HERE" in
+      //*) # Repo on the WSL share. target/ has to go somewhere Windows-local,
+           # for the linker reason above and the 9p lock reason. Same
+           # directory the WSL branch uses, so the two share one build cache.
+           TARGET_U="$HOME/.zmux-target"
+           export CARGO_TARGET_DIR="$(cygpath -w "$TARGET_U")" ;;
+      *)   TARGET_U="$HERE/target" ;;
+    esac
+  fi
+  RELEASE_DIR="$TARGET_U/release"
   BIN_DEFAULT="$HOME/bin"
   TASKLIST=tasklist
 fi
