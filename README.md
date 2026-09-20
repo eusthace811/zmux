@@ -176,12 +176,16 @@ sustained output, attach/detach churn, many splits, and malformed input.
   `C-b <digit>` renumbers with them. tmux leaves a gap instead. There are no
   window names, and only the first ten windows have a digit.
 - **Queues are bounded by message count, not bytes.**
-- **A pane whose shell has stopped reading its input can stall layout.**
-  `Pane::resize` ends in a one-byte write to the pty, and a pty write blocks
-  once ConPTY's input pipe is full. Reflow applies resizes with the pane map
-  released, so typing into other panes is unaffected, but it still holds the
-  geometry lock — so splits, resizes and window switches would wait. Fixing
-  it properly needs a bounded write, which Windows does not offer on a
+- **A pane whose shell has stopped reading its input can stall layout, and
+  teardown with it.** `Pane::resize` ends in a one-byte write to the pty, and
+  a pty write blocks once ConPTY's input pipe is full. Reflow applies resizes
+  with the pane map released, so typing into other panes is unaffected, but
+  it still holds the geometry lock — so splits, resizes and window switches
+  wait, and so does `shutdown`, which needs that lock before it can save and
+  drain. A permanently wedged write has always been able to keep the daemon
+  from exiting; since the save now waits for the lock rather than racing it,
+  a stall also delays the final save rather than overlapping it. Fixing it
+  properly needs a bounded write, which Windows does not offer on a
   synchronous pipe handle.
 - **A control mutation's reply is a snapshot, not a transaction.** It is read
   immediately after the command, but a human attached at the same moment can
