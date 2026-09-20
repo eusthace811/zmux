@@ -113,8 +113,17 @@ pub struct Signals {
     pub cwd: Option<String>,
     /// Latest OSC 0/2 window title.
     pub title: Option<String>,
-    /// Bell since last checked.
-    pub bell: bool,
+    /// How many times this pane has rung the terminal bell.
+    ///
+    /// A COUNT, not a flag. A flag has to be cleared to be useful twice, and
+    /// two readers - the status bar and a control caller - would then race to
+    /// clear it and each swallow the other's notification. A count that only
+    /// ever goes up lets each of them remember what it last saw.
+    ///
+    /// Worth exposing because it is the one attention signal that costs
+    /// nothing and works for a program that reports nothing about itself:
+    /// plenty of agents ring the bell when they stop to ask something.
+    pub bells: u32,
     /// Last command line the shell reported (OSC 633;E). Kept after the
     /// command ends, so `busy=false` plus this plus `last_exit` reads as
     /// "that finished, this is how".
@@ -141,7 +150,18 @@ pub struct Activity {
     pub last_exit: Option<i32>,
     /// The OSC 0/2 title, and ONLY when no shell integration has been seen -
     /// otherwise it is just the directory restated.
+    ///
+    /// This is the STATUS BAR's rule, and it stays that way. A control caller
+    /// wants the title whenever there is one, so it reads `raw_title`.
     pub title: Option<String>,
+    /// The OSC 0/2 title as it actually arrived, whatever else is known.
+    ///
+    /// Many TUIs say what they are doing here, and it is the highest-priority
+    /// signal in herdr's Claude rules (`claude.toml`, `region = "osc_title"`).
+    /// Handed over as a fact the pane stated, not as a conclusion about it.
+    pub raw_title: Option<String>,
+    /// See `Signals::bells`.
+    pub bells: u32,
 }
 
 impl Activity {
@@ -249,7 +269,7 @@ impl vt100::Callbacks for Hooks {
 
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         if let Ok(mut s) = self.signals.lock() {
-            s.bell = true;
+            s.bells = s.bells.saturating_add(1);
         }
     }
 }
@@ -287,11 +307,14 @@ impl Term {
     /// there is, and `vim`/`ssh`/`less` all set it.
     pub fn activity(&self) -> Activity {
         let Ok(s) = self.signals.lock() else { return Activity::default() };
+        let title = s.title.as_deref().and_then(sanitise);
         Activity {
             command: s.command.clone(),
             busy: s.busy,
             last_exit: s.last_exit,
-            title: if s.integrated { None } else { s.title.as_deref().and_then(sanitise) },
+            title: if s.integrated { None } else { title.clone() },
+            raw_title: title,
+            bells: s.bells,
         }
     }
 

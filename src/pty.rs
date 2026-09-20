@@ -5,7 +5,7 @@
 //! forced. tokio is not used for PTY I/O (DESIGN.md §3).
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
@@ -175,6 +175,32 @@ pub struct Pane {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     closing: Arc<AtomicBool>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// When this pane last produced a byte, on the process clock.
+    ///
+    /// A MEASUREMENT, not a guess about what the pane is doing. zmux does
+    /// not read the screen to decide whether a program has finished
+    /// (DESIGN.md §12), but "it has said nothing for eleven seconds" is a
+    /// fact, and it is the best signal available for a program that reports
+    /// nothing about itself.
+    ///
+    /// Stamped by the reader thread and read by anyone: an atomic on the pane
+    /// itself rather than a map the pump would have to lock hundreds of times
+    /// a second.
+    last_output: Arc<AtomicU64>,
+}
+
+/// Process start, for a clock that cannot go backwards.
+///
+/// Wall time can: an NTP correction or a timezone change would make a pane
+/// look like it produced output in the future, and `quiet_ms` would saturate
+/// to zero forever. `Instant` is monotonic by contract.
+fn epoch() -> &'static std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now)
+}
+
+fn now_ms() -> u64 {
+    epoch().elapsed().as_millis() as u64
 }
 
 impl Pane {
@@ -302,12 +328,15 @@ impl Pane {
         let closing = Arc::new(AtomicBool::new(false));
         let reader_closing = Arc::clone(&closing);
 
+        let last_output = Arc::new(AtomicU64::new(now_ms()));
+        let reader_stamp = Arc::clone(&last_output);
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        reader_stamp.store(now_ms(), Ordering::Relaxed);
                         // Replies FIRST and unconditionally. An unanswered
                         // ESC[6n wedges the shell, so this must not queue
                         // behind anything (DESIGN.md §2.5).
@@ -367,6 +396,7 @@ impl Pane {
             writer,
             closing,
             threads: Mutex::new(vec![reader, waiter]),
+            last_output,
         };
         Ok((pane, events))
     }
@@ -430,6 +460,14 @@ impl Pane {
     /// Chunked so a large paste cannot hold the writer mutex for long: the
     /// reader thread needs that same mutex to answer terminal queries, and a
     /// blocked query reply wedges the shell.
+    /// Milliseconds since this pane last produced any output.
+    ///
+    /// Saturating, so a clock that has not ticked yet reads as 0 rather than
+    /// wrapping to something enormous.
+    pub fn quiet_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.last_output.load(Ordering::Relaxed))
+    }
+
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
         const CHUNK: usize = 4096;
         for part in data.chunks(CHUNK) {

@@ -287,6 +287,26 @@ pub struct PaneInfo {
     pub busy: bool,
     /// Exit status of the last finished command.
     pub last_exit: Option<i32>,
+    // --- measured facts, never inferences (DESIGN.md §12) ---
+    /// Milliseconds since this pane last produced ANY output.
+    ///
+    /// zmux does not read a pane's screen to decide whether the program in
+    /// it has finished. This is the honest substitute: a program that has
+    /// been silent for a while is probably waiting, and the caller gets to
+    /// decide what "a while" means rather than being handed a verdict.
+    pub quiet_ms: u64,
+    /// How many times this pane has rung the bell, ever.
+    ///
+    /// Only useful compared against a value read earlier - an increase means
+    /// the pane asked for attention since then. See `Signals::bells` for why
+    /// it is a count and not a flag.
+    pub bells: u32,
+    /// The pane's window title, as it set it.
+    ///
+    /// What the pane SAYS it is doing. Reported verbatim, because deciding
+    /// what a title means about an agent's state is exactly the pattern
+    /// matching this design refuses to ship.
+    pub title: Option<String>,
 }
 
 /// A mouse event, in SCREEN coordinates.

@@ -263,3 +263,68 @@ fn a_program_that_did_not_ask_for_a_paste_never_sees_the_markers() {
     assert!(!screen.contains("200~"), "paste markers were typed at a plain shell:\n{screen}");
     assert!(!screen.contains("201~"), "paste markers were typed at a plain shell:\n{screen}");
 }
+
+/// The honest substitute for guessing at a screen: how long a pane has been
+/// silent. A measurement, so it has to actually measure.
+#[test]
+fn a_pane_reports_how_long_it_has_been_quiet() {
+    let d = Daemon::start("zmux-test-quiet");
+    let mut c = Control::open(&d.session);
+
+    // Let the shell finish starting, then let it go quiet.
+    assert!(c.wait_at(20, Target::Focused, |t| t.contains('$')).is_some());
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let idle = c.info().panes[0].quiet_ms;
+    assert!(idle >= 1000, "a silent pane reported only {idle}ms of quiet");
+
+    // Output resets it. `date` prints and returns, so by the time info is
+    // read the pane spoke a moment ago, not a second and a half ago.
+    c.input_at(Target::Focused, "echo NOISE", true);
+    assert!(c
+        .wait_at(20, Target::Focused, |t| t.matches("NOISE").count() >= 2)
+        .is_some());
+    let after = c.info().panes[0].quiet_ms;
+    assert!(after < idle, "output did not reset the quiet clock: {after}ms vs {idle}ms");
+}
+
+/// The bell is the one attention signal that works for a program which
+/// reports nothing about itself, so it must survive being read twice.
+#[test]
+fn a_bell_is_counted_not_swallowed() {
+    let d = Daemon::start("zmux-test-bell");
+    let mut c = Control::open(&d.session);
+    let before = c.info().panes[0].bells;
+
+    c.input_at(Target::Focused, r"printf '\a'", true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut rang = before;
+    while std::time::Instant::now() < deadline {
+        rang = c.info().panes[0].bells;
+        if rang > before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(rang > before, "the bell was never counted ({before} -> {rang})");
+    // Reading it does not clear it: two callers must not swallow each
+    // other's notification.
+    assert_eq!(c.info().panes[0].bells, rang, "reading the count cleared it");
+}
+
+/// A pane's title is handed over as the pane stated it. Deciding what a title
+/// MEANS about an agent is the pattern matching this design refuses to do.
+#[test]
+fn a_pane_reports_the_title_it_set() {
+    let d = Daemon::start("zmux-test-title");
+    let mut c = Control::open(&d.session);
+
+    c.input_at(Target::Focused, r"printf '\033]0;deploying\007'", true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if c.info().panes[0].title.as_deref() == Some("deploying") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the title never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}

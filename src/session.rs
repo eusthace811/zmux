@@ -502,13 +502,15 @@ impl Session {
                     focus = position;
                 }
                 let rect = rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r);
-                // One lock per pane, taken once for both facts.
-                let (cwd, activity) = match panes.get(&id) {
+                // One lock per pane, taken once for every fact it holds.
+                // `quiet_ms` comes off an atomic on the pty instead, so it
+                // costs nothing and cannot be blocked by a busy parser.
+                let (cwd, activity, quiet_ms) = match panes.get(&id) {
                     Some(p) => {
                         let t = lock(&p.term);
-                        (t.cwd_windows(), t.activity())
+                        (t.cwd_windows(), t.activity(), p.pty.quiet_ms())
                     }
-                    None => (None, crate::term::Activity::default()),
+                    None => (None, crate::term::Activity::default(), 0),
                 };
                 list.push(PaneInfo {
                     position,
@@ -520,6 +522,9 @@ impl Session {
                     command: activity.command,
                     busy: activity.busy,
                     last_exit: activity.last_exit,
+                    quiet_ms,
+                    bells: activity.bells,
+                    title: activity.raw_title,
                 });
             }
         }
