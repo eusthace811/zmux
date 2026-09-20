@@ -325,7 +325,15 @@ fn serve_control(
                 }
             },
             ClientMsg::Input { data } => match session.write_focused(&data) {
-                Ok(true) => ServerMsg::Info(session.info()),
+                Ok(true) => {
+                    // Publish, unlike the attached path. Writing snaps the
+                    // pane back to live output, and an input that produces
+                    // nothing - which `zmux keys` can send - has no echo to
+                    // wake the pump and repaint it. Costs nothing when nobody
+                    // is attached, which is the usual case here.
+                    session.publish();
+                    ServerMsg::Info(session.info())
+                }
                 // The focused pane exited between resolving it and writing.
                 // An attached client shrugs that off; a caller scripting the
                 // session must not be told its command ran.

@@ -253,3 +253,38 @@ fn a_command_that_cannot_be_carried_out_is_refused_not_reported_as_done() {
     assert!(reason.contains("split refused"), "unhelpful reason: {reason}");
     assert_eq!(c.info().panes.len(), 1, "a pane was created anyway");
 }
+
+/// Writing to a pane snaps it back to live output, as any terminal does, even
+/// when the write produces no output of its own to push it there - and
+/// `zmux keys <session> ""` sends exactly that.
+///
+/// Asserted through `capture`, which reads the daemon's own view of the pane,
+/// so it does not depend on a frame happening to be delivered.
+#[test]
+fn an_input_that_echoes_nothing_still_snaps_the_pane_back_to_live_output() {
+    let d = Daemon::start("zmux-test-ctl-unscroll");
+    let mut c = Control::open(&d.session);
+
+    // Wait for the SHELL's answer, not the echoed command line: "60" is in
+    // the echo of `seq 1 60` immediately, and scrolling a screen that has not
+    // filled yet finds no history to scroll into. `$(( ))` is not expanded in
+    // the echo, so FILLED_60 can only have come from the shell.
+    c.ask(&ClientMsg::Input { data: b"seq 1 60; echo FILLED_$((30+30))\r".to_vec() });
+    assert!(c.wait_for(20, None, |t| t.contains("FILLED_60")).is_some(), "the pane never filled");
+
+    c.ask(&ClientMsg::Command(Cmd::ScrollPageUp));
+    let history = c.capture(None);
+    assert!(
+        !history.contains("FILLED_60"),
+        "the pane did not scroll into its history at all:\n{history}"
+    );
+
+    // An input with no bytes in it: nothing is typed, but the view must come
+    // back to the bottom all the same.
+    c.ask(&ClientMsg::Input { data: Vec::new() });
+    let live = c.capture(None);
+    assert!(
+        live.contains("FILLED_60"),
+        "writing to the pane left it showing history it had already left:\n{live}"
+    );
+}

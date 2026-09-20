@@ -484,6 +484,13 @@ impl Session {
             // not exist. `reflow_locked` moves the revision on and clears the
             // delta base, so what follows is a full frame that lands.
             self.reflow_locked();
+            drop(_g);
+            // Save, as both the accepted path and `remove_pane` do. Another
+            // thread's `save_state` can capture the tree while this split is
+            // still retrying its shell, and would otherwise leave a pane on
+            // disk that never existed - to be restored, with a shell, on the
+            // next start.
+            self.save_state();
             return Err(e);
         }
         self.reflow_locked();
@@ -661,11 +668,29 @@ impl Session {
     }
 
     /// Typing snaps the view back to live output, as a terminal does.
+    ///
+    /// Bumps the revision when it actually moved the view, because that is a
+    /// change to the composited screen and a frame at an unchanged revision
+    /// is dropped by the client. Usually the keystroke's own echo advances it
+    /// a moment later - but an input that produces no output at all, which
+    /// `zmux keys` can send, would otherwise leave the pane showing history
+    /// it has already left.
     fn follow_focused(&self) {
         let id = self.focus();
-        let panes = lock(&self.panes);
-        if let Some(p) = panes.get(&id) {
-            lock(&p.term).follow_output();
+        let moved = {
+            let panes = lock(&self.panes);
+            match panes.get(&id) {
+                Some(p) => {
+                    let mut t = lock(&p.term);
+                    let was_scrolled = t.scroll_offset() > 0;
+                    t.follow_output();
+                    was_scrolled
+                }
+                None => false,
+            }
+        };
+        if moved {
+            self.revision.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -753,6 +778,16 @@ impl Session {
     /// Typing changes one or two rows out of thirty, so a full grid per tick is
     /// almost entirely waste.
     pub fn publish(&self) {
+        // Nobody is looking. Compositing a whole screen for zero clients is
+        // pure waste - the pump already skips it for exactly this reason, and
+        // the control connection now publishes too, in sessions that often
+        // have no viewport at all. `last_published` is only the delta BASE,
+        // and it only means anything to an attached client: one that attaches
+        // later is sent a full frame and flagged `needs_full`, and the first
+        // publish after that refreshes the base.
+        if self.client_count() == 0 {
+            return;
+        }
         // Hold `last_published` across COMPOSE-derive-send-update.
         //
         // Composing outside the lock let two publishers snapshot concurrently
@@ -923,10 +958,17 @@ impl Session {
     }
 
     pub fn snapshot(&self) -> Frame {
+        // Read the revision FIRST, before the state it is going to describe.
+        // Reading it afterwards could pick up a bump that happened while this
+        // snapshot was being taken - so the frame would carry a number newer
+        // than its own contents, and the publish that follows that bump,
+        // describing the newer state, would land at an EQUAL revision and be
+        // dropped. A revision that is a little stale is safe; one that runs
+        // ahead of its own contents is not.
+        let revision = self.revision.load(Ordering::Relaxed);
         let (cols, rows) = self.size();
         let layout = self.layout_snapshot();
         let status = self.cfg.status_bar.then(|| self.status_line());
-        let revision = self.revision.load(Ordering::Relaxed);
         let panes = lock(&self.panes);
         let mut f = composite(
             cols,
