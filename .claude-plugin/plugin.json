@@ -1,0 +1,11 @@
+{
+  "name": "zmux",
+  "version": "0.1.0",
+  "description": "Drive zmux, a tmux-style terminal multiplexer for Windows Git Bash: inspect a live session, split panes, run commands in them and read their output, all without attaching a terminal.",
+  "author": {
+    "name": "zmux"
+  },
+  "license": "MIT",
+  "keywords": ["zmux", "terminal", "multiplexer", "panes", "windows", "git-bash", "cli", "ai-agent"],
+  "skills": ["./skills/zmux"]
+}

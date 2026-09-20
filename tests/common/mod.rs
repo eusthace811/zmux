@@ -262,3 +262,57 @@ impl Client {
         latest.or_else(|| self.frame.as_ref().map(text_of))
     }
 }
+
+/// A control connection: request in, one reply out, no frames.
+pub struct Control {
+    stream: interprocess::local_socket::Stream,
+}
+
+impl Control {
+    pub fn open(session: &str) -> Self {
+        let mut stream = ipc::connect(session).expect("connect");
+        ipc::write_msg(&mut stream, &ClientMsg::Control { version: PROTOCOL_VERSION })
+            .expect("control hello");
+        match ipc::read_msg::<_, ServerMsg>(&mut stream).expect("handshake reply") {
+            Some(ServerMsg::Hello { .. }) => {}
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        Self { stream }
+    }
+
+    pub fn ask(&mut self, msg: &ClientMsg) -> ServerMsg {
+        ipc::write_msg(&mut self.stream, msg).expect("request");
+        ipc::read_msg::<_, ServerMsg>(&mut self.stream)
+            .expect("reply")
+            .expect("the daemon closed the control connection")
+    }
+
+    pub fn info(&mut self) -> zmux::protocol::SessionInfo {
+        match self.ask(&ClientMsg::Query(zmux::protocol::Query::Info)) {
+            ServerMsg::Info(i) => i,
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    pub fn capture(&mut self, pane: Option<u8>) -> String {
+        match self.ask(&ClientMsg::Query(zmux::protocol::Query::Capture { pane, lines: 0 })) {
+            ServerMsg::Capture { text } => text,
+            other => panic!("expected Capture, got {other:?}"),
+        }
+    }
+
+    /// Poll `capture` until it matches, or give up after `secs`.
+    pub fn wait_for(&mut self, secs: u64, pane: Option<u8>, pred: impl Fn(&str) -> bool) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            let text = self.capture(pane);
+            if pred(&text) {
+                return Some(text);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}

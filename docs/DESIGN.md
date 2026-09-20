@@ -527,40 +527,7 @@ harvest that does not exist (§2.1) and deferred work that cannot be deferred.
 | Installer / updater / telemetry | §6.2 |
 | Named windows, window indices with gaps | §9 — windows are positional |
 | Agent detection, workspaces, plugins, remote | herdr's product |
-| A control CLI (`split`, `send-keys`, `capture`) | See below |
-
-### The agent surface, and why it stops where it does
-
-herdr is a multiplexer *for coding agents*: it exposes the session through a
-JSON CLI, so an agent can split a pane, start a second agent in it, prompt it
-and read its output. That surface is the product. Three things carry it:
-`HERDR_ENV=1` and the pane/tab/workspace IDs injected into every pane, a
-command group per primitive returning JSON, and a skill file shipped with the
-binary that tells the agent the rules — including which commands would hijack
-the terminal.
-
-zmux takes exactly two of those ideas, because they cost almost nothing:
-
-1. **An environment marker.** `zmuxd` sets `ZMUX=1` and
-   `ZMUX_SESSION=<name>` on itself before the first pane spawns, so every
-   pane shell inherits them. "Am I inside?" gets an answer that does not
-   involve walking process ancestry.
-2. **A bundled skill.** `skills/zmux/SKILL.md` is `include_str!`d into the
-   client and printed by `zmux --skill`, so the description an agent reads
-   can never drift from the binary it describes.
-
-What it does **not** take is the control CLI, and that is the deliberate
-part. Splitting, focus, resize and scrolling are `C-b` keystrokes interpreted
-by an attached client; nothing outside can drive them, and nothing can read a
-pane's screen. Adding `zmux split` would mean a new command surface, a
-protocol version per verb, and answering what a pane *is* to a caller that
-holds no terminal. The daemon composites for attached clients only; that is
-the whole design (§3).
-
-So the skill's most useful content is a refusal: zmux's main entry points
-are a full-screen TUI, and an agent that runs `zmux attach` in a
-non-interactive shell hangs until its timeout. Telling it that is worth more
-than any command we could add.
+| Scrollback capture, session creation from the CLI | §11 |
 
 ---
 
@@ -914,3 +881,58 @@ two is worth keeping.
   keeps updating after a switch, is asserted in
   `a_background_window_keeps_its_output`, which uses only the harness's
   reassembling reader.
+
+---
+
+## 11. The control connection
+
+A session that only a human can drive is half a session. herdr's answer is a
+JSON CLI per primitive; zmux takes the same shape at a fraction of the size,
+because the daemon already holds everything worth exposing.
+
+**A separate handshake, not a quiet attach.** `ClientMsg::Control` replaces
+`Hello`. The peer gets no frames and is never registered as a client, and that
+is the whole reason it exists: the composited size is the SMALLEST attached
+viewport, so a control caller registering as a client would shrink the user's
+screen to a size it invented - and would hold the idle timer open for as long
+as it stayed connected. `a_control_connection_is_not_an_attached_client` pins
+this.
+
+**Every mutation answers with the state it produced.** Not an ack:
+`ServerMsg::Info`. A caller that splits a pane learns the new pane's position
+from the same round trip, so there is no follow-up query to race against the
+user doing something else. It is also the only thing that makes the CLI
+scriptable in one line.
+
+**Position, not `PaneId`.** Every control command takes the 1-based position
+in the current window - what the status bar shows, and what `C-b <digit>`
+means. Ids come from an allocator that never reuses a number (§9), so a
+user-facing surface built on them would be unreadable within an hour's work.
+`PaneInfo` carries both, and says which is which.
+
+**A wrong pane is refused, never redirected.** `InputTo { pane: 7 }` with two
+panes is an error. Clamping would type a command into a shell the caller did
+not mean, which is how a background helper destroys somebody's afternoon.
+
+**Writing does not move focus.** `InputTo` deliberately skips the
+`follow_focused` that `write_focused` does: a caller typing into a background
+pane has no business yanking the user's scrollback view or their cursor. This
+is the difference between "an agent can use zmux" and "an agent and a human
+can use zmux at the same time".
+
+**Capture is visible rows only.** Reading scrollback means moving the pane's
+scroll position, which is user-visible state; there is no way to borrow it
+invisibly while the same pane is on somebody's screen. A limitation stated in
+the skill beats a capture that makes the user's terminal jump.
+
+Wire: v5, appending `Control`, `Query`, `InputTo` to `ClientMsg` and
+`Info`/`Capture` to `ServerMsg`. A pre-v5 daemon cannot decode `Control` at
+all and closes without a word, so the client turns that silence into the
+instruction that fixes it - kill the session and start it again.
+
+The surface an agent gets is `skills/zmux/SKILL.md`, `include_str!`d into
+the client and printed by `zmux --skill`, plus `.claude-plugin/` so Claude
+Code can install it as a plugin. `ZMUX=1` and `ZMUX_SESSION` are set on
+the daemon before the first pane spawns, so every pane shell inherits them and
+"am I inside, and inside what?" has an answer that does not involve walking
+process ancestry.

@@ -4,7 +4,7 @@
 use std::io::{stdout, Write};
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::{execute, terminal};
 use interprocess::TryClone as _;
@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use zmux::ipc;
-use zmux::protocol::{Cmd, ClientMsg, Frame, ServerMsg, PROTOCOL_VERSION};
+use zmux::protocol::{Cmd, ClientMsg, Frame, Query, ServerMsg, PROTOCOL_VERSION};
 use zmux::render::{paint, paint_cursor};
 
 /// Restores terminal state even on panic or early return.
@@ -69,6 +69,14 @@ zmux - tmux-style panes for Windows
   zmux --skill            print the agent skill file (see skills/zmux)
   zmux --help
 
+Driving a session without attaching (for scripts and agents):
+  zmux info <session>                    layout, windows, focus, as JSON
+  zmux send <session> <command> [n]      one command; `send` alone lists them
+  zmux keys <session> [-p N] <text>      type text, no Enter
+  zmux run  <session> [-p N] <command>   type it and press Enter
+  zmux capture <session> [-p N] [-n N]   a pane's visible screen, as text
+  -p N chooses a pane by its position in the current window (default: focused)
+
 In a session (Ctrl-b is the prefix):
   C-b d          detach              C-b %          split left/right
   C-b x          close pane          C-b \"          split top/bottom
@@ -76,6 +84,135 @@ In a session (Ctrl-b is the prefix):
   C-b c          new window          C-b n / C-b p  next / previous window
   C-b 0..9       jump to that window (the numbers in the status bar)
   C-b C-b        send a literal Ctrl-b";
+
+/// The names `zmux send` accepts, printed when it is given none.
+const CMD_NAMES: &str = "\
+commands for `zmux send <session> <command>`:
+  split-h  split-v  close
+  focus-left  focus-right  focus-up  focus-down
+  resize-left  resize-right  resize-up  resize-down
+  new-window  next-window  prev-window  select-window <index>
+  scroll-up  scroll-down  page-up  page-down  scroll-bottom";
+
+fn parse_cmd(name: &str, arg: Option<&str>) -> Option<Cmd> {
+    Some(match name {
+        "split-h" => Cmd::SplitHorizontal,
+        "split-v" => Cmd::SplitVertical,
+        "close" => Cmd::ClosePane,
+        "focus-left" => Cmd::FocusLeft,
+        "focus-right" => Cmd::FocusRight,
+        "focus-up" => Cmd::FocusUp,
+        "focus-down" => Cmd::FocusDown,
+        "resize-left" => Cmd::ResizeLeft,
+        "resize-right" => Cmd::ResizeRight,
+        "resize-up" => Cmd::ResizeUp,
+        "resize-down" => Cmd::ResizeDown,
+        "new-window" => Cmd::NewWindow,
+        "next-window" => Cmd::NextWindow,
+        "prev-window" => Cmd::PrevWindow,
+        "select-window" => Cmd::SelectWindow(arg?.parse().ok()?),
+        "scroll-up" => Cmd::ScrollUp,
+        "scroll-down" => Cmd::ScrollDown,
+        "page-up" => Cmd::ScrollPageUp,
+        "page-down" => Cmd::ScrollPageDown,
+        "scroll-bottom" => Cmd::ScrollToBottom,
+        _ => return None,
+    })
+}
+
+fn session_arg(args: &[String], sub: &str) -> Result<String> {
+    args.get(1).cloned().with_context(|| format!("usage: zmux {sub} <session> ..."))
+}
+
+/// Pull an optional leading `-p N` / `--pane N` off the argument list.
+fn take_pane(args: &[String]) -> Result<(Option<u8>, &[String])> {
+    match args.first().map(String::as_str) {
+        Some("-p" | "--pane") => {
+            let n = args.get(1).and_then(|v| v.parse().ok()).context("-p needs a pane number")?;
+            Ok((Some(n), &args[2..]))
+        }
+        _ => Ok((None, args)),
+    }
+}
+
+/// Backslash escapes, so control keys are reachable without a key-name
+/// vocabulary: `\x03` is Ctrl-C, `\e` Escape, `\r` Enter. An unknown escape
+/// is left alone rather than swallowed - a Windows path typed as an argument
+/// is full of backslashes and none of them mean anything here.
+fn unescape(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut it = s.bytes().peekable();
+    while let Some(b) = it.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        match it.next() {
+            Some(b'r') => out.push(b'\r'),
+            Some(b'n') => out.push(b'\n'),
+            Some(b't') => out.push(b'\t'),
+            Some(b'e') => out.push(0x1b),
+            Some(b'\\') => out.push(b'\\'),
+            Some(b'x') => {
+                let hex: String =
+                    (0..2).filter_map(|_| it.peek().copied()).map(char::from).collect();
+                match u8::from_str_radix(&hex, 16) {
+                    Ok(v) if hex.len() == 2 => {
+                        it.next();
+                        it.next();
+                        out.push(v);
+                    }
+                    _ => out.extend_from_slice(b"\\x"),
+                }
+            }
+            Some(other) => {
+                out.push(b'\\');
+                out.push(other);
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    out
+}
+
+/// One control round trip: connect, handshake, ask, read the single reply.
+///
+/// A fresh connection per command on purpose. These are one-shot CLI calls,
+/// and a control connection holds no session state - nothing is gained by
+/// keeping it open, and a dropped one costs nothing.
+fn request(session: &str, msg: &ClientMsg) -> Result<ServerMsg> {
+    if !ipc::is_running(session) {
+        bail!("no such session: {session}");
+    }
+    let mut s = ipc::connect(session)?;
+    ipc::write_msg(&mut s, &ClientMsg::Control { version: PROTOCOL_VERSION })?;
+    match ipc::read_msg::<_, ServerMsg>(&mut s) {
+        Ok(Some(ServerMsg::Hello { .. })) => {}
+        Ok(Some(ServerMsg::Refused { reason })) => bail!("daemon refused: {reason}"),
+        Ok(Some(other)) => bail!("unexpected handshake reply: {other:?}"),
+        // A daemon from before v5 does not know `Control`, so it cannot even
+        // decode the request: it closes without a word. Say what to do.
+        Ok(None) | Err(_) => bail!(
+            "the daemon serving '{session}' did not answer. It is probably an older \
+             build: `zmux kill {session}`, then start the session again."
+        ),
+    }
+    ipc::write_msg(&mut s, msg)?;
+    match ipc::read_msg::<_, ServerMsg>(&mut s) {
+        Ok(Some(ServerMsg::Refused { reason })) => bail!("{reason}"),
+        Ok(Some(reply)) => Ok(reply),
+        Ok(None) => bail!("the daemon closed the connection without replying"),
+        Err(e) => bail!("no reply from the daemon: {e}"),
+    }
+}
+
+/// Every mutation answers with the session state it produced, so a caller
+/// learns where its new pane landed without a second, racy query.
+fn print_info(reply: ServerMsg) -> Result<()> {
+    let ServerMsg::Info(info) = reply else { bail!("unexpected reply: {reply:?}") };
+    println!("{}", serde_json::to_string_pretty(&info)?);
+    Ok(())
+}
 
 /// Bundled at build time; `zmux --skill` prints it.
 const SKILL: &str = include_str!("../../skills/zmux/SKILL.md");
@@ -122,6 +259,55 @@ fn main() -> Result<()> {
             ipc::write_msg(&mut s, &ClientMsg::Shutdown)?;
             let _ = ipc::read_msg::<_, ServerMsg>(&mut s);
             println!("killed {name}");
+            return Ok(());
+        }
+        Some("info") => {
+            let info = request(&session_arg(&args, "info")?, &ClientMsg::Query(Query::Info))?;
+            let ServerMsg::Info(info) = info else { bail!("unexpected reply: {info:?}") };
+            println!("{}", serde_json::to_string_pretty(&info)?);
+            return Ok(());
+        }
+        Some("send") => {
+            let Some(name) = args.get(2) else {
+                println!("{CMD_NAMES}");
+                return Ok(());
+            };
+            let cmd = parse_cmd(name, args.get(3).map(String::as_str))
+                .with_context(|| format!("unknown command '{name}'\n\n{CMD_NAMES}"))?;
+            print_info(request(&session_arg(&args, "send")?, &ClientMsg::Command(cmd))?)?;
+            return Ok(());
+        }
+        Some("keys" | "run") => {
+            let enter = args[0] == "run";
+            let session = session_arg(&args, &args[0].clone())?;
+            let (pane, rest) = take_pane(&args[2..])?;
+            if rest.is_empty() {
+                bail!("usage: zmux {} <session> [-p N] <text>", args[0]);
+            }
+            let mut data = unescape(&rest.join(" "));
+            if enter {
+                data.push(b'\r');
+            }
+            let msg = match pane {
+                Some(p) => ClientMsg::InputTo { pane: p, data },
+                None => ClientMsg::Input { data },
+            };
+            print_info(request(&session, &msg)?)?;
+            return Ok(());
+        }
+        Some("capture") => {
+            let session = session_arg(&args, "capture")?;
+            let (pane, rest) = take_pane(&args[2..])?;
+            let lines = match rest.first().map(String::as_str) {
+                Some("-n" | "--lines") => rest
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .context("usage: zmux capture <session> [-p N] [-n LINES]")?,
+                _ => 0,
+            };
+            let reply = request(&session, &ClientMsg::Query(Query::Capture { pane, lines }))?;
+            let ServerMsg::Capture { text } = reply else { bail!("unexpected reply: {reply:?}") };
+            println!("{text}");
             return Ok(());
         }
         Some("attach") => {

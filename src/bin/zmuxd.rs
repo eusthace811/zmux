@@ -14,7 +14,7 @@ use interprocess::TryClone as _;
 
 use zmux::ipc;
 use zmux::layout::{Dir, Nav, PaneId};
-use zmux::protocol::{Cmd, ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use zmux::protocol::{Cmd, ClientMsg, Query, ServerMsg, PROTOCOL_VERSION};
 use zmux::pty::PtyEvent;
 use zmux::session::{Outbound, Session};
 
@@ -244,6 +244,71 @@ fn apply(session: &Arc<Session>, cmd: Cmd) {
     }
 }
 
+/// A control connection: one reply per request, no frames, no client record.
+///
+/// This is the whole agent-facing surface. It deliberately does NOT call
+/// `session.attach`: a caller with no terminal must not constrain the
+/// composited size (the session is the SMALLEST attached viewport) and must
+/// not keep the idle timer from ever firing.
+///
+/// Mutations answer with the resulting `Info` rather than a bare ack, so a
+/// caller that split a pane learns the new pane's position from the same
+/// round trip - there is no second query to race against the user.
+fn serve_control(
+    session: &Arc<Session>,
+    mut stream: interprocess::local_socket::Stream,
+) -> Result<()> {
+    ipc::write_msg(&mut stream, &ServerMsg::Hello {
+        version: PROTOCOL_VERSION,
+        session: session.name.clone(),
+    })?;
+
+    while let Ok(Some(msg)) = ipc::read_msg::<_, ClientMsg>(&mut stream) {
+        let reply = match msg {
+            // Same path as a keystroke from an attached client: apply, then
+            // publish so everyone watching sees it immediately.
+            ClientMsg::Command(cmd) => {
+                apply(session, cmd);
+                session.publish();
+                ServerMsg::Info(session.info())
+            }
+            ClientMsg::Input { data } => match session.write_focused(&data) {
+                Ok(()) => ServerMsg::Info(session.info()),
+                Err(e) => ServerMsg::Refused { reason: e.to_string() },
+            },
+            ClientMsg::InputTo { pane, data } => match session.write_pane(pane as usize, &data) {
+                Ok(true) => ServerMsg::Info(session.info()),
+                Ok(false) => ServerMsg::Refused { reason: format!("no pane {pane}") },
+                Err(e) => ServerMsg::Refused { reason: e.to_string() },
+            },
+            ClientMsg::Query(Query::Info) => ServerMsg::Info(session.info()),
+            ClientMsg::Query(Query::Capture { pane, lines }) => {
+                match session.capture(pane.map(usize::from), lines) {
+                    Some(text) => ServerMsg::Capture { text },
+                    None => ServerMsg::Refused {
+                        reason: match pane {
+                            Some(p) => format!("no pane {p}"),
+                            None => "no focused pane".into(),
+                        },
+                    },
+                }
+            }
+            ClientMsg::Shutdown => {
+                let _ = ipc::write_msg(&mut stream, &ServerMsg::ShuttingDown);
+                session.shutdown();
+                let _ = ipc::connect(&session.name);
+                return Ok(());
+            }
+            ClientMsg::Detach => return Ok(()),
+            other => ServerMsg::Refused {
+                reason: format!("not valid on a control connection: {other:?}"),
+            },
+        };
+        ipc::write_msg(&mut stream, &reply)?;
+    }
+    Ok(())
+}
+
 fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) -> Result<()> {
     // A probe connects, learns the session is alive and closes without saying
     // anything - `zmux ls` and every `is_running` check does exactly that.
@@ -279,6 +344,19 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
             // Unblock the accept loop so main() can run its clean teardown.
             let _ = ipc::connect(&session.name);
             return Ok(());
+        }
+        ClientMsg::Control { version } => {
+            if version != PROTOCOL_VERSION {
+                ipc::write_msg(&mut stream, &ServerMsg::Refused {
+                    reason: format!(
+                        "control client speaks protocol {version}, this daemon speaks \
+                         {PROTOCOL_VERSION}. Run `zmux kill {}` and start it again.",
+                        session.name
+                    ),
+                })?;
+                return Ok(());
+            }
+            return serve_control(&session, stream);
         }
         other => {
             ipc::write_msg(&mut stream, &ServerMsg::Refused {
@@ -397,7 +475,13 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                         session.shutdown();
                         return Ok(());
                     }
-                    ClientMsg::Hello { .. } => {}
+                    // Control-connection messages. An attached client has no
+                    // business sending these, and there is nowhere to put a
+                    // reply on a connection that is streaming frames.
+                    ClientMsg::Hello { .. }
+                    | ClientMsg::Control { .. }
+                    | ClientMsg::Query(_)
+                    | ClientMsg::InputTo { .. } => {}
                 }
             }
         }

@@ -1,0 +1,178 @@
+//! The control connection: what a script or a coding agent drives the session
+//! through. Every test here goes over the real pipe to a real daemon, because
+//! the whole point of the surface is that it works from outside the client.
+
+mod common;
+use common::{Control, Daemon};
+
+use zmux::protocol::{ClientMsg, Cmd, Query, ServerMsg};
+
+#[test]
+fn info_reports_the_layout_a_command_produced() {
+    let d = Daemon::start("zmux-test-ctl-info");
+    let mut c = Control::open(&d.session);
+
+    let before = c.info();
+    assert_eq!(before.panes.len(), 1, "a new session has one pane");
+    assert_eq!(before.focus, 1);
+    assert_eq!(before.windows, 1);
+    assert_eq!(before.window, 0);
+
+    // A mutation answers with the resulting state, so one round trip is
+    // enough to learn where the new pane landed.
+    let reply = c.ask(&ClientMsg::Command(Cmd::SplitHorizontal));
+    let ServerMsg::Info(after) = reply else { panic!("expected Info, got {reply:?}") };
+    assert_eq!(after.panes.len(), 2, "split did not report two panes");
+    assert_eq!(after.focus, 2, "focus follows the new pane, as C-b % does");
+
+    // Geometry is real: two side-by-side panes are each narrower than the
+    // session, and together they account for it bar the divider column.
+    let w: u16 = after.panes.iter().map(|p| p.cols).sum();
+    assert!(
+        after.panes.iter().all(|p| p.cols < after.cols),
+        "panes are not actually narrower than the session: {after:?}"
+    );
+    assert_eq!(w + 1, after.cols, "two panes plus one divider should fill the width");
+}
+
+#[test]
+fn a_control_connection_is_not_an_attached_client() {
+    // This is the reason control is a separate handshake. A control peer has
+    // no viewport; if it were registered as a client the session would shrink
+    // to whatever size it claimed - or to the 80x24 default - and the user's
+    // screen would visibly jump.
+    let d = Daemon::start("zmux-test-ctl-size");
+    let mut attached = d.attach_ready(120, 40);
+    attached.input("echo ready\r");
+    assert!(attached.wait_for(20, |t| t.contains("ready")).is_some(), "pane never answered");
+
+    let mut c = Control::open(&d.session);
+    let info = c.info();
+    assert_eq!(
+        (info.cols, info.rows),
+        (120, 40),
+        "opening a control connection changed the session size"
+    );
+
+    // And it stays that way after the control peer issues commands.
+    c.ask(&ClientMsg::Query(Query::Info));
+    let info = c.info();
+    assert_eq!((info.cols, info.rows), (120, 40));
+}
+
+#[test]
+fn a_command_runs_in_a_pane_and_its_output_comes_back() {
+    // The loop an agent actually needs: make a pane, run something in it,
+    // read the answer - without attaching a terminal.
+    let d = Daemon::start("zmux-test-ctl-run");
+    let mut c = Control::open(&d.session);
+
+    let ServerMsg::Info(after) = c.ask(&ClientMsg::Command(Cmd::SplitVertical)) else {
+        panic!("split failed")
+    };
+    let new_pane = after.focus as u8;
+
+    c.ask(&ClientMsg::InputTo {
+        pane: new_pane,
+        data: b"echo CONTROL_MARKER_OK\r".to_vec(),
+    });
+
+    let text = c
+        .wait_for(20, Some(new_pane), |t| t.matches("CONTROL_MARKER_OK").count() >= 2)
+        .unwrap_or_else(|| panic!("the pane never produced the output"));
+    // Twice: the shell's echo of the command line, then the command's output.
+    assert!(text.matches("CONTROL_MARKER_OK").count() >= 2, "captured:\n{text}");
+}
+
+#[test]
+fn writing_to_a_pane_does_not_move_focus() {
+    // Background work must stay in the background: a caller typing into pane 1
+    // while the user works in pane 2 must not drag the focus - and therefore
+    // the user's keystrokes - across the screen.
+    let d = Daemon::start("zmux-test-ctl-focus");
+    let mut c = Control::open(&d.session);
+    c.ask(&ClientMsg::Command(Cmd::SplitHorizontal));
+    assert_eq!(c.info().focus, 2);
+
+    c.ask(&ClientMsg::InputTo { pane: 1, data: b"echo IN_PANE_ONE\r".to_vec() });
+    assert_eq!(c.info().focus, 2, "writing to pane 1 stole the focus");
+
+    // It really did land in pane 1, not the focused one.
+    assert!(
+        c.wait_for(20, Some(1), |t| t.contains("IN_PANE_ONE")).is_some(),
+        "the text did not reach pane 1"
+    );
+    let two = c.capture(Some(2));
+    assert!(!two.contains("IN_PANE_ONE"), "it also went to pane 2:\n{two}");
+}
+
+#[test]
+fn captures_are_per_pane() {
+    let d = Daemon::start("zmux-test-ctl-capture");
+    let mut c = Control::open(&d.session);
+    c.ask(&ClientMsg::Command(Cmd::SplitHorizontal));
+
+    c.ask(&ClientMsg::InputTo { pane: 1, data: b"echo LEFT_SIDE\r".to_vec() });
+    c.ask(&ClientMsg::InputTo { pane: 2, data: b"echo RIGHT_SIDE\r".to_vec() });
+
+    assert!(c.wait_for(20, Some(1), |t| t.contains("LEFT_SIDE")).is_some(), "pane 1 silent");
+    assert!(c.wait_for(20, Some(2), |t| t.contains("RIGHT_SIDE")).is_some(), "pane 2 silent");
+
+    let one = c.capture(Some(1));
+    let two = c.capture(Some(2));
+    assert!(!one.contains("RIGHT_SIDE"), "pane 1 shows pane 2's output:\n{one}");
+    assert!(!two.contains("LEFT_SIDE"), "pane 2 shows pane 1's output:\n{two}");
+}
+
+#[test]
+fn a_pane_that_does_not_exist_is_refused_not_guessed() {
+    let d = Daemon::start("zmux-test-ctl-nopane");
+    let mut c = Control::open(&d.session);
+
+    // One pane exists. Asking for the seventh must not fall back to it: a
+    // caller that believes it wrote to pane 7 would otherwise corrupt pane 1.
+    let reply = c.ask(&ClientMsg::InputTo { pane: 7, data: b"echo NOWHERE\r".to_vec() });
+    assert!(matches!(reply, ServerMsg::Refused { .. }), "expected Refused, got {reply:?}");
+
+    let reply = c.ask(&ClientMsg::Query(Query::Capture { pane: Some(7), lines: 0 }));
+    assert!(matches!(reply, ServerMsg::Refused { .. }), "expected Refused, got {reply:?}");
+
+    let one = c.capture(Some(1));
+    assert!(!one.contains("NOWHERE"), "the refused write landed in pane 1 anyway:\n{one}");
+}
+
+#[test]
+fn windows_can_be_driven_from_outside() {
+    let d = Daemon::start("zmux-test-ctl-windows");
+    let mut c = Control::open(&d.session);
+
+    c.ask(&ClientMsg::Command(Cmd::NewWindow));
+    c.ask(&ClientMsg::Command(Cmd::NewWindow));
+    let info = c.info();
+    assert_eq!(info.windows, 3);
+    assert_eq!(info.window, 2, "a new window is the current one");
+
+    let ServerMsg::Info(info) = c.ask(&ClientMsg::Command(Cmd::SelectWindow(0))) else {
+        panic!("select-window failed")
+    };
+    assert_eq!(info.window, 0, "select-window did not switch");
+    assert_eq!(info.windows, 3, "switching windows changed how many there are");
+}
+
+#[test]
+fn capture_can_be_limited_to_the_last_lines() {
+    let d = Daemon::start("zmux-test-ctl-lines");
+    let mut c = Control::open(&d.session);
+    c.ask(&ClientMsg::Input { data: b"echo TAIL_MARKER\r".to_vec() });
+    assert!(c.wait_for(20, None, |t| t.contains("TAIL_MARKER")).is_some(), "pane silent");
+
+    let all = c.capture(None);
+    let ServerMsg::Capture { text: tail } =
+        c.ask(&ClientMsg::Query(Query::Capture { pane: None, lines: 2 }))
+    else {
+        panic!("capture failed")
+    };
+    assert!(tail.lines().count() <= 2, "asked for 2 lines, got {}", tail.lines().count());
+    assert!(all.lines().count() >= tail.lines().count());
+    assert!(all.ends_with(&tail), "the tail is not the end of the screen:\n{all}\n---\n{tail}");
+}

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 /// v3 added the window commands: a v3 client sending `Cmd::NewWindow` to a v2
 /// daemon would be a decode error mid-stream, which the handshake catches first.
 /// v4 added `Cmd::SelectWindow`, for the same reason.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5 added the control connection - `ClientMsg::Control`, `Query`, `InputTo`
+/// and the `Info`/`Capture` replies.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -53,6 +55,70 @@ pub enum ClientMsg {
     Command(Cmd),
     /// Mouse click at a screen position: focus the pane under it.
     Click { x: u16, y: u16 },
+    // --- appended. Append-only. ---
+    /// Open a CONTROL connection instead of attaching a terminal.
+    ///
+    /// Must be the first message, in place of `Hello`. The peer receives no
+    /// frames and is NOT registered as a client, deliberately: a script
+    /// driving the session has no viewport, so counting it would let it
+    /// shrink the session to a size it invented, and would hold the idle
+    /// timer open for as long as it stayed connected.
+    ///
+    /// Afterwards every message gets exactly one reply.
+    Control { version: u32 },
+    /// Read session state or pane text. Control connections only.
+    Query(Query),
+    /// Write to a pane by POSITION in the current window, 1-based, without
+    /// moving focus - the caller's reason for existing is to work in the
+    /// background while somebody else uses the session.
+    InputTo { pane: u8, data: Vec<u8> },
+}
+
+/// What a control connection can ask for. Append-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Query {
+    /// Windows, panes, focus and geometry.
+    Info,
+    /// The visible screen of one pane of the current window.
+    ///
+    /// `pane` is a 1-based position, `None` meaning the focused pane.
+    /// `lines` keeps only that many lines from the bottom; 0 means all of
+    /// them. Only what is on screen: scrollback is not captured.
+    Capture { pane: Option<u8>, lines: u16 },
+}
+
+/// The answer to `Query::Info`, and to every control mutation - a caller sees
+/// the state its own command produced without a second round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session: String,
+    /// Composited size: the smallest attached viewport, or 80x24 with nobody
+    /// attached.
+    pub cols: u16,
+    pub rows: u16,
+    /// 0-based, exactly what the status bar shows and `SelectWindow` takes.
+    pub window: usize,
+    pub windows: usize,
+    /// 1-based position of the focused pane within `panes`, 0 if there is
+    /// none.
+    pub focus: usize,
+    /// The current window's panes, in the order the status bar counts them.
+    pub panes: Vec<PaneInfo>,
+}
+
+/// One pane of the current window.
+///
+/// `position` is what every control command takes, because it is what the
+/// status bar shows. `id` is the daemon's internal handle: stable for the
+/// pane's lifetime and never reused, but meaningless to a user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneInfo {
+    pub position: usize,
+    pub id: u32,
+    pub cols: u16,
+    pub rows: u16,
+    /// Last directory the shell reported through OSC 7, if it reported one.
+    pub cwd: Option<String>,
 }
 
 /// Pane management. Append-only, like everything else on this wire.
@@ -111,6 +177,11 @@ pub enum ServerMsg {
     /// every tick is almost all waste. A client whose current revision is not
     /// `base_revision` must discard the delta and wait for a full frame.
     Delta(FrameDelta),
+    // --- appended. Append-only. ---
+    /// Reply to `Query::Info`, and to every control mutation.
+    Info(SessionInfo),
+    /// Reply to `Query::Capture`.
+    Capture { text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

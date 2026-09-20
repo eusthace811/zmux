@@ -117,9 +117,29 @@ zmux --skill            # what a coding agent should know about zmux
 zmux --help
 ```
 
-Those are the whole non-interactive surface. Everything else — `zmux`,
-`zmux <name>`, `zmux attach` — opens the full-screen client and does not
-return until you detach.
+A session can also be driven from outside, without attaching — for scripts,
+and for coding agents:
+
+```bash
+zmux info work                      # layout, windows, focus, as JSON
+zmux send work split-v              # any keybinding, by name
+zmux run  work -p 2 "cargo test"    # type it into pane 2 and press Enter
+zmux keys work -p 2 "text"          # type it, no Enter
+zmux capture work -p 2 -n 20        # that pane's last 20 visible lines
+```
+
+`-p N` is a pane's position in the current window — the numbering the status
+bar counts — and targeting a pane this way does **not** move your focus, so
+someone else can keep working while a script types in another pane. `send`
+with no command prints the list. Every command that changes something answers
+with the new `info`, so a script learns where its new pane landed without
+asking twice.
+
+Two limits worth knowing: `capture` reads only what is on screen, not
+scrollback, and only the current window's panes are reachable.
+
+Everything else — `zmux`, `zmux <name>`, `zmux attach` — opens the
+full-screen client and does not return until you detach.
 
 Inside a session, `C-b d` detaches: the shells keep running, and
 `zmux work` puts you back where you were. You can attach from a second Git

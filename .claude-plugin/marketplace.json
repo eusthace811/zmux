@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "zmux",
+  "description": "Terminal multiplexer skills for AI agents on Windows",
+  "owner": {
+    "name": "zmux"
+  },
+  "plugins": [
+    {
+      "name": "zmux",
+      "source": ".",
+      "description": "Drive a zmux session from outside it: inspect the layout, split panes, run commands and read pane output over the control CLI.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["zmux", "terminal", "multiplexer", "panes", "windows", "git-bash"]
+    }
+  ]
+}

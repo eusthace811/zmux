@@ -17,7 +17,9 @@ use anyhow::{bail, Result};
 
 use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::windows::{Closed, Windows};
-use crate::protocol::{clamp_size, Frame, ServerMsg, MAX_INPUT_BYTES, MAX_PANES};
+use crate::protocol::{
+    clamp_size, Frame, PaneInfo, ServerMsg, SessionInfo, MAX_INPUT_BYTES, MAX_PANES,
+};
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
 use crate::render::{composite, frame_from_screen, pane_area_with, status_spans, Span};
@@ -332,6 +334,92 @@ impl Session {
         // Lock released before writing: a blocked write must not stall the
         // whole session.
         pty.write_input(data)
+    }
+
+    /// Write to a pane by 1-based position in the current window, leaving
+    /// focus alone.
+    ///
+    /// False when there is no such pane. Unlike `write_focused` this does not
+    /// snap the pane back to the live screen: a control caller typing into a
+    /// background pane has no business yanking the user's scrollback view.
+    pub fn write_pane(&self, position: usize, data: &[u8]) -> Result<bool> {
+        if data.len() > MAX_INPUT_BYTES {
+            bail!("input of {} bytes exceeds MAX_INPUT_BYTES", data.len());
+        }
+        let Some(id) = self.pane_at_position(position) else { return Ok(false) };
+        let pty = {
+            let panes = lock(&self.panes);
+            match panes.get(&id) {
+                Some(p) => Arc::clone(&p.pty),
+                None => return Ok(false),
+            }
+        };
+        pty.write_input(data)?;
+        Ok(true)
+    }
+
+    /// Resolve a 1-based position in the current window to a pane.
+    fn pane_at_position(&self, position: usize) -> Option<PaneId> {
+        let i = position.checked_sub(1)?;
+        lock(&self.windows).current().panes().get(i).copied()
+    }
+
+    /// Everything a control caller needs to decide what to do next.
+    pub fn info(&self) -> SessionInfo {
+        let (cols, rows) = self.size();
+        let area = self.area(cols, rows);
+        let (window, windows, layout) = {
+            let w = lock(&self.windows);
+            (w.index(), w.len(), w.current().clone())
+        };
+        let (rects, _) = layout.compute(area);
+        let focus_id = layout.focus();
+        let mut focus = 0;
+        let panes = lock(&self.panes);
+        let list = layout
+            .panes()
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let position = i + 1;
+                if id == focus_id {
+                    focus = position;
+                }
+                let rect = rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r);
+                PaneInfo {
+                    position,
+                    id: id.0,
+                    cols: rect.map_or(0, |r| r.w),
+                    rows: rect.map_or(0, |r| r.h),
+                    cwd: panes.get(&id).and_then(|p| lock(&p.term).cwd_windows()),
+                }
+            })
+            .collect();
+        SessionInfo { session: self.name.clone(), cols, rows, window, windows, focus, panes: list }
+    }
+
+    /// The visible screen of one pane, as text.
+    ///
+    /// `position` is 1-based, `None` meaning the focused pane; `lines` keeps
+    /// that many lines from the bottom, 0 meaning all of them. None when
+    /// there is no such pane.
+    ///
+    /// Visible rows only. Reading scrollback would mean moving the pane's
+    /// scroll position, which is user-visible state that a background caller
+    /// must not touch.
+    pub fn capture(&self, position: Option<usize>, lines: u16) -> Option<String> {
+        let id = match position {
+            Some(p) => self.pane_at_position(p)?,
+            None => self.focus(),
+        };
+        let panes = lock(&self.panes);
+        let text = lock(&panes.get(&id)?.term).parser.screen().contents();
+        if lines == 0 {
+            return Some(text);
+        }
+        let rows: Vec<&str> = text.lines().collect();
+        let keep = rows.len().saturating_sub(lines as usize);
+        Some(rows[keep..].join("\n"))
     }
 
     pub fn split(&self, dir: Dir) -> Result<Option<PaneId>> {

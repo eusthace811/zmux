@@ -1,6 +1,6 @@
 ---
 name: zmux
-description: "Work with zmux, a tmux-style terminal multiplexer for Windows Git Bash. Use only when the user explicitly mentions zmux - listing or ending sessions, building or installing it, or understanding what a pane shell is running inside. Do not use merely because a task could benefit from a background terminal or a second shell."
+description: "Drive zmux, a tmux-style terminal multiplexer for Windows Git Bash. Use when the user mentions zmux, or asks to inspect or control its panes, windows or sessions - splitting panes, running a command in one, reading a pane's output, building or installing it. Do not use merely because a task could benefit from a background terminal or a second shell."
 ---
 
 # zmux
@@ -9,65 +9,164 @@ zmux splits a Git Bash window into panes. A background daemon
 (`zmuxd.exe`) owns the shells and the layout; the client (`zmux.exe`) is a
 terminal attached to it. One daemon per named session.
 
+A session can be driven from outside without attaching, which is what this
+skill is for.
+
 ## The one rule that matters
 
 `zmux`, `zmux <session>` and `zmux attach <session>` **start a
 full-screen TUI**. They take over the terminal, enter raw mode and do not
 return until the user detaches.
 
-Never run them. In an agent's non-interactive shell they will hang until the
-command times out, and everything you type afterwards is swallowed by a
-terminal nobody is reading.
+Never run them. In a non-interactive shell they hang until the command times
+out, and everything typed afterwards is swallowed by a terminal nobody is
+reading.
 
-Only these subcommands return:
+Every command below returns immediately instead.
 
-```bash
-zmux ls        # live session names, one per line, or "no live sessions"
-zmux kill <session>
-zmux config    # writes the default config if absent; prints its path
-zmux --help
-zmux --skill   # this file
-```
-
-They are plain text on stdout, not JSON. `ls` is the only way to inspect a
-session from outside; there is no protocol-level query for panes, windows or
-pane contents (see *What zmux cannot do*).
-
-## Know where you are
-
-Every pane shell inherits two variables from its daemon:
+## Find the session
 
 ```bash
-test "${ZMUX:-}" = 1          # true: this shell is a zmux pane
-printf '%s\n' "$ZMUX_SESSION" # the session name that owns it
+zmux ls          # live session names, one per line, or "no live sessions"
 ```
 
-`ZMUX` unset means you are in an ordinary Git Bash window. Both cases are
-fine; they change what is safe to do:
+Inside a pane, the shell already knows:
 
-- **Inside a pane**, never `zmux kill "$ZMUX_SESSION"` — you would kill
-  the session you are running in, and yourself with it. Do not start a nested
-  session either; zmux does not block nesting, so it will "work" and leave
-  the user with two layouts fighting over one window.
-- **Outside**, `zmux ls` tells you what is live before you touch anything.
+```bash
+test "${ZMUX:-}" = 1           # true: this shell IS a zmux pane
+printf '%s\n' "$ZMUX_SESSION"  # the session that owns it
+```
 
-## Ending a session
+`ZMUX` unset means an ordinary Git Bash window; then `zmux ls` is the only
+way to find a session, and if it lists none there is nothing to drive. Do not
+create a session to have something to work with — starting one needs the TUI.
 
-`zmux kill <session>` terminates the daemon and every shell in it,
-immediately and without asking. Unsaved work in those shells is lost.
+## Read the state
 
-Only run it when the user asked for that session by name, or when they asked
-for something that cannot proceed otherwise — and then say which sessions you
-are about to end and why, before doing it.
+```bash
+zmux info <session>
+```
 
-The layout is saved, not the processes: a killed session's panes and
-directories come back on the next attach, with fresh shells.
+JSON, and the authority for everything else:
+
+```json
+{
+  "session": "work", "cols": 120, "rows": 40,
+  "window": 0, "windows": 3, "focus": 2,
+  "panes": [
+    {"position": 1, "id": 1, "cols": 59, "rows": 39, "cwd": "C:\\work"},
+    {"position": 2, "id": 7, "cols": 60, "rows": 39, "cwd": "C:\\work\\api"}
+  ]
+}
+```
+
+- `panes` holds the **current window only** — a background window's panes are
+  not listed, and not reachable until you switch to it.
+- **`position` is what every command takes**, 1-based, in the order the status
+  bar counts them. `id` is the daemon's internal handle; never pass it as a
+  position, and never assume the two match — after a few splits and closes
+  they diverge.
+- `focus` is the position of the focused pane, i.e. where the user's
+  keystrokes go.
+- `window` is 0-based, matching the status bar and `select-window`.
+- `cwd` is the last directory the shell reported; absent if it reported none.
+
+Positions shift when a pane closes. Re-read `info` rather than reusing a
+position across anything that could have changed the layout.
+
+## Change the layout
+
+```bash
+zmux send <session> <command> [n]
+zmux send <session>              # prints the command list
+```
+
+`split-h` `split-v` `close`, `focus-left|right|up|down`,
+`resize-left|right|up|down`, `new-window` `next-window` `prev-window`
+`select-window <index>`, `scroll-up` `scroll-down` `page-up` `page-down`
+`scroll-bottom`.
+
+Every mutation replies with the resulting `info`, so one call tells you where
+the new pane landed — read `focus` from that reply instead of querying again
+and racing the user.
+
+```bash
+NEW=$(zmux send work split-v | python -c 'import json,sys;print(json.load(sys.stdin)["focus"])')
+```
+
+A split inherits the focused pane's directory and **takes the focus**, exactly
+as `C-b "` does. That moves the user's cursor. Split only when the user asked
+for a pane; to run something in the background, use a pane that already
+exists.
+
+`close` closes the **focused** pane. Never close a pane you did not create.
+
+## Run something in a pane
+
+```bash
+zmux run <session> -p 2 "cargo test"     # types it and presses Enter
+zmux keys <session> -p 2 "some text"     # types it, no Enter
+```
+
+`-p N` targets a pane by position **without moving focus**, which is what
+makes background work possible: the user keeps typing where they were. Omit
+`-p` to target the focused pane.
+
+Escapes in the text: `\r` Enter, `\n`, `\t`, `\e` Escape, `\xNN` any byte —
+`\x03` is Ctrl-C. Anything else after a backslash is left alone, so Windows
+paths survive.
+
+There is no "wait until it finishes": a pane is a shell, and zmux does not
+track what is running in it. Poll `capture` for something the command prints,
+or for the prompt returning. A command that needs a machine-readable result is
+better told to write a file that you then read directly.
+
+Asking for a pane that does not exist is **refused**, not redirected — a
+wrong `-p` never lands in the wrong shell.
+
+## Read a pane's output
+
+```bash
+zmux capture <session> -p 2            # that pane's visible screen
+zmux capture <session> -p 2 -n 20      # its last 20 lines
+zmux capture <session>                 # the focused pane
+```
+
+Plain text. Only what is **on screen**: scrollback is not captured, so output
+that scrolled past is gone. A pane is only as wide as its share of the window
+— long lines wrapped at that width, and the wrapping is in the text.
+
+Nothing about `capture` changes what the user sees; it does not move the
+pane's scroll position.
+
+## Safety
+
+- Never attach. Never run bare `zmux`, `zmux <session>` or `zmux attach`.
+- Never `zmux kill` a session the user did not name — it ends every shell in
+  it immediately, losing whatever was running. Inside a pane, killing
+  `$ZMUX_SESSION` kills you too.
+- Do not close panes or windows you did not create.
+- Take positions from `info`, never from the sidebar-free guess that pane 2 is
+  "the one on the right" — it is whatever `info` says it is.
+- Prefer `-p N` over focus commands. Moving focus moves the user's cursor.
+- The daemon runs the user's real shells, in the user's real directories.
+  Treat a pane as their terminal, because it is.
+
+## What zmux still does not do
+
+Say so rather than inventing a command:
+
+- **No scrollback capture** — visible rows only.
+- **No agent awareness.** zmux does not detect, name or track what runs in a
+  pane. There is no lifecycle state, no "is it done".
+- **No pane creation without focus change**, and no way to reach a background
+  window's panes without switching to it.
+- **No remote.** One machine, named pipes, no SSH.
+- **No session creation** from the CLI. A session begins when someone attaches.
 
 ## Build and install
 
-`./x` at the repo root is the only supported way to build; it works out which
-host it is on. The build needs the Windows MSVC toolchain even when the source
-lives in WSL.
+`./x` at the repo root is the only supported way to build.
 
 ```bash
 ./x test              # cargo test
@@ -76,36 +175,29 @@ lives in WSL.
 ./x clippy            # anything else is passed through to cargo
 ```
 
-Run it from the repo folder. When the repo is on the WSL share, either shell
-works — from WSL, or from Git Bash at the `//wsl.localhost/...` path — and
-both keep `target/` in the Windows home so they share one build cache.
-
-Do not run `cargo` directly against a repo on the WSL share: the 9p share has
-no file locks, and `//wsl.localhost/...` object paths reach `link.exe`, which
-reads the leading `/` as an option and fails with *LNK1561: entry point must
-be defined*. That failure means `cargo` was used instead of `./x`.
+Run it from the repo folder, in WSL or in Git Bash; when the repo is on the
+WSL share both work and share one build cache. Do not run `cargo` directly
+against a repo on that share: `target/` would land on 9p, which has no file
+locks, and `//wsl.localhost/...` object paths reach `link.exe`, which reads
+the leading `/` as an option and fails with *LNK1561: entry point must be
+defined*.
 
 `install` copies **both** binaries, because the client starts the daemon by
-looking next to itself. It refuses to run while any `zmux` process is alive,
-because Windows will not replace a running `.exe`, and it prints the sessions
-to end. Report that list to the user and let them decide — do not kill their
-sessions to unblock a build.
+looking next to itself. It refuses while any `zmux` process is alive —
+Windows will not replace a running `.exe` — and prints the sessions to end.
+Report that list to the user; do not kill their sessions to unblock a build.
 
-## What zmux cannot do
+## Failure modes worth recognising
 
-Say so plainly rather than inventing a command:
-
-- **No control CLI.** Splitting, focusing, resizing, switching windows and
-  scrolling exist only as `C-b` keystrokes handled inside an attached client.
-  There is no `zmux split`, `zmux send-keys`, or equivalent.
-- **No output capture.** Nothing reads a pane's screen or scrollback from
-  outside. The daemon composites frames for attached clients only.
-- **No agent awareness.** zmux does not detect, name or track what runs in
-  a pane. `ZMUX_SESSION` is the whole of the introspection surface.
-- **No remote.** One machine, named pipes, no SSH.
-
-If a task needs a background process, run it as a background process. Do not
-try to drive zmux as a job runner; it is a terminal for a human to type in.
+- **"the daemon ... did not answer ... probably an older build"** — the
+  session predates the control connection (protocol v5). It must be killed and
+  started again; a running daemon cannot be upgraded in place.
+- **"protocol mismatch"** on attach — same cause, reported by the client.
+- **Blank panes** — started from WSL or another non-console host. zmux needs
+  a real Windows console, which the Git Bash window provides.
+- **"Access is denied" during a copy** — a `zmux` process is holding the
+  `.exe`.
+- **"no such session"** — `zmux attach` never creates. That is deliberate.
 
 ## Where state lives
 
@@ -115,16 +207,5 @@ try to drive zmux as a job runner; it is a terminal for a human to type in.
 | `%APPDATA%\zmux\session-<name>.json` | saved layout and per-pane directories |
 | `\\.\pipe\zmux-<sid>-<session>` | the live session, for exactly as long as the daemon runs |
 
-A config change takes effect for a session only after that session is killed
-and started again. `prefix` is the exception: the client reads it, so a new
-`zmux` picks it up.
-
-## Failure modes worth recognising
-
-- **"protocol mismatch"** — a daemon from an older build still serves that
-  session. It names the session; `zmux kill` it and attach again.
-- **Blank panes** — started from WSL or another non-console host. zmux needs
-  a real Windows console, which the Git Bash window provides.
-- **"Access is denied" during a copy** — a `zmux` process is holding the
-  `.exe`. `zmux ls`, then end those sessions.
-- **"no such session"** — `zmux attach` never creates. That is deliberate.
+A config change takes effect for a session only after it is killed and started
+again. `prefix` is the exception: the client reads it at startup.
