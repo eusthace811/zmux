@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 173 tests passing, clippy clean.
+Phases 0–6 complete. 184 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -72,8 +72,9 @@ goes quiet, instead of sleeping and hoping.
 | `C-b <arrow>` | move focus |
 | `C-b C-<arrow>` | resize |
 | `C-b [` | scroll mode (`q`/`Esc` to leave) |
+| `C-b m` | cycle who owns the mouse: auto / zmux / the terminal |
 | `C-b C-b` | send a literal `Ctrl-b` |
-| mouse | click focuses, wheel scrolls |
+| mouse | goes to the program that asked for it, else clicks focus and the wheel scrolls |
 
 ## Layout
 
@@ -84,6 +85,7 @@ goes quiet, instead of sleeping and hoping.
 | `src/pty.rs` | ConPTY via `portable-pty`; Git Bash fingerprint; reader thread; explicit teardown. |
 | `src/term.rs` | `vt100` + **terminal query responder** + scrollback + what each pane is running (OSC 133/633). |
 | `src/layout.rs` | BSP tiling tree. |
+| `src/mouse.rs` | One mouse event → the bytes the program in that pane asked for. |
 | `src/windows.rs` | Several layouts per session. A window **is** a `Layout`. |
 | `src/render.rs` | vt100 cells → composited `Frame` → ratatui `Buffer`. |
 | `src/session.rs` | Owns panes, layout and clients. Outlives any connection. |

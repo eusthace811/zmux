@@ -18,7 +18,8 @@ use anyhow::{bail, Result};
 use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::windows::{Closed, Windows};
 use crate::protocol::{
-    clamp_size, Frame, PaneInfo, ServerMsg, SessionInfo, MAX_INPUT_BYTES, MAX_PANES,
+    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, ServerMsg, SessionInfo, MAX_INPUT_BYTES,
+    MAX_PANES,
 };
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
@@ -731,6 +732,72 @@ impl Session {
         };
         if moved {
             self.revision.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Deliver a mouse event.
+    ///
+    /// The pane under the POINTER decides, not the focused one. If the
+    /// program running there asked for the mouse it gets the event, in its
+    /// own coordinates, and zmux does nothing else with it - a click inside
+    /// vim is vim's business, including the click that would otherwise have
+    /// moved focus. Otherwise zmux falls back to what it has always done
+    /// with a click and a wheel.
+    ///
+    /// True when the composited screen changed as a result. A program that
+    /// took the event will redraw itself, so that path reports false and the
+    /// frame follows from its output.
+    pub fn mouse(&self, ev: MouseIn) -> bool {
+        if self.forward_mouse(ev) {
+            return true;
+        }
+        match ev.kind {
+            MouseKind::Press(0) => self.focus_at(ev.x, ev.y),
+            MouseKind::WheelUp => {
+                self.scroll_focused(Some(1));
+                true
+            }
+            MouseKind::WheelDown => {
+                self.scroll_focused(Some(-1));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Hand the event to the program under the pointer, if it wants it.
+    ///
+    /// False means nobody took it. The pty write happens with every lock
+    /// released, like `write_focused`: a pane whose reader has stopped
+    /// draining must not stall the session for everyone else.
+    fn forward_mouse(&self, ev: MouseIn) -> bool {
+        let (cols, rows) = self.size();
+        let area = self.area(cols, rows);
+        let Some((id, rect)) = lock(&self.windows).current().pane_rect_at(area, ev.x, ev.y)
+        else {
+            return false;
+        };
+        let out = {
+            let panes = lock(&self.panes);
+            let Some(p) = panes.get(&id) else { return false };
+            let pty = Arc::clone(&p.pty);
+            let t = lock(&p.term);
+            let screen = t.parser.screen();
+            crate::mouse::encode(
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+                ev,
+                ev.x - rect.x,
+                ev.y - rect.y,
+            )
+            .map(|bytes| (pty, bytes))
+        };
+        match out {
+            Some((pty, bytes)) => {
+                let _ = pty.write_input(&bytes);
+                true
+            }
+            None => false,
         }
     }
 

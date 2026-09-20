@@ -361,7 +361,15 @@ pub fn frame_from_screen(screen: &vt100::Screen) -> Frame {
         let (r, c) = screen.cursor_position();
         Some((c, r))
     };
-    Frame { cols, rows, cells, cursor, app_cursor: screen.application_cursor(), revision: 0 }
+    Frame {
+        cols,
+        rows,
+        cells,
+        cursor,
+        app_cursor: screen.application_cursor(),
+        mouse: screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+        revision: 0,
+    }
 }
 
 /// Paint a Frame into a ratatui Buffer at an offset.
@@ -516,8 +524,11 @@ pub fn composite(
             blit(&mut out, &f, *rect);
             if *id == focus {
                 // Key encoding follows the FOCUSED pane's mode - that is the
-                // pane the keystrokes will reach.
+                // pane the keystrokes will reach. So does whether the client
+                // should hold the mouse: a program in a pane you are not on
+                // is not a reason to take selection away from you.
                 out.app_cursor = f.app_cursor;
+                out.mouse = f.mouse;
                 if let Some((cx, cy)) = f.cursor {
                     if cx < rect.w && cy < rect.h {
                         cursor = Some((rect.x + cx, rect.y + cy));

@@ -123,6 +123,7 @@ fn a_delta_against_an_unknown_base_is_refused() {
         rows_changed: vec![(0, vec![Default::default(); 10])],
         cursor: None,
         app_cursor: false,
+        mouse: false,
     };
     assert!(!f.apply_delta(&bogus), "applied a delta with the wrong base");
     assert_eq!(f.revision, 7, "a refused delta must not mutate the frame");
@@ -142,6 +143,7 @@ fn a_delta_with_mismatched_geometry_is_refused() {
         rows_changed: vec![(0, vec![Default::default(); 20])],
         cursor: None,
         app_cursor: false,
+        mouse: false,
     };
     assert!(!f.apply_delta(&wrong));
 }

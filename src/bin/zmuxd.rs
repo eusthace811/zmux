@@ -529,6 +529,11 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                         }
                         session.publish();
                     }
+                    ClientMsg::Mouse(ev) => {
+                        if session.mouse(ev) {
+                            session.publish();
+                        }
+                    }
                     ClientMsg::Click { x, y } => {
                         if session.focus_at(x, y) {
                             session.publish();

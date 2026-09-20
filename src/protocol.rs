@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 /// enum variant, a new field changes the encoding for every existing reader.
 /// The handshake already refuses a mismatch with instructions, which is why
 /// this costs a version rather than a corrupt frame.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// v7 added `Frame::mouse` and `FrameDelta::mouse` - the same kind of struct
+/// change - and `ClientMsg::Mouse`, which is only an appended variant.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -64,6 +66,11 @@ pub enum ClientMsg {
     /// A pane-management command, issued after the client's prefix key.
     Command(Cmd),
     /// Mouse click at a screen position: focus the pane under it.
+    ///
+    /// Superseded by `Mouse`, which can also reach a program that wants the
+    /// mouse for itself. Nothing sends this any more; the daemon still
+    /// answers it because variants are append-only and removing it would
+    /// renumber every one below.
     Click { x: u16, y: u16 },
     // --- appended. Append-only. ---
     /// Open a CONTROL connection instead of attaching a terminal.
@@ -85,6 +92,12 @@ pub enum ClientMsg {
     /// moving focus - the caller's reason for existing is to work in the
     /// background while somebody else uses the session.
     InputTo { pane: u8, data: Vec<u8> },
+    // --- appended. Append-only. ---
+    /// The mouse did something, in screen coordinates.
+    ///
+    /// Supersedes `Click`, which could only say "focus what is here" and so
+    /// could never reach a program that wanted the mouse for itself.
+    Mouse(MouseIn),
 }
 
 /// What a control connection can ask for. Append-only.
@@ -147,6 +160,41 @@ pub struct PaneInfo {
     pub busy: bool,
     /// Exit status of the last finished command.
     pub last_exit: Option<i32>,
+}
+
+/// A mouse event, in SCREEN coordinates.
+///
+/// The client knows where the pointer is; only the daemon knows which pane
+/// that lands in, and what the program inside that pane has asked to be told.
+/// So the raw event travels and the daemon decides - the mirror of
+/// `Frame::app_cursor`, which travels the other way for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseIn {
+    pub x: u16,
+    pub y: u16,
+    pub kind: MouseKind,
+    /// `MOUSE_SHIFT`, `MOUSE_ALT`, `MOUSE_CTRL`.
+    pub mods: u8,
+}
+
+pub const MOUSE_SHIFT: u8 = 1;
+pub const MOUSE_ALT: u8 = 2;
+pub const MOUSE_CTRL: u8 = 4;
+
+/// What the mouse did. Append-only, like every other enum here.
+///
+/// The button is xterm's numbering - 0 left, 1 middle, 2 right - because that
+/// is what goes on the wire to the program in the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseKind {
+    Press(u8),
+    Release(u8),
+    /// Moved with a button held.
+    Drag(u8),
+    /// Moved with no button held.
+    Move,
+    WheelUp,
+    WheelDown,
 }
 
 /// Pane management. Append-only, like everything else on this wire.
@@ -222,6 +270,8 @@ pub struct FrameDelta {
     pub rows_changed: Vec<(u16, Vec<Cell>)>,
     pub cursor: Option<(u16, u16)>,
     pub app_cursor: bool,
+    /// Whether the focused pane's program wants the mouse. See `Frame`.
+    pub mouse: bool,
 }
 
 impl Frame {
@@ -258,6 +308,7 @@ impl Frame {
             rows_changed,
             cursor: self.cursor,
             app_cursor: self.app_cursor,
+            mouse: self.mouse,
         })
     }
 
@@ -289,6 +340,7 @@ impl Frame {
         }
         self.cursor = d.cursor;
         self.app_cursor = d.app_cursor;
+        self.mouse = d.mouse;
         self.revision = d.revision;
         true
     }
@@ -334,6 +386,12 @@ pub struct Frame {
     /// so it has to travel. Without it arrows are wrong in vim and in
     /// readline's vi mode.
     pub app_cursor: bool,
+    /// Whether the focused pane's program has asked for the mouse.
+    ///
+    /// Travels for the same reason as `app_cursor`: only the daemon's vt100
+    /// state knows, and only the CLIENT can act on it, by handing the host
+    /// terminal's mouse over or taking it back.
+    pub mouse: bool,
     /// Monotonic session revision this frame was composed at.
     ///
     /// Arrival order is not trustworthy: a queued broadcast can be delivered
@@ -351,6 +409,7 @@ impl Frame {
             cells: vec![Cell::default(); cols as usize * rows as usize],
             cursor: None,
             app_cursor: false,
+            mouse: false,
             revision: 0,
         }
     }

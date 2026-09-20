@@ -133,7 +133,7 @@ In a session (Ctrl-b is the prefix):
   C-b c          new window          C-b n / C-b p  next / previous window
   C-b 0..9       jump to that window (the numbers in the status bar)
   C-b [          scroll history      C-b PageUp     scroll back a page
-  C-b m          give the mouse to the terminal, so you can select text
+  C-b m          cycle who owns the mouse (auto / zmux / the terminal)
   C-b C-b        send a literal Ctrl-b";
 
 /// The names `zmux send` accepts, printed when it is given none.
@@ -475,7 +475,10 @@ fn attach(session: String) -> Result<()> {
     }
 
     let mut mouse = cfg.mouse;
-    let _guard = TermGuard::enter(mouse.captures())?;
+    // Nothing has drawn yet, so nothing can be asking for the mouse. `Auto`
+    // starts off and turns itself on with the first frame that wants it.
+    let mut capturing = mouse.captures(false);
+    let _guard = TermGuard::enter(capturing)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     // Frames arrive on their own thread; the main loop owns input and drawing.
@@ -513,7 +516,7 @@ fn attach(session: String) -> Result<()> {
                         break;
                     }
                     Prefix::Scroll => {
-                        if !scroll_mode(&mut stream)? {
+                        if !scroll_mode(&mut stream, capturing)? {
                             drop(_guard);
                             eprintln!("lost connection to the daemon");
                             return Ok(());
@@ -521,7 +524,6 @@ fn attach(session: String) -> Result<()> {
                     }
                     Prefix::MouseToggle => {
                         mouse = mouse.toggled();
-                        set_mouse_capture(mouse.captures())?;
                     }
                     Prefix::Command(cmd) => {
                         ipc::write_msg(&mut stream, &ClientMsg::Command(cmd))?;
@@ -540,19 +542,15 @@ fn attach(session: String) -> Result<()> {
                         ipc::write_msg(&mut stream, &ClientMsg::Input { data: bytes })?;
                     }
                 }
-                Event::Mouse(m) => match m.kind {
-                    event::MouseEventKind::Down(event::MouseButton::Left) => {
-                        ipc::write_msg(&mut stream, &ClientMsg::Click { x: m.column, y: m.row })?;
+                // Every mouse event goes to the daemon as it happened. Only
+                // the daemon knows which pane the pointer is over and what
+                // the program there asked for, so it - not the client -
+                // decides between feeding that program and focusing a pane.
+                Event::Mouse(m) => {
+                    if let Some(ev) = mouse_event(m) {
+                        ipc::write_msg(&mut stream, &ClientMsg::Mouse(ev))?;
                     }
-                    // Wheel scrolls history directly - no mode to enter.
-                    event::MouseEventKind::ScrollUp => {
-                        ipc::write_msg(&mut stream, &ClientMsg::Command(Cmd::ScrollUp))?;
-                    }
-                    event::MouseEventKind::ScrollDown => {
-                        ipc::write_msg(&mut stream, &ClientMsg::Command(Cmd::ScrollDown))?;
-                    }
-                    _ => {}
-                },
+                }
                 Event::Resize(c, r) => {
                     ipc::write_msg(&mut stream, &ClientMsg::Resize { cols: c, rows: r })?;
                 }
@@ -606,6 +604,16 @@ fn attach(session: String) -> Result<()> {
             }
         }
 
+        // Who should have the mouse now. Checked once a tick rather than on
+        // every frame: the answer only changes when a program starts or stops
+        // asking, and telling the terminal the same thing repeatedly costs a
+        // write to stdout each time.
+        let want = mouse.captures(latest.as_ref().is_some_and(|f| f.mouse));
+        if want != capturing {
+            set_mouse_capture(want)?;
+            capturing = want;
+        }
+
         if let Some(f) = &latest {
             // ratatui diffs against its own previous buffer and emits only the
             // changed cells - no hand-written blitter (DESIGN.md §0.4).
@@ -624,6 +632,36 @@ fn attach(session: String) -> Result<()> {
 fn is_prefix(k: &KeyEvent, cfg: &zmux::config::Config) -> bool {
     k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&cfg.prefix))
+}
+
+/// Turn a crossterm mouse event into the wire form.
+///
+/// `None` for the ones nothing downstream can use - horizontal scrolling has
+/// no xterm button number, so there is nothing to forward and nothing zmux
+/// does with it either.
+fn mouse_event(m: event::MouseEvent) -> Option<zmux::protocol::MouseIn> {
+    use zmux::protocol::{MouseKind, MOUSE_ALT, MOUSE_CTRL, MOUSE_SHIFT};
+    // xterm's numbering, which is what these end up as on the way to a
+    // program: left 0, middle 1, right 2.
+    let button = |b| match b {
+        event::MouseButton::Left => 0,
+        event::MouseButton::Middle => 1,
+        event::MouseButton::Right => 2,
+    };
+    let kind = match m.kind {
+        event::MouseEventKind::Down(b) => MouseKind::Press(button(b)),
+        event::MouseEventKind::Up(b) => MouseKind::Release(button(b)),
+        event::MouseEventKind::Drag(b) => MouseKind::Drag(button(b)),
+        event::MouseEventKind::Moved => MouseKind::Move,
+        event::MouseEventKind::ScrollUp => MouseKind::WheelUp,
+        event::MouseEventKind::ScrollDown => MouseKind::WheelDown,
+        event::MouseEventKind::ScrollLeft | event::MouseEventKind::ScrollRight => return None,
+    };
+    let mut mods = 0;
+    if m.modifiers.contains(KeyModifiers::SHIFT) { mods |= MOUSE_SHIFT }
+    if m.modifiers.contains(KeyModifiers::ALT) { mods |= MOUSE_ALT }
+    if m.modifiers.contains(KeyModifiers::CONTROL) { mods |= MOUSE_CTRL }
+    Some(zmux::protocol::MouseIn { x: m.column, y: m.row, kind, mods })
 }
 
 enum Prefix {
@@ -689,7 +727,21 @@ fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
 /// Returns false if the connection died while we were in scroll mode - the
 /// main loop watches the frame channel, but this one has its own input loop
 /// and would otherwise spin forever in raw alternate-screen mode.
-fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<bool> {
+fn scroll_mode(stream: &mut interprocess::local_socket::Stream, had_mouse: bool) -> Result<bool> {
+    // Scroll mode is zmux's own, so zmux takes the mouse for the duration
+    // whatever `mouse` says: a wheel is the obvious way to move through
+    // history, and under `auto` there is no program asking for it here.
+    if !had_mouse {
+        set_mouse_capture(true)?;
+    }
+    let out = scroll_keys(stream);
+    if !had_mouse {
+        set_mouse_capture(false)?;
+    }
+    out
+}
+
+fn scroll_keys(stream: &mut interprocess::local_socket::Stream) -> Result<bool> {
     loop {
         if !event::poll(Duration::from_millis(200))? {
             continue;

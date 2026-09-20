@@ -282,7 +282,16 @@ impl Layout {
 
     /// The pane at a screen position, for click-to-focus.
     pub fn pane_at(&self, area: Rect, x: u16, y: u16) -> Option<PaneId> {
-        self.compute(area).0.into_iter().find(|(_, r)| r.contains(x, y)).map(|(p, _)| p)
+        self.pane_rect_at(area, x, y).map(|(p, _)| p)
+    }
+
+    /// The pane at a screen position AND the rectangle it occupies.
+    ///
+    /// The rectangle is what turns a screen position into one the program
+    /// inside that pane would recognise: it is drawing on its own grid and
+    /// has never heard of the twenty columns to its left.
+    pub fn pane_rect_at(&self, area: Rect, x: u16, y: u16) -> Option<(PaneId, Rect)> {
+        self.compute(area).0.into_iter().find(|(_, r)| r.contains(x, y))
     }
 }
 

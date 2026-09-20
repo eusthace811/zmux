@@ -38,26 +38,38 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mouse {
-    /// zmux takes the mouse: click focuses a pane, the wheel scrolls
-    /// history. Selecting text needs Shift held down.
+    /// Whoever is using it. zmux holds the mouse only while the program in
+    /// the focused pane has asked for it, so vim and lazygit get a mouse and
+    /// a shell prompt leaves you free to select text.
     #[default]
+    Auto,
+    /// zmux takes the mouse always: click focuses a pane, the wheel scrolls
+    /// history. Selecting text needs Shift held down.
     On,
-    /// The terminal keeps the mouse. Selection works as it does in any other
-    /// window; zmux gets no clicks and no wheel.
+    /// The terminal keeps the mouse always. Selection works as it does in any
+    /// other window; nothing inside zmux sees a mouse, programs included.
     Off,
 }
 
 impl Mouse {
     /// Should zmux be reporting mouse events right now?
-    pub fn captures(self) -> bool {
-        self == Mouse::On
+    ///
+    /// `app` is whether the program in the focused pane has asked for the
+    /// mouse - which only `Auto` cares about.
+    pub fn captures(self, app: bool) -> bool {
+        match self {
+            Mouse::Auto => app,
+            Mouse::On => true,
+            Mouse::Off => false,
+        }
     }
 
-    /// What `C-b m` switches to.
+    /// What `C-b m` switches to. Cycles, because there are three of them.
     pub fn toggled(self) -> Self {
         match self {
+            Mouse::Auto => Mouse::On,
             Mouse::On => Mouse::Off,
-            Mouse::Off => Mouse::On,
+            Mouse::Off => Mouse::Auto,
         }
     }
 }
@@ -159,10 +171,12 @@ status_bar = true
 # Who the mouse belongs to. Only one of zmux and the terminal can have it:
 # while zmux is reporting mouse events, dragging out a selection does
 # nothing, because the terminal never sees the drag.
-#   "on"   zmux takes it: click focuses a pane, the wheel scrolls history
-#   "off"  the terminal keeps it, so selection works as it does anywhere else
-# `C-b m` switches between them for the session without editing this file.
-mouse = "on"
+#   "auto"  zmux holds it only while the program in the focused pane has
+#           asked for one, so vim gets a mouse and a shell prompt does not
+#   "on"    zmux takes it: click focuses a pane, the wheel scrolls history
+#   "off"   the terminal keeps it, and nothing inside zmux sees a mouse
+# `C-b m` cycles through them for the session without editing this file.
+mouse = "auto"
 "#;
 
 #[cfg(test)]
@@ -178,20 +192,27 @@ mod tests {
         assert!(c.shell_integration);
     }
 
-    /// The default has to be what shipped before the setting existed, or
-    /// upgrading silently changes what the mouse does.
+    /// Only `Auto` asks what the program wants; the other two have already
+    /// decided, and must not start following a pane that turns mouse
+    /// reporting on.
     #[test]
-    fn the_mouse_starts_where_it_always_was() {
-        assert_eq!(Config::default().mouse, Mouse::On);
-        assert!(Mouse::On.captures());
-        assert!(!Mouse::Off.captures());
+    fn only_auto_follows_the_program() {
+        assert_eq!(Config::default().mouse, Mouse::Auto);
+        for (mode, idle, app) in [
+            (Mouse::Auto, false, true),
+            (Mouse::On, true, true),
+            (Mouse::Off, false, false),
+        ] {
+            assert_eq!(mode.captures(false), idle, "{mode:?} with nothing asking");
+            assert_eq!(mode.captures(true), app, "{mode:?} with a program asking");
+        }
     }
 
     #[test]
     fn the_toggle_gets_you_back_where_you_started() {
-        for m in [Mouse::On, Mouse::Off] {
+        for m in [Mouse::Auto, Mouse::On, Mouse::Off] {
             assert_ne!(m.toggled(), m);
-            assert_eq!(m.toggled().toggled(), m);
+            assert_eq!(m.toggled().toggled().toggled(), m);
         }
     }
 
@@ -199,6 +220,7 @@ mod tests {
     fn the_mouse_setting_is_spelled_the_way_the_comment_says() {
         let c: Config = toml::from_str("mouse = \"off\"").expect("lowercase names");
         assert_eq!(c.mouse, Mouse::Off);
+        assert_eq!(toml::from_str::<Config>("mouse = \"auto\"").unwrap().mouse, Mouse::Auto);
         assert!(toml::from_str::<Config>("mouse = \"sometimes\"").is_err());
     }
 

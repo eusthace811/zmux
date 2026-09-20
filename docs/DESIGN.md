@@ -798,6 +798,20 @@ file.
 client meeting a v3 daemon is refused cleanly rather than failing to decode
 mid-stream.
 
+Appending an enum VARIANT is cheap; adding a struct FIELD is not. `PaneInfo`
+and `Frame` are bincode structs, and bincode does not tag fields, so a new
+field changes the encoding for every existing reader rather than only for the
+ones that use it. 6 (`PaneInfo::command`, `busy`, `last_exit`) and 7
+(`Frame::mouse`, `FrameDelta::mouse`) each cost a version for that reason.
+
+Two things cross the wire only because the two ends know different halves of
+the answer. `Frame::app_cursor` and `Frame::mouse` go daemon → client: only
+the daemon's vt100 state knows what the focused pane's program has asked for,
+and only the client can act on it, by encoding a key or by handing over the
+host terminal's mouse. `ClientMsg::Mouse` goes the other way for the mirror
+reason: only the client knows where the pointer is, and only the daemon knows
+which pane that lands in and what the program there wants.
+
 ### The status bar and the dividers are ours to colour
 
 `render.rs` owns every cell we draw ourselves. The session says what a run of

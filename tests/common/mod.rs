@@ -278,6 +278,31 @@ impl Client {
         None
     }
 
+    /// Wait until the daemon reports that the focused pane's program does
+    /// (or does not) want the mouse.
+    ///
+    /// This is the flag the real client uses to decide whether to hold the
+    /// host terminal's mouse, so a test that asserts on it is asserting on
+    /// exactly what a user would see happen.
+    pub fn wait_for_mouse(&mut self, secs: u64, want: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if self.frame.as_ref().is_some_and(|f| f.mouse == want) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            match self.rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(msg) => {
+                    self.absorb(msg);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+
     /// The most recent screen, after letting updates settle.
     ///
     /// Drains everything currently queued rather than returning the first
