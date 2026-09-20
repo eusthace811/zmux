@@ -221,22 +221,16 @@ impl Client {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(secs);
-        let mut last = String::new();
         while Instant::now() < deadline {
             match self.rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(msg) => {
-                    if let Some(screen) = self.absorb(msg) {
-                        last = screen;
-                        if pred(&last) {
-                            return Some(last);
-                        }
-                    }
-                }
+                Ok(msg) => match self.absorb(msg) {
+                    Some(screen) if pred(&screen) => return Some(screen),
+                    _ => {}
+                },
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        let _ = last;
         None
     }
 

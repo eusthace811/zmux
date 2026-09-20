@@ -207,7 +207,10 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<bool> {
     let mut filled = 0;
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {
-            Ok(0) => return Ok(filled != 0 && { bail!("eof mid-frame") }),
+            // Clean EOF only counts at a message boundary; halfway through a
+            // length prefix or a payload it is a truncated frame.
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => bail!("eof mid-frame"),
             Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e.into()),

@@ -915,11 +915,6 @@ impl Session {
         cs.retain(|c| !c.lagged);
     }
 
-    /// Stop the session: tell clients, then tear every ConPTY down cleanly.
-    ///
-    /// Explicit teardown matters on Windows - closing a pseudoconsole without
-    /// draining it can hang (DESIGN.md §2.5), and `process::exit` would skip
-    /// this entirely.
     /// Recompute viewport size if a broadcast dropped a client.
     pub fn settle_size(&self) {
         if self.size_dirty.swap(false, Ordering::Relaxed) {
@@ -927,6 +922,11 @@ impl Session {
         }
     }
 
+    /// Stop the session: tell clients, then tear every ConPTY down cleanly.
+    ///
+    /// Explicit teardown matters on Windows - closing a pseudoconsole without
+    /// draining it can hang (DESIGN.md §2.5), and `process::exit` would skip
+    /// this entirely.
     pub fn shutdown(&self) {
         if !self.running.swap(false, Ordering::Relaxed) {
             return; // already shutting down

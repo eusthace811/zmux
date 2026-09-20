@@ -135,13 +135,35 @@ fn take_pane(args: &[String]) -> Result<(Option<u8>, &[String])> {
     }
 }
 
+/// `capture`'s flags: `-p N` and `-n LINES`, in either order.
+///
+/// An argument that is neither is an ERROR rather than something to skip.
+/// Reading only a LEADING `-p` meant `capture s -n 20 -p 2` quietly dropped
+/// the `-p` and answered with the focused pane - the same silent wrong answer
+/// that an out-of-range position is refused to avoid.
+fn capture_args(args: &[String]) -> Result<(Option<u8>, u16)> {
+    const USAGE: &str = "usage: zmux capture <session> [-p N] [-n LINES]";
+    let (mut pane, mut lines) = (None, 0u16);
+    let mut rest = args;
+    while let Some(flag) = rest.first().map(String::as_str) {
+        let value = rest.get(1).with_context(|| format!("{flag} needs a number\n{USAGE}"))?;
+        match flag {
+            "-p" | "--pane" => pane = Some(value.parse().context(USAGE)?),
+            "-n" | "--lines" => lines = value.parse().context(USAGE)?,
+            other => bail!("unexpected argument '{other}'\n{USAGE}"),
+        }
+        rest = &rest[2..];
+    }
+    Ok((pane, lines))
+}
+
 /// Backslash escapes, so control keys are reachable without a key-name
 /// vocabulary: `\x03` is Ctrl-C, `\e` Escape, `\r` Enter. An unknown escape
 /// is left alone rather than swallowed - a Windows path typed as an argument
 /// is full of backslashes and none of them mean anything here.
 fn unescape(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
-    let mut it = s.bytes().peekable();
+    let mut it = s.bytes();
     while let Some(b) = it.next() {
         if b != b'\\' {
             out.push(b);
@@ -154,12 +176,15 @@ fn unescape(s: &str) -> Vec<u8> {
             Some(b'e') => out.push(0x1b),
             Some(b'\\') => out.push(b'\\'),
             Some(b'x') => {
+                // Look ahead by CLONING the iterator. A `Peekable` cannot see
+                // the second digit - peeking twice returned the first one
+                // twice, so `\x03` sent NUL, `\x1b` sent 0x11, and Ctrl-C
+                // never reached a pane. Consume only once both digits match.
                 let hex: String =
-                    (0..2).filter_map(|_| it.peek().copied()).map(char::from).collect();
+                    it.clone().take(2).map(char::from).filter(char::is_ascii_hexdigit).collect();
                 match u8::from_str_radix(&hex, 16) {
                     Ok(v) if hex.len() == 2 => {
-                        it.next();
-                        it.next();
+                        it.nth(1);
                         out.push(v);
                     }
                     _ => out.extend_from_slice(b"\\x"),
@@ -262,9 +287,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some("info") => {
-            let info = request(&session_arg(&args, "info")?, &ClientMsg::Query(Query::Info))?;
-            let ServerMsg::Info(info) = info else { bail!("unexpected reply: {info:?}") };
-            println!("{}", serde_json::to_string_pretty(&info)?);
+            print_info(request(&session_arg(&args, "info")?, &ClientMsg::Query(Query::Info))?)?;
             return Ok(());
         }
         Some("send") => {
@@ -279,7 +302,7 @@ fn main() -> Result<()> {
         }
         Some("keys" | "run") => {
             let enter = args[0] == "run";
-            let session = session_arg(&args, &args[0].clone())?;
+            let session = session_arg(&args, &args[0])?;
             let (pane, rest) = take_pane(&args[2..])?;
             if rest.is_empty() {
                 bail!("usage: zmux {} <session> [-p N] <text>", args[0]);
@@ -297,14 +320,7 @@ fn main() -> Result<()> {
         }
         Some("capture") => {
             let session = session_arg(&args, "capture")?;
-            let (pane, rest) = take_pane(&args[2..])?;
-            let lines = match rest.first().map(String::as_str) {
-                Some("-n" | "--lines") => rest
-                    .get(1)
-                    .and_then(|v| v.parse().ok())
-                    .context("usage: zmux capture <session> [-p N] [-n LINES]")?,
-                _ => 0,
-            };
+            let (pane, lines) = capture_args(&args[2..])?;
             let reply = request(&session, &ClientMsg::Query(Query::Capture { pane, lines }))?;
             let ServerMsg::Capture { text } = reply else { bail!("unexpected reply: {reply:?}") };
             println!("{text}");
@@ -607,5 +623,116 @@ fn scroll_mode(stream: &mut interprocess::local_socket::Stream) -> Result<bool> 
         if ipc::write_msg(stream, &ClientMsg::Command(cmd)).is_err() {
             return Ok(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The escapes the skill file promises. `\x03` is the one that matters:
+    /// it is how a caller interrupts whatever is running in a pane, and it
+    /// used to arrive as NUL, which a shell ignores - so "send Ctrl-C" did
+    /// nothing at all and said it had worked.
+    #[test]
+    fn hex_escapes_decode_both_digits() {
+        assert_eq!(unescape(r"\x03"), vec![0x03]);
+        assert_eq!(unescape(r"\x1b"), vec![0x1b]);
+        assert_eq!(unescape(r"\x41"), b"A".to_vec());
+        assert_eq!(unescape(r"a\x03b"), vec![b'a', 0x03, b'b']);
+        assert_eq!(unescape(r"\xff"), vec![0xff]);
+    }
+
+    #[test]
+    fn the_named_escapes_are_the_control_bytes_they_name() {
+        assert_eq!(unescape(r"\r\n\t\e"), vec![b'\r', b'\n', b'\t', 0x1b]);
+        assert_eq!(unescape(r"\\"), vec![b'\\']);
+    }
+
+    /// A Windows path is mostly backslashes and none of them are escapes.
+    /// Swallowing them would silently retype the argument as something else.
+    #[test]
+    fn an_unknown_escape_is_left_alone() {
+        assert_eq!(unescape(r"C:\Users\dev"), b"C:\\Users\\dev".to_vec());
+        // Including `\x` without two hex digits after it.
+        assert_eq!(unescape(r"\xzz"), b"\\xzz".to_vec());
+        assert_eq!(unescape(r"\x4z"), b"\\x4z".to_vec());
+        assert_eq!(unescape(r"\x"), b"\\x".to_vec());
+        assert_eq!(unescape(r"ends\"), b"ends\\".to_vec());
+    }
+
+    /// `+3` parses as 3 for `from_str_radix`, so the digits are checked
+    /// rather than trusted: `\x+3` is not a byte, it is text.
+    #[test]
+    fn a_sign_is_not_a_hex_digit() {
+        assert_eq!(unescape(r"\x+3"), b"\\x+3".to_vec());
+    }
+
+    #[test]
+    fn a_pane_flag_is_taken_only_from_the_front() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let args = a(&["-p", "2", "cargo", "test"]);
+        let (pane, rest) = take_pane(&args).unwrap();
+        assert_eq!(pane, Some(2));
+        assert_eq!(rest, &args[2..]);
+
+        // No flag: every argument is text, and nothing is consumed.
+        let args = a(&["cargo", "test"]);
+        let (pane, rest) = take_pane(&args).unwrap();
+        assert_eq!(pane, None);
+        assert_eq!(rest, &args[..]);
+
+        // A flag with no number is an error, not a silently ignored flag -
+        // otherwise `-p` alone would type "-p" into the focused pane.
+        assert!(take_pane(&a(&["-p"])).is_err());
+        assert!(take_pane(&a(&["-p", "x"])).is_err());
+        // Beyond a u8 there is no such pane anyway (MAX_PANES is 64).
+        assert!(take_pane(&a(&["-p", "300"])).is_err());
+    }
+
+    #[test]
+    fn capture_takes_its_flags_in_either_order() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(capture_args(&a(&[])).unwrap(), (None, 0));
+        assert_eq!(capture_args(&a(&["-p", "2"])).unwrap(), (Some(2), 0));
+        assert_eq!(capture_args(&a(&["-n", "20"])).unwrap(), (None, 20));
+        assert_eq!(capture_args(&a(&["-p", "2", "-n", "20"])).unwrap(), (Some(2), 20));
+        // The order that used to lose the pane silently.
+        assert_eq!(capture_args(&a(&["-n", "20", "-p", "2"])).unwrap(), (Some(2), 20));
+        assert_eq!(capture_args(&a(&["--pane", "3", "--lines", "5"])).unwrap(), (Some(3), 5));
+    }
+
+    /// Answering with the WRONG pane is worse than answering with an error,
+    /// so anything not understood stops the command.
+    #[test]
+    fn capture_refuses_an_argument_it_would_otherwise_ignore() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let e = capture_args(&a(&["-p", "2", "extra"])).unwrap_err().to_string();
+        assert!(e.contains("extra"), "{e}");
+        assert!(capture_args(&a(&["-p"])).is_err(), "a flag with no value must not pass");
+        assert!(capture_args(&a(&["-n", "lots"])).is_err());
+        assert!(capture_args(&a(&["-p", "300"])).is_err(), "no pane is beyond a u8");
+    }
+
+    /// Every name the CLI prints in its own help must resolve to a command.
+    /// The list and the parser used to be able to drift apart.
+    #[test]
+    fn every_advertised_command_name_parses() {
+        let names: Vec<&str> = CMD_NAMES
+            .lines()
+            .skip(1)
+            .flat_map(str::split_whitespace)
+            .filter(|w| !w.starts_with('<'))
+            .collect();
+        assert!(names.len() >= 19, "the list looks empty: {names:?}");
+        for n in names {
+            assert!(parse_cmd(n, Some("0")).is_some(), "`send` advertises '{n}' but cannot parse it");
+        }
+        assert!(parse_cmd("no-such-command", None).is_none());
+        // `select-window` needs its index; without one it is not a command.
+        assert!(parse_cmd("select-window", None).is_none());
     }
 }

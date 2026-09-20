@@ -64,7 +64,10 @@ pub enum ClientMsg {
     /// shrink the session to a size it invented, and would hold the idle
     /// timer open for as long as it stayed connected.
     ///
-    /// Afterwards every message gets exactly one reply.
+    /// Afterwards every message gets exactly one reply, except `Detach` and
+    /// `Shutdown`, which end the connection - `Shutdown` after a final
+    /// `ShuttingDown`, `Detach` immediately, because there is nothing left to
+    /// say to a peer that is leaving.
     Control { version: u32 },
     /// Read session state or pane text. Control connections only.
     Query(Query),

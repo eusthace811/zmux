@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 146 tests passing, clippy clean.
+Phases 0–6 complete. 154 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -38,6 +38,24 @@ zmux kill work          terminate a session
 zmux config             write a commented default config, print its path
 ```
 
+A session can also be driven **without attaching**, which is what a script or
+a coding agent uses. These return immediately instead of taking over the
+terminal:
+
+```
+zmux info work                      layout, windows and focus, as JSON
+zmux send work split-v              any keybinding, by name
+zmux run  work -p 2 "cargo test"    type it into pane 2 and press Enter
+zmux keys work -p 2 "text"          type it, no Enter
+zmux capture work -p 2 -n 20        that pane's last 20 visible lines
+```
+
+`-p N` is a pane's position in the current window and does **not** move the
+focus, so a script can work in one pane while someone types in another. Every
+mutation answers with the resulting `info`, so a caller learns where its new
+pane landed without a second, racy query. `zmux --skill` prints the whole
+agent-facing contract.
+
 | Key | |
 | --- | --- |
 | `C-b d` | detach (the session keeps running) |
@@ -67,6 +85,8 @@ zmux config             write a commented default config, print its path
 | `src/persist.rs` | Layout + cwd to `%APPDATA%`. |
 | `src/cwd.rs` | OSC 7 parsing and the bash integration snippet. |
 | `src/config.rs` | `config.toml`. |
+| `src/keys.rs` | Key events → xterm byte sequences, including application cursor mode. |
+| `src/harden.rs` | `SetDefaultDllDirectories`, before anything can `LoadLibrary`. |
 
 Everything outside `src/`:
 

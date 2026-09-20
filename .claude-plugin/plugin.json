@@ -5,7 +5,7 @@
   "author": {
     "name": "zmux"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "keywords": ["zmux", "terminal", "multiplexer", "panes", "windows", "git-bash", "cli", "ai-agent"],
   "skills": ["./skills/zmux"]
 }
