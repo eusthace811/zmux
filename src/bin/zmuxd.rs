@@ -219,8 +219,17 @@ fn apply(session: &Arc<Session>, cmd: Cmd) {
 }
 
 fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) -> Result<()> {
-    let (cols, rows) = match ipc::read_msg::<_, ClientMsg>(&mut stream)? {
-        Some(ClientMsg::Hello { version, cols, rows }) => {
+    // A probe connects, learns the session is alive and closes without saying
+    // anything - `zmux ls` and every `is_running` check does exactly that.
+    // Propagating those filled the daemon's log with "connection ended: the
+    // pipe is being closed", dozens of lines per run, which buries anything
+    // that actually went wrong. A peer that says nothing is not an error.
+    let first = match ipc::read_msg::<_, ClientMsg>(&mut stream) {
+        Ok(Some(msg)) => msg,
+        Ok(None) | Err(_) => return Ok(()),
+    };
+    let (cols, rows) = match first {
+        ClientMsg::Hello { version, cols, rows } => {
             if version != PROTOCOL_VERSION {
                 // Say what to DO about it. The common cause by far is an
                 // upgraded binary meeting a session still served by the daemon
@@ -238,7 +247,7 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
             }
             (cols, rows)
         }
-        Some(ClientMsg::Shutdown) => {
+        ClientMsg::Shutdown => {
             let _ = ipc::write_msg(&mut stream, &ServerMsg::ShuttingDown);
             session.shutdown();
             // Unblock the accept loop so main() can run its clean teardown.

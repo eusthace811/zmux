@@ -162,8 +162,7 @@ fn draw_status(dst: &mut Frame, text: &str) {
 }
 
 /// Mark the focused pane so it is obvious which one takes input.
-fn highlight_focus(dst: &mut Frame, dividers: &[Divider], focus: LRect) {
-    let _ = dividers;
+fn highlight_focus(dst: &mut Frame, focus: LRect) {
     // A bold top-left corner marker is cheap and does not steal a row.
     if focus.w > 0 && focus.h > 0 {
         let idx = focus.y as usize * dst.cols as usize + focus.x as usize;
@@ -213,7 +212,7 @@ pub fn composite(
     }
     draw_dividers(&mut out, &dividers);
     if let Some((_, r)) = panes.iter().find(|(p, _)| *p == focus) {
-        highlight_focus(&mut out, &dividers, *r);
+        highlight_focus(&mut out, *r);
     }
     if let Some(text) = status {
         draw_status(&mut out, text);
