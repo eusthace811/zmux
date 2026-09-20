@@ -206,4 +206,50 @@ fn a_control_command_refuses_a_session_whose_name_only_collides() {
     assert!(!bad.status.success(), "a colliding name was accepted: {bad:?}");
     let err = String::from_utf8_lossy(&bad.stderr);
     assert!(err.contains("collide"), "unhelpful error: {err}");
+
+    // `kill` most of all: being wrong there ends every shell in somebody
+    // else's session, and `Shutdown` is acted on before any handshake, so it
+    // has to ask the name first.
+    let bad = std::process::Command::new(zmux)
+        .args(["kill", &collided])
+        .output()
+        .expect("run zmux kill");
+    assert!(!bad.status.success(), "kill accepted a colliding name: {bad:?}");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("collide"),
+        "unhelpful error: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(
+        zmux::ipc::is_running(&d.session),
+        "the session was killed by a name that only collides with it"
+    );
+}
+
+/// A command that could not be carried out must SAY so. An attached human
+/// sees that nothing happened; a script cannot, and one told its split
+/// succeeded goes on to type into a pane that was never created - the same
+/// wrong-shell accident an out-of-range `-p` is refused to avoid.
+#[test]
+fn a_command_that_cannot_be_carried_out_is_refused_not_reported_as_done() {
+    let d = Daemon::start("zmux-test-ctl-refused");
+    let mut c = Control::open(&d.session);
+
+    // The session's last pane has nowhere to go.
+    let reply = c.ask(&ClientMsg::Command(Cmd::ClosePane));
+    let ServerMsg::Refused { reason } = reply else { panic!("expected Refused, got {reply:?}") };
+    assert!(reason.contains("last pane"), "unhelpful reason: {reason}");
+    assert_eq!(c.info().panes.len(), 1, "the pane went anyway");
+
+    // A viewport too narrow for two panes cannot be divided. Attaching a
+    // client is what sets the session size; 16 columns is below MIN_COLS*2+1.
+    let mut tiny = d.attach(16, 6);
+    assert!(tiny.wait_for(20, |t| !t.trim().is_empty()).is_some(), "no frame arrived");
+
+    let reply = c.ask(&ClientMsg::Command(Cmd::SplitHorizontal));
+    let ServerMsg::Refused { reason } = reply else {
+        panic!("a split that cannot fit was reported as done: {reply:?}")
+    };
+    assert!(reason.contains("split refused"), "unhelpful reason: {reason}");
+    assert_eq!(c.info().panes.len(), 1, "a pane was created anyway");
 }

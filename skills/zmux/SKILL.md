@@ -90,6 +90,10 @@ Every mutation replies with the resulting `info`, so one call tells you where
 the new pane landed — read `focus` from that reply instead of querying again
 and racing the user.
 
+A command that could **not** be carried out is an error, not a reply with an
+unchanged `info`: a split with no room for another pane, or `close` on the
+session's last one. Check the exit status rather than diffing the layout.
+
 That reply is a snapshot taken right after the command, not a transaction. If
 somebody is attached and moving focus at that moment, `focus` can already be
 theirs rather than yours. When it matters, note the new pane's `id` from the
@@ -104,7 +108,8 @@ as `C-b "` does. That moves the user's cursor. Split only when the user asked
 for a pane; to run something in the background, use a pane that already
 exists.
 
-`close` closes the **focused** pane. Never close a pane you did not create.
+`close` closes the **focused** pane, and is refused when it is the session's
+last one. Never close a pane you did not create.
 
 ## Run something in a pane
 

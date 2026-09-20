@@ -305,7 +305,30 @@ fn main() -> Result<()> {
         }
         Some("kill") => {
             let Some(name) = args.get(1) else { bail!("usage: zmux kill <session>") };
+            // Ask WHICH session this pipe serves before ending it. `Shutdown`
+            // is acted on before any handshake, so sent on its own it cannot
+            // tell `a/b` from the `a_b` it collides with - and this is the one
+            // command where being wrong ends every shell in somebody's
+            // session. A daemon too old for the control protocol closes
+            // without answering; that is exactly the daemon a version
+            // mismatch tells you to kill, so it is ended unverified.
             let mut s = connect_to(name)?;
+            ipc::write_msg(&mut s, &ClientMsg::Control { version: PROTOCOL_VERSION })?;
+            let verified = match ipc::read_msg::<_, ServerMsg>(&mut s) {
+                Ok(Some(ServerMsg::Hello { session: served, .. })) => {
+                    if served != *name {
+                        bail!(
+                            "asked to kill '{name}' but the daemon serves '{served}' - \
+                             the two names collide once sanitised for a pipe name"
+                        );
+                    }
+                    true
+                }
+                _ => false,
+            };
+            // Reuse the control connection when it lives; it takes Shutdown
+            // too. Otherwise the old daemon has already dropped this one.
+            let mut s = if verified { s } else { connect_to(name)? };
             ipc::write_msg(&mut s, &ClientMsg::Shutdown)?;
             let _ = ipc::read_msg::<_, ServerMsg>(&mut s);
             println!("killed {name}");

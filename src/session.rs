@@ -466,6 +466,11 @@ impl Session {
         let inherit = self.focused_cwd();
         let accepted = lock(&self.windows).current_mut().split(dir, area, new_id).is_some();
         if !accepted {
+            // Nothing was created, so the id goes back. The tree has to be
+            // asked whether the split fits, and it can only be asked with an
+            // id in hand - so the only way a refused split costs nothing is
+            // to return it afterwards.
+            new_id.release();
             eprintln!("[session] split refused: area {}x{} too small", area.w, area.h);
             return Ok(None); // too small; no pty is created for a pane that cannot fit
         }
@@ -475,6 +480,7 @@ impl Session {
             // Roll the tree back: a leaf with no runtime would render as a
             // dead hole and confuse focus and reflow.
             lock(&self.windows).current_mut().close(new_id);
+            new_id.release();
             return Err(e);
         }
         self.reflow_locked();
@@ -563,7 +569,10 @@ impl Session {
         // whole area, so unlike a split there is no rect to compute from the
         // tree first - which means no half-built state to roll back if the
         // shell will not start.
-        self.spawn_pane_retrying(id, area.w, area.h, inherit)?;
+        if let Err(e) = self.spawn_pane_retrying(id, area.w, area.h, inherit) {
+            id.release(); // no window was created, so the id was not spent
+            return Err(e);
+        }
         let index = lock(&self.windows).push(Layout::new(id));
         self.reflow_locked();
         drop(_g);

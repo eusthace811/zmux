@@ -922,6 +922,13 @@ user-facing surface built on them would be unreadable within an hour's work.
 panes is an error. Clamping would type a command into a shell the caller did
 not mean, which is how a background helper destroys somebody's afternoon.
 
+So is a command that could not be carried out. A split with no room, or
+`close` on the last pane, answers `Refused` rather than an `Info` that happens
+to look the same as before - someone attached can SEE that nothing happened,
+and a script cannot. Only the creating and destroying commands report this: a
+focus command that does nothing at the edge of the screen is not a failure,
+it is the edge.
+
 **Writing does not move focus.** `InputTo` deliberately skips the
 `follow_focused` that `write_focused` does: a caller typing into a background
 pane has no business yanking the user's scrollback view or their cursor. This

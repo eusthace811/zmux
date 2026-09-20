@@ -176,70 +176,104 @@ fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEve
     }
 }
 
-/// Run one client command.
+/// Whether a command that CREATES something managed to.
 ///
-/// Infallible on purpose. Creating a pane can fail - the shell may not start
-/// under resource pressure - and propagating that ended the CONNECTION, so a
-/// transient failure threw the user out of a session that was otherwise
-/// perfectly healthy. A command that cannot be carried out is logged and does
-/// not happen; that is all it should ever cost.
-fn apply(session: &Arc<Session>, cmd: Cmd) {
+/// `Ok(None)` is the session declining - no room, or already at `MAX_PANES` -
+/// and `Err` is the shell refusing to start. Neither may end the connection
+/// (see `apply`), but both are things a caller has to be told.
+fn refusal<T>(outcome: Result<Option<T>>, what: &str) -> Option<String> {
+    match outcome {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(format!(
+            "{what} refused: too small to divide, or the session is at its pane limit"
+        )),
+        Err(e) => Some(format!("{what} failed: {e}")),
+    }
+}
+
+/// Run one client command. `Some(reason)` when it could not be carried out.
+///
+/// Never an `Err`, on purpose. Creating a pane can fail - the shell may not
+/// start under resource pressure - and propagating that ended the CONNECTION,
+/// so a transient failure threw the user out of a session that was otherwise
+/// perfectly healthy.
+///
+/// The reason exists for CONTROL callers. Someone attached can SEE that
+/// nothing happened; a script cannot, and a script told its split succeeded
+/// goes on to type into a pane that was never created - which is precisely
+/// the wrong-shell accident an out-of-range `-p` is refused to avoid. Only
+/// the commands that create or destroy report one: a focus command that does
+/// nothing at the edge of the screen is not a failure, it is the edge.
+fn apply(session: &Arc<Session>, cmd: Cmd) -> Option<String> {
     match cmd {
-        Cmd::SplitHorizontal => {
-            if let Err(e) = session.split(Dir::Horizontal) {
-                eprintln!("[zmuxd] split failed: {e}");
-            }
-        }
-        Cmd::SplitVertical => {
-            if let Err(e) = session.split(Dir::Vertical) {
-                eprintln!("[zmuxd] split failed: {e}");
-            }
-        }
-        Cmd::ClosePane => {
-            session.close_focused();
-        }
+        Cmd::SplitHorizontal => refusal(session.split(Dir::Horizontal), "split"),
+        Cmd::SplitVertical => refusal(session.split(Dir::Vertical), "split"),
+        Cmd::NewWindow => refusal(session.new_window(), "new window"),
+        Cmd::ClosePane => (!session.close_focused())
+            .then(|| "cannot close the session's last pane".to_string()),
         Cmd::FocusLeft => {
             session.focus_dir(Nav::Left);
+            None
         }
         Cmd::FocusRight => {
             session.focus_dir(Nav::Right);
+            None
         }
         Cmd::FocusUp => {
             session.focus_dir(Nav::Up);
+            None
         }
         Cmd::FocusDown => {
             session.focus_dir(Nav::Down);
+            None
         }
         Cmd::ResizeLeft => {
             session.resize_focused(Nav::Left, 2);
+            None
         }
         Cmd::ResizeRight => {
             session.resize_focused(Nav::Right, 2);
+            None
         }
         Cmd::ResizeUp => {
             session.resize_focused(Nav::Up, 1);
+            None
         }
         Cmd::ResizeDown => {
             session.resize_focused(Nav::Down, 1);
+            None
         }
-        Cmd::ScrollUp => session.scroll_focused(Some(1)),
-        Cmd::ScrollDown => session.scroll_focused(Some(-1)),
-        Cmd::ScrollPageUp => session.scroll_focused(Some(10)),
-        Cmd::ScrollPageDown => session.scroll_focused(Some(-10)),
-        Cmd::ScrollToBottom => session.scroll_focused(None),
-        Cmd::NewWindow => {
-            if let Err(e) = session.new_window() {
-                eprintln!("[zmuxd] new window failed: {e}");
-            }
+        Cmd::ScrollUp => {
+            session.scroll_focused(Some(1));
+            None
+        }
+        Cmd::ScrollDown => {
+            session.scroll_focused(Some(-1));
+            None
+        }
+        Cmd::ScrollPageUp => {
+            session.scroll_focused(Some(10));
+            None
+        }
+        Cmd::ScrollPageDown => {
+            session.scroll_focused(Some(-10));
+            None
+        }
+        Cmd::ScrollToBottom => {
+            session.scroll_focused(None);
+            None
         }
         Cmd::NextWindow => {
             session.next_window();
+            None
         }
         Cmd::PrevWindow => {
             session.prev_window();
+            None
         }
         Cmd::SelectWindow(i) => {
             session.select_window(i as usize);
+            None
         }
     }
 }
@@ -267,18 +301,23 @@ fn serve_control(
         let reply = match msg {
             // Same path as a keystroke from an attached client: apply, then
             // publish so everyone watching sees it immediately.
-            ClientMsg::Command(cmd) => {
-                apply(session, cmd);
+            ClientMsg::Command(cmd) => match apply(session, cmd) {
+                // Nothing happened, so there is nothing to publish - and a
+                // caller told "ok" here would act on a pane that was never
+                // created.
+                Some(reason) => ServerMsg::Refused { reason },
                 // Read the state back BEFORE publishing. `publish` composites
                 // a whole screen, and every millisecond of it is a millisecond
                 // in which an attached human can move the focus - so the reply
                 // would describe where THEY went, not what this command did.
                 // The gap cannot be closed entirely without a lock spanning
                 // both, so `panes[].id` is the identifier that survives it.
-                let info = session.info();
-                session.publish();
-                ServerMsg::Info(info)
-            }
+                None => {
+                    let info = session.info();
+                    session.publish();
+                    ServerMsg::Info(info)
+                }
+            },
             ClientMsg::Input { data } => match session.write_focused(&data) {
                 Ok(true) => ServerMsg::Info(session.info()),
                 // The focused pane exited between resolving it and writing.
@@ -469,7 +508,11 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     // clients must see, and a direct write would bypass the
                     // delta base, leaving the next delta unapplicable.
                     ClientMsg::Command(cmd) => {
-                        apply(&session, cmd);
+                        // Someone attached can see for themselves that nothing
+                        // happened, so the reason only goes to the log.
+                        if let Some(reason) = apply(&session, cmd) {
+                            eprintln!("[zmuxd] {reason}");
+                        }
                         session.publish();
                     }
                     ClientMsg::Click { x, y } => {
