@@ -258,13 +258,30 @@ oldest line.) Each pane keeps **10,000 lines** by default.
 | Key | |
 | --- | --- |
 | `C-b d` | detach; the session keeps running |
+| `C-b m` | hand the mouse to the terminal, and back |
 | `C-b C-b` | send a literal `Ctrl-b` to the shell |
 
 `C-b C-b` is how you reach Ctrl-b inside programs that want it themselves —
 readline's "move back one character", for instance.
 
-**Selecting text:** zmux captures the mouse, so hold **Shift** to use
-MinTTY's own selection and copy.
+**Selecting text.** Only one of zmux and your terminal can have the mouse.
+While zmux has it — which is the default, so that clicking focuses a pane
+and the wheel scrolls history — the terminal never sees your drag, and
+dragging out a selection does nothing at all.
+
+Three ways round it:
+
+- Hold **Shift** while dragging. Windows Terminal and MinTTY both treat Shift
+  as "ignore the application and let me select".
+- Press **`C-b m`**. The mouse goes back to the terminal until you press it
+  again; click-to-focus and wheel-scroll stop working while it is away.
+- Set `mouse = "off"` to start every session that way.
+
+Two things to expect even once selection works. zmux runs on the alternate
+screen, so the terminal's own scrollbar is empty — you can only select what
+is on screen, and `C-b [` is how you reach the rest. And with a left/right
+split every line crosses both panes, so a selection takes text from both;
+tmux has the same problem for the same reason.
 
 ---
 
@@ -287,8 +304,9 @@ have. A malformed file is reported and ignored rather than being fatal.
 | `shell_integration` | `true` | OSC 7 directory tracking, so new panes inherit the current directory |
 | `idle_timeout_hours` | `8` | how long an unattended daemon lingers |
 | `status_bar` | `true` | turning it off gives panes one more row |
+| `mouse` | `"on"` | `"off"` leaves the mouse to the terminal, so text selection works |
 
-`prefix` is read by the client, so a new `zmux` picks it up. Everything
+`prefix` and `mouse` are read by the client, so a new `zmux` picks them up. Everything
 else is read by the daemon when the session is created — `zmux kill` the
 session and start it again.
 

@@ -15,25 +15,58 @@ use zmux::ipc;
 use zmux::protocol::{Cmd, ClientMsg, Frame, Query, ServerMsg, PROTOCOL_VERSION};
 use zmux::render::{paint, paint_cursor};
 
+/// Every host mouse-reporting mode we know how to turn off.
+///
+/// Wider than crossterm's `DisableMouseCapture`, which clears 1006, 1015,
+/// 1003, 1002 and 1000 and leaves `?9` (X10 compatibility) and `?1005`/`?1016`
+/// (alternative encodings) set. A program that enabled one of those and then
+/// died leaves the host terminal reporting mouse events at a zmux that has
+/// stopped listening for them, and the only cure is closing the window.
+/// herdr clears the same list on entry and exit (`terminal_modes.rs:3`).
+const CLEAR_HOST_MOUSE: &[u8] =
+    b"\x1b[?1006l\x1b[?1016l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l";
+
+/// Hand the mouse to zmux, or give it back to the terminal.
+///
+/// Only one of them can have it: while these modes are set the terminal
+/// forwards clicks and drags to us instead of acting on them itself, which is
+/// why selecting text does nothing until they are cleared.
+fn set_mouse_capture(on: bool) -> Result<()> {
+    let mut out = stdout();
+    if on {
+        execute!(out, crossterm::event::EnableMouseCapture)?;
+    } else {
+        out.write_all(CLEAR_HOST_MOUSE)?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
 /// Restores terminal state even on panic or early return.
 struct TermGuard;
 
 impl TermGuard {
-    fn enter() -> Result<Self> {
+    fn enter(mouse: bool) -> Result<Self> {
         terminal::enable_raw_mode()?;
         // DisableLineWrap matters: herdr notes clients must disable host
         // autowrap or writing the last column wraps and corrupts the next row
         // (render_ansi.rs:986, terminal_setup.rs:114). DESIGN.md §0.4.
         execute!(stdout(), terminal::EnterAlternateScreen, terminal::DisableLineWrap,
-                 crossterm::event::EnableMouseCapture, crossterm::cursor::Hide)?;
+                 crossterm::cursor::Hide)?;
+        // Clear before setting, even when we are about to capture: whatever
+        // the last program in this window left behind is not our state.
+        set_mouse_capture(false)?;
+        if mouse {
+            set_mouse_capture(true)?;
+        }
         Ok(Self)
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), crossterm::cursor::Show,
-                         crossterm::event::DisableMouseCapture, terminal::EnableLineWrap,
+        let _ = set_mouse_capture(false);
+        let _ = execute!(stdout(), crossterm::cursor::Show, terminal::EnableLineWrap,
                          terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
@@ -99,6 +132,8 @@ In a session (Ctrl-b is the prefix):
   C-b <arrow>    move focus          C-b C-<arrow>  resize
   C-b c          new window          C-b n / C-b p  next / previous window
   C-b 0..9       jump to that window (the numbers in the status bar)
+  C-b [          scroll history      C-b PageUp     scroll back a page
+  C-b m          give the mouse to the terminal, so you can select text
   C-b C-b        send a literal Ctrl-b";
 
 /// The names `zmux send` accepts, printed when it is given none.
@@ -439,7 +474,8 @@ fn attach(session: String) -> Result<()> {
         other => bail!("unexpected handshake reply: {other:?}"),
     }
 
-    let _guard = TermGuard::enter()?;
+    let mut mouse = cfg.mouse;
+    let _guard = TermGuard::enter(mouse.captures())?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     // Frames arrive on their own thread; the main loop owns input and drawing.
@@ -482,6 +518,10 @@ fn attach(session: String) -> Result<()> {
                             eprintln!("lost connection to the daemon");
                             return Ok(());
                         }
+                    }
+                    Prefix::MouseToggle => {
+                        mouse = mouse.toggled();
+                        set_mouse_capture(mouse.captures())?;
                     }
                     Prefix::Command(cmd) => {
                         ipc::write_msg(&mut stream, &ClientMsg::Command(cmd))?;
@@ -592,6 +632,8 @@ enum Prefix {
     Literal,
     /// Enter scroll mode: keys drive history until q/Esc/Enter leaves it.
     Scroll,
+    /// Hand the mouse to the other side - see `config::Mouse`.
+    MouseToggle,
     Ignore,
 }
 
@@ -624,6 +666,7 @@ fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
             Prefix::Command(Cmd::SelectWindow(c as u8 - b'0'))
         }
         KeyCode::Char('[') => Prefix::Scroll,
+        KeyCode::Char('m') => Prefix::MouseToggle,
         KeyCode::PageUp => Prefix::Command(Cmd::ScrollPageUp),
         KeyCode::Left if ctrl => Prefix::Command(Cmd::ResizeLeft),
         KeyCode::Right if ctrl => Prefix::Command(Cmd::ResizeRight),

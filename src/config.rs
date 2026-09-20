@@ -26,6 +26,40 @@ pub struct Config {
     pub idle_timeout_hours: u64,
     /// Show the status bar. Disabling it gives panes one more row.
     pub status_bar: bool,
+    /// Who the mouse belongs to.
+    pub mouse: Mouse,
+}
+
+/// Who gets the mouse: zmux, or the terminal zmux is running in.
+///
+/// Only one of them can have it. While zmux reports mouse events, the host
+/// terminal stops interpreting them, which is why dragging out a selection
+/// does nothing - Windows Terminal never sees the drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mouse {
+    /// zmux takes the mouse: click focuses a pane, the wheel scrolls
+    /// history. Selecting text needs Shift held down.
+    #[default]
+    On,
+    /// The terminal keeps the mouse. Selection works as it does in any other
+    /// window; zmux gets no clicks and no wheel.
+    Off,
+}
+
+impl Mouse {
+    /// Should zmux be reporting mouse events right now?
+    pub fn captures(self) -> bool {
+        self == Mouse::On
+    }
+
+    /// What `C-b m` switches to.
+    pub fn toggled(self) -> Self {
+        match self {
+            Mouse::On => Mouse::Off,
+            Mouse::Off => Mouse::On,
+        }
+    }
 }
 
 impl Default for Config {
@@ -38,6 +72,7 @@ impl Default for Config {
             shell_integration: true,
             idle_timeout_hours: 8,
             status_bar: true,
+            mouse: Mouse::default(),
         }
     }
 }
@@ -120,6 +155,14 @@ idle_timeout_hours = 8
 
 # Show the status bar. Turning it off gives panes one more row.
 status_bar = true
+
+# Who the mouse belongs to. Only one of zmux and the terminal can have it:
+# while zmux is reporting mouse events, dragging out a selection does
+# nothing, because the terminal never sees the drag.
+#   "on"   zmux takes it: click focuses a pane, the wheel scrolls history
+#   "off"  the terminal keeps it, so selection works as it does anywhere else
+# `C-b m` switches between them for the session without editing this file.
+mouse = "on"
 "#;
 
 #[cfg(test)]
@@ -133,6 +176,30 @@ mod tests {
         assert_eq!(c.prefix_byte(), 0x02);
         assert_eq!(c.scrollback, 10_000);
         assert!(c.shell_integration);
+    }
+
+    /// The default has to be what shipped before the setting existed, or
+    /// upgrading silently changes what the mouse does.
+    #[test]
+    fn the_mouse_starts_where_it_always_was() {
+        assert_eq!(Config::default().mouse, Mouse::On);
+        assert!(Mouse::On.captures());
+        assert!(!Mouse::Off.captures());
+    }
+
+    #[test]
+    fn the_toggle_gets_you_back_where_you_started() {
+        for m in [Mouse::On, Mouse::Off] {
+            assert_ne!(m.toggled(), m);
+            assert_eq!(m.toggled().toggled(), m);
+        }
+    }
+
+    #[test]
+    fn the_mouse_setting_is_spelled_the_way_the_comment_says() {
+        let c: Config = toml::from_str("mouse = \"off\"").expect("lowercase names");
+        assert_eq!(c.mouse, Mouse::Off);
+        assert!(toml::from_str::<Config>("mouse = \"sometimes\"").is_err());
     }
 
     #[test]
