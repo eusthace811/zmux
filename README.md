@@ -68,6 +68,16 @@ zmux config             write a commented default config, print its path
 | `src/cwd.rs` | OSC 7 parsing and the bash integration snippet. |
 | `src/config.rs` | `config.toml`. |
 
+Everything outside `src/`:
+
+| Path | Role |
+| --- | --- |
+| `tests/` | Integration tests. They drive a real daemon over the real pipe. |
+| `examples/dump.rs` | Prints a live session's screen as text. Needs no console, so it works from WSL. |
+| `probes/` | The Phase 0 go/no-go experiments, kept for **re-validation on the work laptop** (DESIGN §8.4): does a detached daemon survive its parent, does mintty give a real console. Separate crates, deliberately outside the build — `probes/RUNBOOK.md` says how to run them and has the table to fill in. |
+| `x` | Build, test and install, from WSL or Git Bash. |
+| `docs/` | `GUIDE.md` to use it, `DESIGN.md` for why it is built this way. |
+
 ## Seven things that will bite you if you change them
 
 **1. Terminal query replies are mandatory.** ConPTY is created with
