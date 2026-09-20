@@ -228,3 +228,19 @@ fn typing_exit_in_the_only_pane_ends_the_session() {
     });
     assert!(gone, "the daemon outlived its only shell");
 }
+
+#[test]
+fn a_pane_shell_can_tell_it_is_inside_zmux() {
+    let name = "zmux-test-env";
+    let d = Daemon::start(name);
+    let mut c = d.attach_ready(100, 24);
+
+    // The echoed command line shows the variables unexpanded, so only the
+    // shell's own answer can produce the expanded form - the same trick
+    // tests/splits.rs uses to tell two shells apart.
+    c.input("echo INSIDE:$ZMUX:$ZMUX_SESSION:\r");
+    let screen = c
+        .wait_for(20, |t| t.contains(&format!("INSIDE:1:{name}:")))
+        .unwrap_or_else(|| panic!("the pane shell never reported the session it is in"));
+    assert!(screen.contains(&format!("INSIDE:1:{name}:")), "screen was:\n{screen}");
+}

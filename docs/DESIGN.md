@@ -527,6 +527,40 @@ harvest that does not exist (§2.1) and deferred work that cannot be deferred.
 | Installer / updater / telemetry | §6.2 |
 | Named windows, window indices with gaps | §9 — windows are positional |
 | Agent detection, workspaces, plugins, remote | herdr's product |
+| A control CLI (`split`, `send-keys`, `capture`) | See below |
+
+### The agent surface, and why it stops where it does
+
+herdr is a multiplexer *for coding agents*: it exposes the session through a
+JSON CLI, so an agent can split a pane, start a second agent in it, prompt it
+and read its output. That surface is the product. Three things carry it:
+`HERDR_ENV=1` and the pane/tab/workspace IDs injected into every pane, a
+command group per primitive returning JSON, and a skill file shipped with the
+binary that tells the agent the rules — including which commands would hijack
+the terminal.
+
+zmux takes exactly two of those ideas, because they cost almost nothing:
+
+1. **An environment marker.** `zmuxd` sets `ZMUX=1` and
+   `ZMUX_SESSION=<name>` on itself before the first pane spawns, so every
+   pane shell inherits them. "Am I inside?" gets an answer that does not
+   involve walking process ancestry.
+2. **A bundled skill.** `skills/zmux/SKILL.md` is `include_str!`d into the
+   client and printed by `zmux --skill`, so the description an agent reads
+   can never drift from the binary it describes.
+
+What it does **not** take is the control CLI, and that is the deliberate
+part. Splitting, focus, resize and scrolling are `C-b` keystrokes interpreted
+by an attached client; nothing outside can drive them, and nothing can read a
+pane's screen. Adding `zmux split` would mean a new command surface, a
+protocol version per verb, and answering what a pane *is* to a caller that
+holds no terminal. The daemon composites for attached clients only; that is
+the whole design (§3).
+
+So the skill's most useful content is a refusal: zmux's main entry points
+are a full-screen TUI, and an agent that runs `zmux attach` in a
+non-interactive shell hangs until its timeout. Telling it that is worth more
+than any command we could add.
 
 ---
 

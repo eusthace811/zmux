@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 137 tests passing, clippy clean.
+Phases 0–6 complete. 138 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -75,6 +75,7 @@ Everything outside `src/`:
 | `tests/` | Integration tests. They drive a real daemon over the real pipe. |
 | `examples/dump.rs` | Prints a live session's screen as text. Needs no console, so it works from WSL. |
 | `probes/` | The Phase 0 go/no-go experiments, kept for **re-validation on the work laptop** (DESIGN §8.4): does a detached daemon survive its parent, does mintty give a real console. Separate crates, deliberately outside the build — `probes/RUNBOOK.md` says how to run them and has the table to fill in. |
+| `skills/zmux/SKILL.md` | What a coding agent needs to know about zmux. Bundled into the binary, so `zmux --skill` always prints the one that matches the build. |
 | `x` | Build, test and install, from WSL or Git Bash. |
 | `docs/` | `GUIDE.md` to use it, `DESIGN.md` for why it is built this way. |
 

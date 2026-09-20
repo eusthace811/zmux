@@ -113,8 +113,13 @@ zmux ls                 # which sessions are alive
 zmux attach work        # attach, but refuse to create
 zmux kill work          # end the session and its daemon
 zmux config             # write a commented config file, print its path
+zmux --skill            # what a coding agent should know about zmux
 zmux --help
 ```
+
+Those are the whole non-interactive surface. Everything else — `zmux`,
+`zmux <name>`, `zmux attach` — opens the full-screen client and does not
+return until you detach.
 
 Inside a session, `C-b d` detaches: the shells keep running, and
 `zmux work` puts you back where you were. You can attach from a second Git
@@ -123,6 +128,21 @@ Bash window at the same time — both see the same screen, sized to the
 
 A session ends when you `zmux kill` it, when every shell in it has exited,
 or after **8 idle hours** with nobody attached.
+
+---
+
+## Inside a pane
+
+Each pane shell inherits two variables from its daemon:
+
+```bash
+echo "$ZMUX"          # 1
+echo "$ZMUX_SESSION"  # the session that owns this shell
+```
+
+Useful in a prompt, in a script that should behave differently under zmux,
+or for a coding agent working out where it is. `ZMUX` is unset in an
+ordinary Git Bash window.
 
 ---
 

@@ -24,6 +24,15 @@ fn main() -> Result<()> {
     let session_name = std::env::args().nth(1).unwrap_or_else(|| "default".into());
     eprintln!("[zmuxd] session={session_name}");
 
+    // Every pane shell inherits the daemon's environment, so setting these
+    // two here is all it takes for anything running in a pane - a script, a
+    // prompt, a coding agent - to know where it is. Set before Session::new,
+    // which spawns the first pane. herdr does the same with HERDR_ENV; the
+    // point of a marker like this is that "am I inside?" has an answer that
+    // does not involve guessing from process ancestry.
+    std::env::set_var("ZMUX", "1");
+    std::env::set_var("ZMUX_SESSION", &session_name);
+
     // Atomically claim the session name. This must outlive the listener, so
     // it is bound to a name rather than dropped at the end of the statement -
     // `let _ = ...` would release it immediately and defeat the whole point.

@@ -66,6 +66,7 @@ zmux - tmux-style panes for Windows
   zmux ls                 list live sessions
   zmux kill <session>     terminate a session and its daemon
   zmux config             write a commented default config, print its path
+  zmux --skill            print the agent skill file (see skills/zmux)
   zmux --help
 
 In a session (Ctrl-b is the prefix):
@@ -76,6 +77,9 @@ In a session (Ctrl-b is the prefix):
   C-b 0..9       jump to that window (the numbers in the status bar)
   C-b C-b        send a literal Ctrl-b";
 
+/// Bundled at build time; `zmux --skill` prints it.
+const SKILL: &str = include_str!("../../skills/zmux/SKILL.md");
+
 fn main() -> Result<()> {
     // Before anything that could trigger a LoadLibrary (see harden.rs).
     zmux::harden::restrict_dll_search_path();
@@ -83,6 +87,13 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
             println!("{USAGE}");
+            return Ok(());
+        }
+        Some("--skill") => {
+            // Bundled at build time so the printed skill always matches this
+            // binary, the way herdr does it: a skill that describes a CLI it
+            // was not built alongside is worse than none.
+            print!("{SKILL}");
             return Ok(());
         }
         Some("ls") => {
