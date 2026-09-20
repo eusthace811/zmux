@@ -378,6 +378,15 @@ impl Session {
         let (cols, rows) = self.size();
         let area = self.area(cols, rows);
         let new_id = PaneId::alloc();
+        // Inherit the focused pane's directory, as tmux does.
+        //
+        // Read it BEFORE splitting. `Layout::split` moves focus to the NEW
+        // pane, which has no runtime yet, so asking afterwards looked up a
+        // pane that does not exist and always answered None - splits silently
+        // started in the daemon's directory instead. The test that was meant
+        // to catch this matched the old pane's own prompt on the composited
+        // screen, so it passed either way.
+        let inherit = self.focused_cwd();
         let accepted = lock(&self.windows).current_mut().split(dir, area, new_id).is_some();
         if !accepted {
             eprintln!("[session] split refused: area {}x{} too small", area.w, area.h);
@@ -385,8 +394,6 @@ impl Session {
         }
         let rect =
             lock(&self.windows).current().rect_of(new_id, area).unwrap_or(Rect::new(0, 0, 1, 1));
-        // Inherit the focused pane's directory, as tmux does.
-        let inherit = self.focused_cwd();
         if let Err(e) = self.spawn_pane_retrying(new_id, rect.w, rect.h, inherit) {
             // Roll the tree back: a leaf with no runtime would render as a
             // dead hole and confuse focus and reflow.

@@ -25,11 +25,17 @@ fn a_new_pane_inherits_the_focused_pane_directory() {
     assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some(), "split did not happen");
 
     // The new pane is focused; ask it where it is.
-    c.input("pwd\r");
+    //
+    // Tag the answer. The composited screen still shows the OLD pane, whose
+    // command line and prompt both say /c/Windows, so looking for the bare
+    // path passes whatever the new pane's directory actually is. `$(pwd)` is
+    // not expanded in the echoed command line, so "CWD:/c/Windows" can only
+    // have come from the new pane running it.
+    c.input("echo CWD:$(pwd)\r");
     let screen = c
-        .wait_for(20, |t| t.matches("/c/Windows").count() >= 1)
+        .wait_for(20, |t| t.contains("CWD:/c/Windows"))
         .expect("new pane did not start in the focused pane's directory");
-    assert!(screen.contains("/c/Windows"), "screen was:\n{screen}");
+    assert!(screen.contains("CWD:/c/Windows"), "screen was:\n{screen}");
 }
 
 /// Shell integration must not cost the user their profile. Dropping `-l` means
