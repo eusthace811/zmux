@@ -73,6 +73,16 @@ fn a_background_window_keeps_its_output() {
         "window 0 is showing window 1's output:\n{back}"
     );
     assert!(back.contains("0* 1"), "the status bar should mark window 0 as current:\n{back}");
+
+    // The display must keep updating after the switch. If the switch had left
+    // the client and the daemon disagreeing about the delta base, every later
+    // delta would be refused and the screen would freeze on whatever it had
+    // last managed to apply.
+    echo_mark(&mut c, "AFTERSWITCH");
+    assert!(
+        c.wait_for(25, |t| t.contains("AFTERSWITCH")).is_some(),
+        "the display stopped updating after a window switch"
+    );
 }
 
 #[test]
@@ -252,8 +262,15 @@ fn windows_survive_a_daemon_restart() {
 fn a_new_window_inherits_the_focused_directory() {
     let d = Daemon::start("zmux-test-win-cwd");
     let mut c = d.attach_ready(120, 30);
-    c.input("cd /c/Windows\r");
-    assert!(c.wait_for(20, |t| t.contains("Windows")).is_some(), "cd did not take");
+    c.input("cd /c/Windows && printf 'CD_OK:%s\\n' \"$PWD\"\r");
+    // Wait for the SHELL's answer, not the echoed command line - Git Bash
+    // echoes "cd /c/Windows", so matching "Windows" succeeds before cd runs
+    // and even if it fails. "CD_OK:/c/Windows" appears only in the output;
+    // the echoed literal contains "CD_OK:%s".
+    assert!(
+        c.wait_for(20, |t| t.contains("CD_OK:/c/Windows")).is_some(),
+        "cd did not take"
+    );
     // OSC 7 arrives with the next prompt; give the daemon a moment to see it.
     std::thread::sleep(std::time::Duration::from_millis(800));
 
@@ -304,4 +321,9 @@ fn switching_windows_resends_the_whole_screen() {
         }
     }
     assert_eq!(first, Some("frame"), "a window switch must send a full frame, not a delta");
+    // Nothing else is asserted here on purpose: `next_msg` bypasses the
+    // harness's frame reassembly, so anything read afterwards with `wait_for`
+    // would be judging a client state this test itself broke. That the
+    // display keeps updating after a switch is covered by
+    // `a_background_window_keeps_its_output`.
 }

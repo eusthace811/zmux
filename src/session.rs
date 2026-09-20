@@ -28,9 +28,9 @@ use crate::config::Config;
 /// A live session plus the channel its panes report on.
 pub type SessionHandle = (Arc<Session>, Receiver<(PaneId, PtyEvent)>);
 
-pub struct PaneState {
-    pub term: Arc<Mutex<Term>>,
-    pub pty: Arc<Pane>,
+struct PaneState {
+    term: Arc<Mutex<Term>>,
+    pty: Arc<Pane>,
 }
 
 /// Control messages only. Frames do not queue - see `Outbound`.
@@ -85,6 +85,13 @@ pub struct Session {
     /// Set when a client was dropped mid-broadcast; the pump recomputes size
     /// outside the broadcast path, where taking the geometry lock is safe.
     size_dirty: std::sync::atomic::AtomicBool,
+    /// Serialises persistence end to end.
+    ///
+    /// Write-then-rename stops a torn file, not a stale one: two savers could
+    /// each capture state, and the one that captured FIRST could rename LAST,
+    /// leaving the older layout on disk. The lock is taken before the capture,
+    /// not just around the write.
+    save: Mutex<()>,
     /// Serialises every geometry mutation.
     ///
     /// apply_size previously read the client list, released the lock, then
@@ -190,6 +197,7 @@ impl Session {
             size: Mutex::new((cols, rows)),
             last_published: Mutex::new(None),
             size_dirty: std::sync::atomic::AtomicBool::new(false),
+            save: Mutex::new(()),
             geometry: Mutex::new(()),
             cfg: Config::load(),
             events_tx,
@@ -230,6 +238,7 @@ impl Session {
     /// Called after any structural change. Failures are logged, never fatal:
     /// not being able to save a layout is no reason to lose a working session.
     fn save_state(&self) {
+        let _s = lock(&self.save);
         // Capture layout and panes together. Taking them under separate locks
         // allowed a split to land in between, producing a snapshot whose tree
         // and directories described different moments.
@@ -360,7 +369,12 @@ impl Session {
             let panes = lock(&self.panes);
             match panes.get(&id) {
                 Some(p) => Arc::clone(&p.pty),
-                None => bail!("focused pane {id:?} has no pty"),
+                // The pane exited between reading focus and looking it up.
+                // That is a stale keystroke, not a protocol violation - and
+                // the daemon ends the connection on an input error, so
+                // returning one here threw the user out of a live session
+                // merely for typing as a shell exited.
+                None => return Ok(()),
             }
         };
         // Lock released before writing: a blocked write must not stall the
@@ -370,6 +384,13 @@ impl Session {
 
     pub fn split(&self, dir: Dir) -> Result<Option<PaneId>> {
         let _g = lock(&self.geometry);
+        // shutdown() drains the pane map under this same lock. A command that
+        // arrives after that drain would create a ConPTY nothing owns and
+        // nothing tears down - an orphaned shell. Reachable with two clients:
+        // one sends Shutdown while the other has a split queued.
+        if !self.running.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         // Across every window: a hidden pane costs a ConPTY and a shell
         // exactly like a visible one.
         if lock(&self.windows).panes().len() >= MAX_PANES {
@@ -469,6 +490,10 @@ impl Session {
     /// `Ok(None)` means the session is already at `MAX_PANES`.
     pub fn new_window(&self) -> Result<Option<usize>> {
         let _g = lock(&self.geometry);
+        // See split(): no pane may be created after shutdown's drain.
+        if !self.running.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         if lock(&self.windows).panes().len() >= MAX_PANES {
             eprintln!("[session] new window refused: already at {MAX_PANES} panes");
             return Ok(None);
@@ -507,6 +532,9 @@ impl Session {
     fn switch_window(&self, f: impl FnOnce(&mut Windows) -> bool) -> bool {
         let changed = {
             let _g = lock(&self.geometry);
+            if !self.running.load(Ordering::Relaxed) {
+                return false; // tearing down; do not persist a new current window
+            }
             let changed = f(&mut lock(&self.windows));
             if changed {
                 self.reflow_locked();
@@ -636,12 +664,18 @@ impl Session {
     /// Typing changes one or two rows out of thirty, so a full grid per tick is
     /// almost entirely waste.
     pub fn publish(&self) {
-        let frame = self.snapshot();
-        // Hold `last_published` across derive-send-update. Releasing it between
-        // steps let two publishers derive deltas from the SAME base and then
-        // update that base out of order, so a client could receive a delta
-        // whose base it had already moved past.
+        // Hold `last_published` across COMPOSE-derive-send-update.
+        //
+        // Composing outside the lock let two publishers snapshot concurrently
+        // and commit in the opposite order - reachable by switching windows
+        // while a pane is producing output. The loser then derived a
+        // BACKWARDS delta (base N+1 -> revision N) and reset the base to N.
+        // The client's `revision < base_revision` guard refuses that delta,
+        // but nothing repaired the base, so every later delta was derived
+        // from N against a client already past it and refused too: the
+        // display froze until some unrelated full frame arrived.
         let mut last = lock(&self.last_published);
+        let frame = self.snapshot();
         let msg_delta = last.as_ref().and_then(|prev| frame.delta_from(prev)).map(ServerMsg::Delta);
         let full = ServerMsg::Frame(frame.clone());
 

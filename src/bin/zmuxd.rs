@@ -24,13 +24,27 @@ fn main() -> Result<()> {
     let session_name = std::env::args().nth(1).unwrap_or_else(|| "default".into());
     eprintln!("[zmuxd] session={session_name}");
 
-    // Windows allows MULTIPLE instances of the same named pipe, so without
-    // this two daemons can serve one session name and clients land on
-    // whichever answers first - with different panes behind each.
-    if ipc::is_running(&session_name) {
-        eprintln!("[zmuxd] session '{session_name}' is already served by another daemon");
-        return Ok(());
-    }
+    // Atomically claim the session name. This must outlive the listener, so
+    // it is bound to a name rather than dropped at the end of the statement -
+    // `let _ = ...` would release it immediately and defeat the whole point.
+    //
+    // Retry briefly. A daemon releases the claim at process exit, which is
+    // marginally AFTER its listener closes, so a client that saw the old one
+    // stop and started a replacement can arrive inside that window. Failing
+    // outright there would turn an ordinary restart into "already served".
+    let _claim = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(c) = ipc::claim_session(&session_name) {
+                break c;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("[zmuxd] session '{session_name}' is already served by another daemon");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
     let listener = ipc::listen(&session_name)?;
     eprintln!("[zmuxd] listening on {}", ipc::pipe_name(&session_name));
 

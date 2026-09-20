@@ -32,7 +32,11 @@ impl PaneId {
     /// herdr's version does not do this (`layout.rs:19-31`), so restoring a
     /// session and then splitting collides on ids.
     pub fn from_raw(id: u32) -> Self {
-        NEXT_PANE_ID.fetch_max(id + 1, Ordering::Relaxed);
+        // `id + 1` on a saved id of u32::MAX panics in debug and wraps in
+        // release, after which `alloc` hands back ids already in use. A state
+        // file can say any number; `Windows::repaired` refuses ids with no
+        // room left above them, and this keeps the arithmetic itself safe.
+        NEXT_PANE_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
         Self(id)
     }
 }
@@ -113,11 +117,6 @@ impl Layout {
         self.focus
     }
 
-    /// The raw tree, for persistence.
-    pub fn root_snapshot(&self) -> Node {
-        self.root.clone()
-    }
-
     pub fn panes(&self) -> Vec<PaneId> {
         let mut v = Vec::new();
         self.root.leaves(&mut v);
@@ -139,6 +138,14 @@ impl Layout {
         } else {
             false
         }
+    }
+
+    /// Re-validate a layout that came from `serde`, which skips `from_saved`.
+    ///
+    /// Consumes and moves the tree rather than cloning it, which is what a
+    /// `root_snapshot()` round trip used to cost on every restored window.
+    pub fn repaired(self) -> Self {
+        Self::from_saved(self.root, self.focus)
     }
 
     /// Restore from a saved tree, repairing focus if it names a missing pane.
@@ -327,45 +334,68 @@ fn adjust_ratio(
     step: u16,
 ) -> bool {
     let Node::Split { dir, ratio, a, b } = node else { return false };
-    let (dir, a_rect, b_rect) = (*dir, Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0));
-    let _ = (a_rect, b_rect);
-    if dir == want && (contains_leaf(a, target) || contains_leaf(b, target)) {
-        let span = match dir {
-            Dir::Horizontal => area.w,
-            Dir::Vertical => area.h,
-        };
-        if span == 0 {
-            return false;
-        }
-        let delta = step as f32 / span as f32;
-        // Right/Down move the divider forward (ratio up); Left/Up move it back.
-        let sign = if forward { 1.0 } else { -1.0 };
-        let min = match dir {
-            Dir::Horizontal => MIN_COLS as f32 / span as f32,
-            Dir::Vertical => MIN_ROWS as f32 / span as f32,
-        };
-        // f32::clamp panics when lo > hi or either bound is NaN. Both happen
-        // in a viewport too small for two minimum-size panes, which is exactly
-        // when a user is most likely to be dragging a divider around.
-        if !min.is_finite() || min >= 0.5 {
-            return false;
-        }
-        let next = (*ratio + sign * delta).clamp(min, 1.0 - min);
-        if (next - *ratio).abs() < f32::EPSILON {
-            return false;
-        }
-        *ratio = next;
-        return true;
-    }
-    // Descend into whichever side holds the target.
+    let dir = *dir;
     let (ra, rb) = split_rects(dir, *ratio, area);
-    if contains_leaf(a, target) {
+
+    // DESCEND FIRST, then consider this node.
+    //
+    // Testing this node before descending moved the first matching ANCESTOR,
+    // which for nested same-axis splits is the wrong divider: with three panes
+    // side by side (split horizontally twice, so the tree is 1 | (2 | 3)),
+    // resizing pane 3 leftwards moved the outer 1|(2 3) divider instead of the
+    // 2|3 divider that actually borders it. The doc comment on
+    // `resize_focused` has always said "the divider BORDERING the focused
+    // pane"; this makes it true.
+    let descended = if contains_leaf(a, target) {
         adjust_ratio(a, target, want, ra, forward, step)
     } else if contains_leaf(b, target) {
         adjust_ratio(b, target, want, rb, forward, step)
     } else {
-        false
+        return false; // the target is not below us at all
+    };
+    if descended {
+        return true;
     }
+
+    // The DEEPEST split on this axis wins, which is what descending first
+    // achieves. Taking the shallowest left the inner divider unreachable from
+    // any pane: in 1 | (2 | 3) both pane 2 and pane 3 drove the outer divider
+    // and nothing could move the one between them.
+    //
+    // Deliberately NOT restricted to the side the target sits on. That would
+    // be more literal - "move my left edge left" - but it breaks the symmetry
+    // this module documents and tests: an edge pane could then point outward
+    // and get nothing, so the same keystroke would work or not depending on
+    // where you happened to be.
+    if dir != want {
+        return false;
+    }
+    let span = match dir {
+        Dir::Horizontal => area.w,
+        Dir::Vertical => area.h,
+    };
+    if span == 0 {
+        return false;
+    }
+    let delta = step as f32 / span as f32;
+    // Right/Down move the divider forward (ratio up); Left/Up move it back.
+    let sign = if forward { 1.0 } else { -1.0 };
+    let min = match dir {
+        Dir::Horizontal => MIN_COLS as f32 / span as f32,
+        Dir::Vertical => MIN_ROWS as f32 / span as f32,
+    };
+    // f32::clamp panics when lo > hi or either bound is NaN. Both happen in a
+    // viewport too small for two minimum-size panes, which is exactly when a
+    // user is most likely to be dragging a divider around.
+    if !min.is_finite() || min >= 0.5 {
+        return false;
+    }
+    let next = (*ratio + sign * delta).clamp(min, 1.0 - min);
+    if (next - *ratio).abs() < f32::EPSILON {
+        return false;
+    }
+    *ratio = next;
+    true
 }
 
 /// Divide `area` in two, reserving one cell for the divider between them.
@@ -548,6 +578,36 @@ mod tests {
         for (id, r) in panes {
             assert!(r.w >= MIN_COLS, "pane {id:?} collapsed below MIN_COLS: {r:?}");
         }
+    }
+
+    /// Three panes side by side is `1 | (2 | 3)`. Resizing pane 3 must move
+    /// the divider next to it, not the outer one - which is what taking the
+    /// first matching ancestor did, leaving the inner divider unreachable
+    /// from any pane at all.
+    #[test]
+    fn nested_same_axis_splits_resize_the_nearest_divider() {
+        let mut l = Layout::new(PaneId(1));
+        l.split(Dir::Horizontal, area(), PaneId(2)).unwrap(); // focus 2
+        l.split(Dir::Horizontal, area(), PaneId(3)).unwrap(); // focus 3
+        let w = |l: &Layout, id| l.rect_of(id, area()).unwrap().w;
+        let (w1, w2, w3) = (w(&l, PaneId(1)), w(&l, PaneId(2)), w(&l, PaneId(3)));
+
+        assert!(l.resize_focused(Nav::Left, area(), 4));
+        assert_eq!(w(&l, PaneId(1)), w1, "the outer divider must not have moved");
+        assert!(w(&l, PaneId(2)) < w2, "pane 2 should have given up the space");
+        assert!(w(&l, PaneId(3)) > w3, "pane 3 should have taken it");
+    }
+
+    /// And it is still symmetric there: pointing back returns it.
+    #[test]
+    fn resizing_a_nested_split_is_symmetric() {
+        let mut l = Layout::new(PaneId(1));
+        l.split(Dir::Horizontal, area(), PaneId(2)).unwrap();
+        l.split(Dir::Horizontal, area(), PaneId(3)).unwrap();
+        let before = l.rect_of(PaneId(3), area()).unwrap().w;
+        assert!(l.resize_focused(Nav::Left, area(), 4));
+        assert!(l.resize_focused(Nav::Right, area(), 4));
+        assert_eq!(l.rect_of(PaneId(3), area()).unwrap().w, before);
     }
 
     #[test]

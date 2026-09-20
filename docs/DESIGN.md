@@ -763,3 +763,59 @@ file.
 `PROTOCOL_VERSION` 3 appends `Cmd::{NewWindow, NextWindow, PrevWindow}`. The
 handshake rejects a mismatch, so a v3 client meeting a v2 daemon is refused
 cleanly rather than failing to decode mid-stream.
+
+
+---
+
+## 10. What the third review changed
+
+An adversarial review (Codex `gpt-5.6-sol`) of the windows work found eight
+correctness issues. Six were real and are fixed; the reasoning for the other
+two is worth keeping.
+
+**Fixed:**
+
+- `publish()` composed its snapshot OUTSIDE `last_published`, so two
+  publishers could commit in the opposite order and the loser reset the base
+  to an older revision. Every later delta was then refused against a client
+  that had moved past it. The client's `revision < base_revision` guard
+  rejected the bad delta but nothing repaired the base, so the display froze
+  until an unrelated full frame arrived. The lock is now held across
+  compose-derive-send-update.
+- `is_running()` then `listen()` is a TOCTOU race; Windows allows several
+  instances of one pipe name, so two daemons could serve one session. A named
+  mutex (`ipc::claim_session`) makes the claim atomic. It retries for five
+  seconds, because a daemon releases its claim marginally after its listener
+  closes and a legitimate restart lands in that window.
+- `shutdown()` drains the pane map under `geometry`, but `split`,
+  `new_window` and `switch_window` did not re-check `running` once they held
+  it - so a command arriving after the drain could create a ConPTY nothing
+  owned and nothing tore down.
+- Write-then-rename stops a torn state file, not a stale one: two savers
+  could capture in one order and rename in the other. A `save` mutex now
+  covers capture, write and rename together.
+- `adjust_ratio` adjusted the first matching ANCESTOR, so in `1 | (2 | 3)`
+  the divider between 2 and 3 could not be moved by any pane. It descends
+  first and takes the deepest split on the axis. It is deliberately NOT
+  restricted to the side the focused pane sits on: that reads better in
+  isolation but breaks the symmetry this module documents and tests, leaving
+  an edge pane unable to point outward.
+- `write_focused` returned an error when the focused pane had already exited,
+  and the daemon ends a connection on any input error - so typing as a shell
+  exited threw the user out of a live session. A vanished pane is a stale
+  keystroke, not a protocol violation.
+
+**Not taken:**
+
+- Deleting `Layout::is_empty` / `Windows::is_empty`. They are unused and
+  always return `false`, but clippy's `len_without_is_empty` requires them
+  alongside `len()`. Removing them trades a documented invariant for an
+  `#[allow]`.
+- Rewriting the full-frame window-switch test to identify which message the
+  switch produced. The concern - that it could pass or fail on unrelated
+  traffic - is answered by draining both shells to silence first, and the
+  test was verified non-vacuous by breaking `reflow_locked`'s invalidation
+  and watching it fail. What the user actually cares about, that the display
+  keeps updating after a switch, is asserted in
+  `a_background_window_keeps_its_output`, which uses only the harness's
+  reassembling reader.

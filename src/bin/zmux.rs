@@ -146,6 +146,16 @@ fn attach(session: String) -> Result<()> {
     ipc::write_msg(&mut stream, &ClientMsg::Hello { version: PROTOCOL_VERSION, cols, rows })?;
 
     match ipc::read_msg::<_, ServerMsg>(&mut stream)? {
+        // Verify the name we were ACTUALLY given. Pipe names are sanitised
+        // lossily and truncated, so two different session names can map to
+        // one pipe - `a/b` and `a?b` both become `a_b`. Without this you
+        // silently join somebody else's session; with it you get told.
+        Some(ServerMsg::Hello { session: served, .. }) if served != session => {
+            bail!(
+                "asked for session '{session}' but the daemon serves '{served}' - \
+                 the two names collide once sanitised for a pipe name"
+            );
+        }
         Some(ServerMsg::Hello { session, .. }) => eprintln!("attached to {session}"),
         Some(ServerMsg::Refused { reason }) => bail!("daemon refused: {reason}"),
         other => bail!("unexpected handshake reply: {other:?}"),

@@ -16,8 +16,15 @@ fn a_new_pane_inherits_the_focused_pane_directory() {
     let mut c = d.attach_ready(120, 30);
 
     // Move somewhere unmistakable, then split.
-    c.input("cd /c/Windows\r");
-    assert!(c.wait_for(20, |t| t.contains("Windows")).is_some(), "cd never echoed");
+    c.input("cd /c/Windows && printf 'CD_OK:%s\\n' \"$PWD\"\r");
+    // Wait for the SHELL's answer, not the echoed command line - Git Bash
+    // echoes "cd /c/Windows", so matching "Windows" succeeds before cd runs
+    // and even if it fails. "CD_OK:/c/Windows" appears only in the output;
+    // the echoed literal contains "CD_OK:%s".
+    assert!(
+        c.wait_for(20, |t| t.contains("CD_OK:/c/Windows")).is_some(),
+        "cd did not take"
+    );
     // Let the prompt fire so OSC 7 is emitted.
     std::thread::sleep(std::time::Duration::from_millis(800));
 
@@ -127,8 +134,9 @@ fn layout_and_directories_survive_a_daemon_restart() {
     {
         let d = Daemon::start_preserving_state(name);
         let mut c = d.attach_ready(120, 30);
-        c.input("cd /c/Windows\r");
-        assert!(c.wait_for(20, |t| t.contains("Windows")).is_some());
+        // The shell's own answer, not the echoed command line - see above.
+        c.input("cd /c/Windows && printf 'CD_OK:%s\\n' \"$PWD\"\r");
+        assert!(c.wait_for(20, |t| t.contains("CD_OK:/c/Windows")).is_some(), "cd did not take");
         std::thread::sleep(std::time::Duration::from_millis(800));
         c.cmd(Cmd::SplitHorizontal);
         assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some(), "split failed");

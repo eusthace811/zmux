@@ -80,7 +80,7 @@ impl Windows {
         let list: Vec<Layout> = self
             .list
             .into_iter()
-            .map(|l| Layout::from_saved(l.root_snapshot(), l.focus()))
+            .map(Layout::repaired)
             .collect();
         Self::from_saved(list, current)
     }

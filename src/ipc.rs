@@ -106,6 +106,69 @@ fn windows_user_sid() -> Option<String> {
     }
 }
 
+/// A per-session singleton, held for the daemon's whole life.
+///
+/// `is_running()` followed by `listen()` is a TOCTOU race: Windows allows
+/// MULTIPLE instances of one pipe name, so two daemons starting together can
+/// both see nothing listening and both succeed. Clients then land on whichever
+/// answers first, with different panes behind each. A probe cannot enforce
+/// exclusivity; a named mutex can, in one atomic call.
+///
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` would do the same job, but `interprocess`
+/// does not expose it.
+pub struct SessionLock {
+    #[cfg(windows)]
+    handle: *mut core::ffi::c_void,
+}
+
+// The handle is only ever closed on drop, from the thread that owns the value.
+#[cfg(windows)]
+unsafe impl Send for SessionLock {}
+
+#[cfg(windows)]
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        extern "system" {
+            fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+        }
+        if !self.handle.is_null() {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
+/// Claim the right to serve `session`, or `None` if another daemon holds it.
+#[cfg(windows)]
+pub fn claim_session(session: &str) -> Option<SessionLock> {
+    use widestring::U16CString;
+
+    extern "system" {
+        fn CreateMutexW(attrs: *mut core::ffi::c_void, owner: i32, name: *const u16)
+            -> *mut core::ffi::c_void;
+        fn GetLastError() -> u32;
+        fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    // `Local\` scopes the name to this logon session, which is the same
+    // boundary the pipe's DACL and SID-keyed name already draw.
+    let name = U16CString::from_str(format!("Local\\{}", pipe_name(session))).ok()?;
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        if handle.is_null() {
+            return None;
+        }
+        // CreateMutexW returns a valid handle for an EXISTING mutex too; only
+        // the error code distinguishes "I created it" from "someone else has
+        // it". Checking the handle alone would let every daemon through.
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(handle);
+            return None;
+        }
+        Some(SessionLock { handle })
+    }
+}
+
 fn bincode_config() -> bincode::config::Configuration {
     bincode::config::standard()
 }

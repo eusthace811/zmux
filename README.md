@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 124 tests passing, clippy clean.
+Phases 0–6 complete. 126 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -121,10 +121,15 @@ sustained output, attach/detach churn, many splits, and malformed input.
   fills with frames it never drains. The daemon stays healthy, which is what
   matters, but that client will not recover.
 - **No server identity check on connect.** The DACL restricts who can use the
-  pipe and the name is SID-keyed, but a local process could still pre-create
-  the name. `FILE_FLAG_FIRST_PIPE_INSTANCE` would close this; `interprocess`
+  pipe and the name is SID-keyed, but a *hostile* local process could still
+  pre-create the name. A named mutex now stops two of OUR OWN daemons racing
+  to serve one session, which is the case that actually happened;
+  `FILE_FLAG_FIRST_PIPE_INSTANCE` would close the rest, and `interprocess`
   does not expose it.
-- **Session names are sanitised lossily**, so `a/b` and `a_b` collide.
+- **Session names are sanitised lossily**, so `a/b` and `a_b` collide on one
+  pipe. The client compares the name it asked for against the one the daemon
+  reports and refuses the mismatch, so a collision is an error rather than
+  silently joining the wrong session.
 - **Windows are positional**, so closing one renumbers those after it. tmux
   leaves a gap instead. There are no window names and no `C-b <digit>`.
 - **Queues are bounded by message count, not bytes.**

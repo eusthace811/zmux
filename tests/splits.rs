@@ -38,6 +38,14 @@ fn splitting_gives_two_independent_shells() {
     // can only be this shell's own answer. One shared shell would say
     // "LEFT:right:".
     c.cmd(Cmd::FocusLeft);
+    // Confirm the focus actually moved before typing. The status line names
+    // the focused pane, and without this the input races the focus change -
+    // if it lands in the right-hand pane it reads that shell's own variable
+    // and the test fails for a reason that has nothing to do with the claim.
+    assert!(
+        c.wait_for(20, |t| t.contains("pane 1")).is_some(),
+        "focus never moved back to the original pane"
+    );
     c.input("echo LEFT:$SPLITVAR:\r");
     let screen = c
         .wait_for(20, |t| t.contains("LEFT::"))
