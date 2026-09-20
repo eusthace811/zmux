@@ -257,6 +257,7 @@ oldest line.) Each pane keeps **10,000 lines** by default.
 
 | Key | |
 | --- | --- |
+| `C-b ?` | the shortcut list, on screen; any key closes it |
 | `C-b d` | detach; the session keeps running |
 | `C-b m` | cycle who owns the mouse: auto → zmux → the terminal |
 | `C-b C-b` | send a literal `Ctrl-b` to the shell |

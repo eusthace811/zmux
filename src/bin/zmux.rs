@@ -13,7 +13,7 @@ use ratatui::Terminal;
 
 use zmux::ipc;
 use zmux::protocol::{Cmd, ClientMsg, Frame, Query, ServerMsg, PROTOCOL_VERSION};
-use zmux::render::{paint, paint_cursor};
+use zmux::render::{paint, paint_cursor, paint_overlay};
 
 /// Every host mouse-reporting mode we know how to turn off.
 ///
@@ -125,16 +125,7 @@ Driving a session without attaching (for scripts and agents):
   zmux run  <session> [-p N] <command>   type it and press Enter
   zmux capture <session> [-p N] [-n N]   a pane's visible screen, as text
   -p N chooses a pane by its position in the current window (default: focused)
-
-In a session (Ctrl-b is the prefix):
-  C-b d          detach              C-b %          split left/right
-  C-b x          close pane          C-b \"          split top/bottom
-  C-b <arrow>    move focus          C-b C-<arrow>  resize
-  C-b c          new window          C-b n / C-b p  next / previous window
-  C-b 0..9       jump to that window (the numbers in the status bar)
-  C-b [          scroll history      C-b PageUp     scroll back a page
-  C-b m          cycle who owns the mouse (auto / zmux / the terminal)
-  C-b C-b        send a literal Ctrl-b";
+";
 
 /// The names `zmux send` accepts, printed when it is given none.
 const CMD_NAMES: &str = "\
@@ -327,7 +318,10 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--help" | "-h") => {
-            println!("{USAGE}");
+            // The shortcuts are generated from one list, so this
+            // and `C-b ?` cannot drift apart again.
+            let cfg = zmux::config::Config::load();
+            println!("{USAGE}\n{}", zmux::help::usage_block(cfg.prefix));
             return Ok(());
         }
         Some("--skill") => {
@@ -501,6 +495,7 @@ fn attach(session: String) -> Result<()> {
 
     let mut latest: Option<Frame> = None;
     let mut seen_revision = 0u64;
+    let mut help = false;
     loop {
         // Input. Ctrl-b is the prefix, as in tmux.
         if event::poll(Duration::from_millis(8))? {
@@ -510,6 +505,10 @@ fn attach(session: String) -> Result<()> {
                 // filter - so the Ctrl-b RELEASE was read as a doubled prefix
                 // and sent a literal Ctrl-b to the pane.
                 Event::Key(k) if matches!(k.kind, event::KeyEventKind::Release) => {}
+                // Any key closes the shortcut list, and is SWALLOWED closing
+                // it - otherwise whatever you pressed to get rid of it turns
+                // up in your shell.
+                Event::Key(_) if help => help = false,
                 Event::Key(k) if is_prefix(&k, &cfg) => match read_prefix_command(&cfg)? {
                     Prefix::Detach => {
                         ipc::write_msg(&mut stream, &ClientMsg::Detach)?;
@@ -525,6 +524,7 @@ fn attach(session: String) -> Result<()> {
                     Prefix::MouseToggle => {
                         mouse = mouse.toggled();
                     }
+                    Prefix::Help => help = true,
                     Prefix::Command(cmd) => {
                         ipc::write_msg(&mut stream, &ClientMsg::Command(cmd))?;
                     }
@@ -617,10 +617,18 @@ fn attach(session: String) -> Result<()> {
         if let Some(f) = &latest {
             // ratatui diffs against its own previous buffer and emits only the
             // changed cells - no hand-written blitter (DESIGN.md §0.4).
+            let size = term.size()?;
             term.draw(|frame| {
                 let buf = frame.buffer_mut();
                 paint(buf, f, 0, 0);
-                paint_cursor(buf, f, 0, 0);
+                if help {
+                    // Over the cursor too: it belongs to a pane you are not
+                    // looking at while this is up.
+                    let text = (size.width as usize).saturating_sub(8);
+                    paint_overlay(buf, &zmux::help::lines(cfg.prefix, text, size.height as usize));
+                } else {
+                    paint_cursor(buf, f, 0, 0);
+                }
             })?;
         }
     }
@@ -672,6 +680,8 @@ enum Prefix {
     Scroll,
     /// Hand the mouse to the other side - see `config::Mouse`.
     MouseToggle,
+    /// Put the shortcut list on screen.
+    Help,
     Ignore,
 }
 
@@ -705,6 +715,7 @@ fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
         }
         KeyCode::Char('[') => Prefix::Scroll,
         KeyCode::Char('m') => Prefix::MouseToggle,
+        KeyCode::Char('?') => Prefix::Help,
         KeyCode::PageUp => Prefix::Command(Cmd::ScrollPageUp),
         KeyCode::Left if ctrl => Prefix::Command(Cmd::ResizeLeft),
         KeyCode::Right if ctrl => Prefix::Command(Cmd::ResizeRight),

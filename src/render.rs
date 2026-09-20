@@ -34,6 +34,11 @@ const ALERT_FG: u32 = idx(214);
 /// A running pane. Green rather than the alert orange: busy is normal, and
 /// the bar should not look like something is wrong every time a build runs.
 const BUSY_FG: u32 = idx(114);
+/// The shortcut list sits ON TOP of the session, so it needs a background of
+/// its own or the text behind it shows through the gaps and neither is
+/// readable.
+const OVERLAY_BG: u32 = idx(236);
+const OVERLAY_FG: u32 = idx(252);
 /// Dividers recede. They are structure, not content - drawn in the default
 /// foreground they were the brightest thing on the screen.
 const DIVIDER_FG: u32 = idx(240);
@@ -412,6 +417,54 @@ pub fn paint_cursor(buf: &mut Buffer, frame: &Frame, ox: u16, oy: u16) {
     }
     if let Some(c) = buf.cell_mut((x, y)) {
         c.set_style(c.style().add_modifier(Modifier::REVERSED));
+    }
+}
+
+/// Draw a centred, bordered panel over whatever is already there.
+///
+/// The client draws this, not the daemon: it is a thing the person looking at
+/// the screen asked for, not a change to the session, so nobody else attached
+/// should see it appear.
+pub fn paint_overlay(buf: &mut Buffer, lines: &[String]) {
+    let area = *buf.area();
+    let text = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    // Two columns of padding each side, plus the border.
+    let w = (text + 6).min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    if w < 4 || h < 3 {
+        return;
+    }
+    let (x0, y0) = ((area.width - w) / 2, (area.height - h) / 2);
+    let style = Style::default().fg(unpack(OVERLAY_FG)).bg(unpack(OVERLAY_BG));
+    for row in 0..h {
+        for col in 0..w {
+            let Some(c) = buf.cell_mut((x0 + col, y0 + row)) else { continue };
+            let edge_y = row == 0 || row == h - 1;
+            let edge_x = col == 0 || col == w - 1;
+            let ch = match (edge_y, edge_x) {
+                (true, true) => match (row == 0, col == 0) {
+                    (true, true) => '\u{250c}',
+                    (true, false) => '\u{2510}',
+                    (false, true) => '\u{2514}',
+                    (false, false) => '\u{2518}',
+                },
+                (true, false) => '\u{2500}',
+                (false, true) => '\u{2502}',
+                // Text starts three columns in: the border and two of
+                // padding. The two padding columns have no character of
+                // their own, which `checked_sub` is what says.
+                (false, false) => (col as usize)
+                    .checked_sub(3)
+                    .and_then(|i| lines.get(row as usize - 1)?.chars().nth(i))
+                    .unwrap_or(' '),
+            };
+            c.set_char(ch);
+            c.set_style(if edge_x || edge_y {
+                style.add_modifier(Modifier::DIM)
+            } else {
+                style
+            });
+        }
     }
 }
 
@@ -796,6 +849,42 @@ mod tests {
 
     /// The bar is a band, not just coloured text: the empty right-hand end
     /// carries the background too, or the line looks like it stops mid-screen.
+    fn buffer_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area().width)
+            .map(|x| buf.cell((x, y)).map_or(' ', |c| c.symbol().chars().next().unwrap_or(' ')))
+            .collect()
+    }
+
+    /// The list has to be readable, which means a background of its own and
+    /// a border you can find the edges of.
+    #[test]
+    fn the_overlay_is_a_centred_box_with_the_text_inside_it() {
+        let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 40, 12));
+        let lines = vec!["one".to_string(), "two".to_string()];
+        paint_overlay(&mut buf, &lines);
+        // 3 text + 6 padding and border wide, 4 tall, centred in 40x12.
+        let top = (12 - 4) / 2;
+        let row = buffer_text(&buf, top);
+        assert!(row.contains("\u{250c}") && row.contains("\u{2510}"), "no top corners: {row:?}");
+        assert!(buffer_text(&buf, top + 1).contains("one"), "{:?}", buffer_text(&buf, top + 1));
+        assert!(buffer_text(&buf, top + 2).contains("two"));
+        assert!(buffer_text(&buf, top + 3).contains("\u{2514}"), "no bottom corner");
+        // Nothing outside the box was touched.
+        assert_eq!(buffer_text(&buf, 0).trim(), "");
+    }
+
+    /// A box that cannot fit draws nothing rather than a broken frame, and
+    /// must not index outside the buffer trying.
+    #[test]
+    fn an_overlay_with_no_room_simply_does_not_appear() {
+        for (w, h) in [(3u16, 10u16), (40, 2), (1, 1)] {
+            let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, w, h));
+            paint_overlay(&mut buf, &["hello".to_string()]);
+            let all: String = (0..h).map(|y| buffer_text(&buf, y)).collect();
+            assert_eq!(all.trim(), "", "{w}x{h} drew something it had no room for");
+        }
+    }
+
     #[test]
     fn the_status_bar_is_painted_across_the_whole_width() {
         let mut f = Frame::blank(40, 3);
@@ -834,4 +923,5 @@ mod tests {
         }
     }
 }
+
 

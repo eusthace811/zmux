@@ -5,6 +5,7 @@
 pub mod config;
 pub mod cwd;
 pub mod harden;
+pub mod help;
 pub mod ipc;
 pub mod keys;
 pub mod layout;
