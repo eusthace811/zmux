@@ -81,9 +81,9 @@ impl Windows {
         //
         // This closes the collision, not exhaustion in general: a file that
         // starts the counter high enough can still be walked to the top by
-        // repeated splits. `PaneId::release` is what keeps that bounded by
-        // panes actually created rather than splits attempted. Genuine
-        // exhaustion needs four billion of them, which no session reaches.
+        // repeated splits, because ids are never handed back - see
+        // `NEXT_PANE_ID` for why they must not be. Reaching the top from an
+        // ORDINARY id takes four billion splits, which no session does.
         const CEILING: u32 = u32::MAX - crate::protocol::MAX_PANES as u32;
         let mut seen = std::collections::HashSet::new();
         for id in self.panes() {
@@ -402,7 +402,6 @@ mod tests {
     /// already using. `repaired()` is what closes that.
     #[test]
     fn restoring_windows_advances_the_pane_allocator() {
-        let _g = crate::layout::ALLOCATOR_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let saved = Windows::new(one(50_000));
         let json = serde_json::to_string(&saved).unwrap();
         let back: Windows = serde_json::from_str(&json).unwrap();

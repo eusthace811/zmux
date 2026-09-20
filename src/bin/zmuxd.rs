@@ -302,10 +302,16 @@ fn serve_control(
             // Same path as a keystroke from an attached client: apply, then
             // publish so everyone watching sees it immediately.
             ClientMsg::Command(cmd) => match apply(session, cmd) {
-                // Nothing happened, so there is nothing to publish - and a
-                // caller told "ok" here would act on a pane that was never
-                // created.
-                Some(reason) => ServerMsg::Refused { reason },
+                // A caller told "ok" here would act on a pane that was never
+                // created. Still publish: a split that reached the tree and
+                // only then failed to start a shell was rolled back, and the
+                // pump may already have sent attached clients the
+                // intermediate layout. Skipping the repaint would leave a
+                // pane on their screen that no longer exists.
+                Some(reason) => {
+                    session.publish();
+                    ServerMsg::Refused { reason }
+                }
                 // Read the state back BEFORE publishing. `publish` composites
                 // a whole screen, and every millisecond of it is a millisecond
                 // in which an attached human can move the focus - so the reply

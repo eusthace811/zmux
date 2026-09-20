@@ -17,17 +17,18 @@ use serde::{Deserialize, Serialize};
 pub const MIN_COLS: u16 = 8;
 pub const MIN_ROWS: u16 = 2;
 
-static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
-
-/// Serialises the tests that touch `NEXT_PANE_ID`.
+/// Ids are never reused - and never handed back.
 ///
-/// It is one global counter and cargo runs tests in parallel THREADS of one
-/// process, so a test asserting on what `alloc` hands back is asserting about
-/// a number another test can move underneath it. Every test that allocates or
-/// restores an id takes this first - including the ones that only perturb the
-/// counter, since those are what break the others.
-#[cfg(test)]
-pub(crate) static ALLOCATOR_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A refused split allocates before it can find out there is no room, so ids
+/// do leak. Harmlessly: a 32-bit space is not exhausted by anything a session
+/// does. Returning them was tried and reverted, because it cannot be done
+/// safely. `write_pane` resolves a position to an id and then looks that id
+/// up in the pane map; between those two steps a provisional split leaf whose
+/// shell failed to start can be rolled back, its id returned, and that id
+/// handed to a new pane - so the write, which would have been refused, lands
+/// in the wrong shell instead. "Never reused" is also what `PaneInfo::id`
+/// promises every control caller. It is worth more than the ids it costs.
+static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PaneId(pub u32);
@@ -35,25 +36,6 @@ pub struct PaneId(pub u32);
 impl PaneId {
     pub fn alloc() -> Self {
         Self(NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// Hand an id back when whatever it was allocated for did not happen.
-    ///
-    /// A refused split allocates before it learns there is no room, and a
-    /// pane whose shell will not start is rolled back out of the tree. Both
-    /// would otherwise burn an id. That is free in the middle of a 32-bit
-    /// range and dangerous near the top, which is precisely where a crafted
-    /// state file can put the counter.
-    ///
-    /// Only takes effect if nothing has allocated since; otherwise the
-    /// counter has moved on and there is nothing to undo.
-    pub fn release(self) {
-        let _ = NEXT_PANE_ID.compare_exchange(
-            self.0.saturating_add(1),
-            self.0,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
     }
 
     /// Rebuild a saved id AND keep the allocator ahead of it.
@@ -610,29 +592,6 @@ mod tests {
         }
     }
 
-    /// A split that will not fit must not cost an id. It matters only near
-    /// the top of the range, and that is exactly where a crafted state file
-    /// can leave the counter - 66 refused splits would otherwise walk it
-    /// over the end and start handing back ids that are still in use.
-    #[test]
-    fn a_refused_split_does_not_spend_an_id() {
-        let _g = ALLOCATOR_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let a = PaneId::alloc();
-        let b = PaneId::alloc();
-        assert_eq!(b.0, a.0 + 1, "alloc should be sequential");
-
-        b.release();
-        let c = PaneId::alloc();
-        assert_eq!(c.0, b.0, "the released id was not handed out again");
-
-        // Releasing an id that is no longer the most recent is a no-op: the
-        // counter has moved on and there is nothing to undo.
-        let d = PaneId::alloc();
-        c.release();
-        let e = PaneId::alloc();
-        assert_eq!(e.0, d.0 + 1, "a stale release must not rewind the allocator");
-    }
-
     /// Three panes side by side is `1 | (2 | 3)`. Resizing pane 3 must move
     /// the divider next to it, not the outer one - which is what taking the
     /// first matching ancestor did, leaving the inner divider unreachable
@@ -701,7 +660,6 @@ mod tests {
     /// The bug from DESIGN.md §2.2 that this module exists to avoid.
     #[test]
     fn restoring_ids_advances_the_allocator() {
-        let _g = ALLOCATOR_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let restored = PaneId::from_raw(9_000);
         let fresh = PaneId::alloc();
         assert!(fresh.0 > restored.0, "alloc() reused a restored id: {fresh:?} vs {restored:?}");
@@ -721,7 +679,6 @@ mod tests {
 
     #[test]
     fn layout_survives_a_serde_round_trip() {
-        let _g = ALLOCATOR_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let mut l = Layout::new(PaneId::alloc());
         l.split(Dir::Vertical, area(), PaneId::alloc()).unwrap();
         let json = serde_json::to_string(&l).unwrap();
