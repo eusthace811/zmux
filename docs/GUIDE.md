@@ -15,42 +15,48 @@ Everything runs from the repo folder — the one holding `Cargo.toml` and the
 `x` script. The script works out which host it is on; you only have to be in
 the right directory.
 
-**On this machine** the repo lives under your WSL home, so open a **WSL**
-shell:
+**On this machine** the repo lives inside WSL, not on `C:`. That makes `~`
+ambiguous — it is a different folder in each shell, and so is the repo:
+
+| In | `~` is | the repo folder is |
+| --- | --- | --- |
+| WSL | `/home/<you>` | `/home/<you>/projects/Experiments/zmux/zmux` |
+| Git Bash | `/c/Users/<you>` | `//wsl.localhost/Ubuntu/home/<you>/projects/Experiments/zmux/zmux` |
+
+`cd ~/projects/Experiments/zmux/zmux` therefore works in WSL and **not**
+in Git Bash, where it looks under `C:\Users\<you>` and finds something else,
+or nothing. Every path below is spelled out in full for that reason.
+
+Build and install from a **WSL** shell:
 
 ```bash
-# /home/<you>/projects/Experiments/zmux/zmux
-cd ~/projects/Experiments/zmux/zmux
-
-# build --release, then copy both binaries to ~/bin
-./x install
+cd /home/<you>/projects/Experiments/zmux/zmux
+./x install                 # --release, then both binaries into place
 ```
 
-then, in a **Git Bash** window:
+`./x` compiles with the *Windows* cargo and installs into the **Windows**
+home, `C:\Users\<you>\bin` — the shells run on Windows, so that is the only
+home that matters. Pick it up in a **Git Bash** window:
 
 ```bash
 hash -r
 zmux --help
 ```
 
-Git Bash can reach that same repo folder over the WSL share, which is handy
-for reading the source or running `git` from the Windows side:
+Git Bash can reach the repo itself over the WSL share, which is useful for
+reading the source or running `git` from the Windows side:
 
 ```bash
 cd //wsl.localhost/Ubuntu/home/<you>/projects/Experiments/zmux/zmux
 ```
 
-Reach it, yes — but do not build it from there; see the warning below.
-
-Run from WSL, `./x` compiles with the *Windows* cargo and installs into the
-**Windows** home (`C:\Users\<you>\bin`), which is the `~/bin` Git Bash sees —
-the shells run on Windows, so that is the only home that matters.
+Reach it, yes — but do not build there; see the warning below.
 
 **On the work laptop** there is no WSL: the repo sits on the Windows disk and
 Git Bash does the whole job, from the folder you cloned into —
 
 ```bash
-cd ~/projects/zmux       # i.e. C:\Users\<you>\projects\zmux
+cd /c/Users/<you>/projects/zmux      # wherever you cloned it
 ./x install
 hash -r
 ```
