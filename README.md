@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 158 tests passing, clippy clean.
+Phases 0–6 complete. 160 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -86,7 +86,7 @@ agent-facing contract.
 | `src/cwd.rs` | OSC 7 parsing and the bash integration snippet. |
 | `src/config.rs` | `config.toml`. |
 | `src/keys.rs` | Key events → xterm byte sequences, including application cursor mode. |
-| `src/harden.rs` | `SetDefaultDllDirectories`, before anything can `LoadLibrary`. |
+| `src/harden.rs` | `SetDefaultDllDirectories`, before anything can `LoadLibrary`; and the job-object check behind the daemon-survival warning. |
 
 Everything outside `src/`:
 
@@ -100,7 +100,7 @@ Everything outside `src/`:
 | `x` | Build, test and install, from WSL or Git Bash. |
 | `docs/` | `GUIDE.md` to use it, `DESIGN.md` for why it is built this way. |
 
-## Seven things that will bite you if you change them
+## Eight things that will bite you if you change them
 
 **1. Terminal query replies are mandatory.** ConPTY is created with
 `PSEUDOCONSOLE_INHERIT_CURSOR` and emits `ESC[6n` at startup. Unanswered, the
@@ -108,9 +108,16 @@ shell never initialises and teardown deadlocks. This reproduced on the first
 run of the spike, on Windows 11 build 26200. `term.rs::QueryResponder` handles
 it, including queries split across read boundaries.
 
-**2. Never spawn the daemon via WMI.** `DETACHED_PROCESS` is sufficient
-(verified). WMI `Win32_Process.Create` is MITRE ATT&CK T1047 and a high-signal
-EDR detection on a managed laptop. See `docs/DESIGN.md` §0.2.
+**2. Never spawn the daemon via WMI.** `DETACHED_PROCESS` is sufficient on this
+PC (verified). WMI `Win32_Process.Create` is MITRE ATT&CK T1047 and a
+high-signal EDR detection on a managed laptop. See `docs/DESIGN.md` §0.2.
+Because `DETACHED_PROCESS` leaves the console but **not** the job object,
+`harden::job_kills_members_on_close()` checks for
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before spawning and warns when the daemon
+will not outlive whoever owns that job. It reads the *immediate* job only —
+jobs nest and an ancestor cannot be read from inside — so a `true` is
+trustworthy and a `false` is not a guarantee. herdr asks the same question and
+falls back to WMI; we only report.
 
 **3. Panes launch with `--rcfile`, NOT `-l`.** A login shell *ignores*
 `--rcfile`, so `-l` and OSC 7 cwd tracking are mutually exclusive. The rcfile
@@ -132,7 +139,18 @@ the resize, so it lands exactly on someone who splits a pane and then types.
 `Pane::resize` spends one NUL — the conventional terminal no-op filler — every
 time. Remove it and every fourth split eats a keystroke.
 
-**7. The waiter thread and `close()` share ONE child handle.** They used to
+**7. A pane's environment is scrubbed on purpose.** `CommandBuilder::new`
+merges the two Windows `Environment` registry keys over the process
+environment, and a value that is not `REG_SZ`/`REG_EXPAND_SZ` arrives with its
+separator NULs intact. One embedded NUL ends the `CreateProcessW` environment
+block early, so every variable sorting after that name vanishes — a shell with
+no `PATH` — or the call fails outright with `ERROR_INVALID_PARAMETER` (87) and
+no pane starts. Group policy writes into exactly those keys, so the managed
+laptop is where it is likeliest to fire. `pty::pane_command` clears the merge
+and puts this process's own environment back, which is what should reach a
+pane anyway. herdr vendors a patched `portable-pty` for the same bug.
+
+**8. The waiter thread and `close()` share ONE child handle.** They used to
 hold separate slots, and the constructor filled `Pane::child` by *taking* the
 child out of the waiter's — so the waiter found `None` on its first tick and
 returned, and `PtyEvent::Exited` could never fire for any pane. Typing `exit`
@@ -184,9 +202,17 @@ sustained output, attach/detach churn, many splits, and malformed input.
   wait, and so does `shutdown`, which needs that lock before it can save and
   drain. A permanently wedged write has always been able to keep the daemon
   from exiting; since the save now waits for the lock rather than racing it,
-  a stall also delays the final save rather than overlapping it. Fixing it
-  properly needs a bounded write, which Windows does not offer on a
-  synchronous pipe handle.
+  a stall also delays the final save rather than overlapping it.
+
+  Fixing this does **not** need a bounded write, as this list previously
+  claimed. herdr runs the same blocking `portable-pty` writer on Windows and
+  does not stall, because one dedicated thread per pane owns the writer and
+  every other path — user input, terminal-query replies, **and resize** —
+  posts to it over a channel and returns (`src/pty/actor.rs`, `run_writer`).
+  The wedge is then confined to that pane's writer thread instead of reaching
+  the geometry lock. Adopting that shape is the open item; it changes input
+  from "queued indefinitely" to "refused when the pane is not draining", which
+  is a behaviour change, not just a refactor.
 - **A control mutation's reply is a snapshot, not a transaction.** It is read
   immediately after the command, but a human attached at the same moment can
   move the focus in between. `panes[].id` survives that; `focus` is only as

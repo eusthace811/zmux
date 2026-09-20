@@ -79,6 +79,46 @@ fn ensure_rcfile(cfg: &crate::config::Config) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Build the pane's command with an environment we can vouch for.
+///
+/// `CommandBuilder::new` seeds itself from `std::env::vars_os()` and then
+/// MERGES the two Windows `Environment` registry keys over the result
+/// (`portable-pty-0.9.0/src/cmdbuilder.rs:104`). That merge is unsound:
+///
+/// - Anything that is not `REG_SZ`/`REG_EXPAND_SZ` goes through
+///   `OsString::from_reg_value`, so a `REG_MULTI_SZ` arrives with its
+///   separator NULs intact. `environment_block()` (`cmdbuilder.rs:638`) writes
+///   `NAME=`, the value, then a NUL - so one embedded NUL ends the block
+///   early. `envs` is a `BTreeMap`, so EVERY variable sorting after that name
+///   silently disappears; a shell with no `PATH` is a likely outcome, and
+///   `CreateProcessW` rejecting the block outright with
+///   `ERROR_INVALID_PARAMETER` (87) is the other.
+/// - `REG_EXPAND_SZ` is read through `value.bytes.as_ptr() as *const u16`, an
+///   unaligned load out of a `Vec<u8>`.
+///
+/// Group policy writes into exactly those keys, so the managed laptop this is
+/// built for is where it is most likely to fire, and the symptom would look
+/// like our fault. herdr carries a vendored patch for it
+/// (`vendor/portable-pty.patches.md` 0003, upstream `wezterm#4364`); we do not
+/// need to fork the crate, because we do not want the merge at all. The
+/// daemon's own environment is what should reach a pane - that is what carries
+/// `ZMUX` and `ZMUX_SESSION` - and a process environment block cannot
+/// contain an embedded NUL by construction.
+fn pane_command(shell: &std::path::Path) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(shell);
+    #[cfg(windows)]
+    {
+        // Drop what the registry contributed, then put this process's own
+        // environment back. On unix `get_base_env` also supplies SHELL, so the
+        // scrub is deliberately Windows-only.
+        cmd.env_clear();
+        for (key, value) in std::env::vars_os() {
+            cmd.env(key, value);
+        }
+    }
+    cmd
+}
+
 pub enum PtyEvent {
     Output(Vec<u8>),
     Exited(i32),
@@ -192,7 +232,7 @@ impl Pane {
         // `-l` only. Bash is already interactive on a pty, and `-l -i` changes
         // which startup files run. herdr's windows_login_shell_args does the
         // same (`pane.rs:1856`).
-        let mut cmd = CommandBuilder::new(&shell);
+        let mut cmd = pane_command(&shell);
         // Shell integration for OSC 7 cwd reporting.
         //
         // NOTE: deliberately NOT `-l`. A login shell ignores --rcfile, so the
@@ -405,5 +445,48 @@ impl Pane {
         // writer lock, and there is no reason to hold both.
         let _ = self.write_input(b"\0");
         Ok(())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// `portable-pty` merges the Windows `Environment` registry keys over the
+    /// process environment, and a value that arrives with an embedded NUL
+    /// truncates the whole `CreateProcessW` block. `pane_command` must hand a
+    /// pane exactly this process's environment, which cannot contain one.
+    ///
+    /// The sharpest symptom is `PATH`: the registry holds the unexpanded
+    /// system+user value, the process holds the merged one, so if the merge is
+    /// still in the builder the two differ and a pane shell starts with a
+    /// `PATH` that is not the daemon's.
+    #[test]
+    fn a_pane_gets_this_process_environment_and_nothing_the_registry_added() {
+        let cmd = pane_command(std::path::Path::new(r"C:\Program Files\Git\bin\bash.exe"));
+
+        let built: std::collections::BTreeMap<String, String> = cmd
+            .iter_extra_env_as_str()
+            .map(|(k, v)| (k.to_ascii_uppercase(), v.to_string()))
+            .collect();
+        let ours: std::collections::BTreeMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?.to_ascii_uppercase(), v.into_string().ok()?)))
+            .collect();
+
+        assert!(!ours.is_empty(), "no environment to compare against");
+        assert_eq!(
+            built, ours,
+            "a pane would not inherit this process's environment - `portable-pty`'s \
+             registry merge is still what reaches the shell"
+        );
+        assert_eq!(
+            built.get("PATH"),
+            ours.get("PATH"),
+            "a pane's PATH is not the daemon's"
+        );
+        assert!(
+            built.iter().all(|(k, v)| !k.contains('\0') && !v.contains('\0')),
+            "an embedded NUL would truncate the CreateProcessW environment block"
+        );
     }
 }

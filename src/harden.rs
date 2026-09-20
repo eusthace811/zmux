@@ -48,6 +48,72 @@ pub fn restrict_dll_search_path() {
     }
 }
 
+/// Whether the job object this process belongs to kills its members when the
+/// last handle to it closes. `None` means the question could not be answered.
+///
+/// This is the shipped half of Probe C, and the reason it is worth shipping is
+/// that Probe C has never been run on the machine zmux is FOR
+/// (`probes/RUNBOOK.md`, `DESIGN.md` §8.3). Windows console hosts put their
+/// children in a job object, and `DETACHED_PROCESS` severs the console without
+/// leaving the job - so if that job carries
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the daemon dies with the terminal
+/// that started it and every "persistent" session goes with it. Group policy
+/// is the usual source, so this is most likely to be true exactly where it has
+/// not been tested.
+///
+/// herdr asks the same question at runtime
+/// (`platform/windows.rs:current_job_kills_processes_on_close`) and, when the
+/// answer is yes, spawns via WMI `Win32_Process.Create` instead. That rung is
+/// closed to us: WMI process creation is MITRE ATT&CK T1047 and a high-signal
+/// EDR detection on a managed laptop (`DESIGN.md` §0.2). So we report rather
+/// than route around it - a session that will not survive is still worth
+/// having, as long as nobody is told otherwise.
+///
+/// ONE-SIDED. `QueryInformationJobObject(NULL, ...)` describes the job this
+/// process is DIRECTLY in. Jobs nest, an ancestor's limits apply too, and they
+/// cannot be read from inside. `Some(true)` is therefore trustworthy;
+/// `Some(false)` only means "not the immediate job".
+pub fn job_kills_members_on_close() -> Option<bool> {
+    #[cfg(not(windows))]
+    {
+        None
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::JobObjects::{
+            IsProcessInJob, QueryInformationJobObject, JobObjectExtendedLimitInformation,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut in_job = 0i32;
+        // SAFETY: a pseudo-handle for this process, a null job meaning "any",
+        // and a valid writable BOOL.
+        if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) } == 0 {
+            return None;
+        }
+        if in_job == 0 {
+            return Some(false);
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is writable and its exact size is passed. A null job
+        // handle means the job this process is in.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        if !ok {
+            return None;
+        }
+        Some(info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0)
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::ffi::OsStr;
@@ -68,6 +134,17 @@ mod tests {
             unsafe { FreeLibrary(h) };
             true
         }
+    }
+
+    /// The two syscalls must actually work, with the struct size and info
+    /// class we pass. A `None` here means we would ship a check that can never
+    /// warn - worse than no check, because its silence reads as an all-clear.
+    #[test]
+    fn the_job_question_gets_an_answer_rather_than_a_shrug() {
+        assert!(
+            super::job_kills_members_on_close().is_some(),
+            "could not read this process's job limits; the Probe C warning would never fire"
+        );
     }
 
     /// Proves the mitigation rather than assuming it.

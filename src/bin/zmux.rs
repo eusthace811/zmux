@@ -48,9 +48,25 @@ fn spawn_daemon(session: &str) -> Result<()> {
     if !exe.is_file() {
         bail!("daemon not found next to the client: {}", exe.display());
     }
+    // Say so BEFORE spawning, because after this the answer is invisible: the
+    // daemon comes up, sessions work, and the loss only shows when the
+    // terminal closes and everything the user thought was persistent is gone.
+    // `DETACHED_PROCESS` leaves the console but NOT the job (probe-c's header),
+    // so the daemon inherits this limit from us.
+    if zmux::harden::job_kills_members_on_close() == Some(true) {
+        eprintln!(
+            "[zmux] warning: this process is in a job object marked \
+             KILL_ON_JOB_CLOSE, and the daemon inherits it.\n\
+             [zmux] it will be killed when the last handle to that job closes. \
+             For a console host that is when you close the window, so this \
+             session may not outlive it.\n\
+             [zmux] run probes/probe-c to find out for certain on this machine."
+        );
+    }
     // DESIGN.md §0.2: DETACHED_PROCESS only. No WMI - that is MITRE T1047 and
     // a high-signal EDR detection on a managed laptop. Probe C confirmed this
-    // is sufficient; CREATE_BREAKAWAY_FROM_JOB is the documented fallback rung.
+    // is sufficient ON THIS PC; the check above is what answers the question
+    // anywhere else. CREATE_BREAKAWAY_FROM_JOB is the documented fallback rung.
     std::process::Command::new(exe)
         .arg(session)
         .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
