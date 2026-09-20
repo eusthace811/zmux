@@ -35,6 +35,16 @@ struct PaneState {
     pty: Arc<Pane>,
 }
 
+/// One pane's pending resize, lifted out of the pane map so that the pty
+/// write inside `Pane::resize` happens with the map lock released. See
+/// `reflow_locked`.
+struct PendingResize {
+    id: PaneId,
+    rect: Rect,
+    pty: Arc<Pane>,
+    term: Arc<Mutex<Term>>,
+}
+
 /// Control messages only. Frames do not queue - see `Outbound`.
 const CLIENT_QUEUE: usize = 32;
 
@@ -312,8 +322,13 @@ impl Session {
         lock(&self.windows).current().clone()
     }
 
-    /// Write to the focused pane.
-    pub fn write_focused(&self, data: &[u8]) -> Result<()> {
+    /// Write to the focused pane. False when it went away first.
+    ///
+    /// The distinction matters to a control caller: a human losing a
+    /// keystroke as a shell exits is nothing, but a script told its `run`
+    /// succeeded when not a byte was written would go on to poll for output
+    /// that can never appear.
+    pub fn write_focused(&self, data: &[u8]) -> Result<bool> {
         if data.len() > MAX_INPUT_BYTES {
             bail!("input of {} bytes exceeds MAX_INPUT_BYTES", data.len());
         }
@@ -328,12 +343,13 @@ impl Session {
                 // the daemon ends the connection on an input error, so
                 // returning one here threw the user out of a live session
                 // merely for typing as a shell exited.
-                None => return Ok(()),
+                None => return Ok(false),
             }
         };
         // Lock released before writing: a blocked write must not stall the
         // whole session.
-        pty.write_input(data)
+        pty.write_input(data)?;
+        Ok(true)
     }
 
     /// Write to a pane by 1-based position in the current window, leaving
@@ -673,31 +689,50 @@ impl Session {
             let w = lock(&self.windows);
             w.all().iter().flat_map(|l| l.compute(area).0).collect()
         };
-        let panes = lock(&self.panes);
-        for (id, r) in rects {
-            let Some(p) = panes.get(&id) else { continue };
-            if r.w == 0 || r.h == 0 {
-                continue;
+        // DECIDE under the pane-map lock, APPLY outside it.
+        //
+        // `Pane::resize` ends in a one-byte write to the pty - the NUL ConPTY
+        // eats - and a pty write BLOCKS when the shell has stopped reading its
+        // input. Holding the map lock across it would stall every other pane's
+        // keystrokes behind one wedged shell; `write_focused` drops the lock
+        // before writing for exactly this reason. `geometry` is still held,
+        // deliberately: two reflows interleaving and leaving the pty at one
+        // size and the parser at another is what it exists to prevent.
+        let mut todo: Vec<PendingResize> = Vec::new();
+        {
+            let panes = lock(&self.panes);
+            for (id, r) in rects {
+                if r.w == 0 || r.h == 0 {
+                    continue;
+                }
+                let Some(p) = panes.get(&id) else { continue };
+                // Skip panes already at this size. `ResizePseudoConsole` is not
+                // free and makes the shell redraw, and reflow runs on every
+                // window switch - where nothing has actually moved - so
+                // resizing unconditionally would churn every pane in every
+                // window on each C-b n. The parser's size is the pty's: they
+                // are only ever set together, below.
+                let (cur_rows, cur_cols) = lock(&p.term).parser.screen().size();
+                if (cur_cols, cur_rows) == (r.w, r.h) {
+                    continue;
+                }
+                todo.push(PendingResize {
+                    id,
+                    rect: r,
+                    pty: Arc::clone(&p.pty),
+                    term: Arc::clone(&p.term),
+                });
             }
-            // Skip panes already at this size. `ResizePseudoConsole` is not
-            // free and makes the shell redraw, and reflow runs on every window
-            // switch - where nothing has actually moved - so resizing
-            // unconditionally would churn every pane in every window on each
-            // C-b n. The parser's size is the pty's: they are only ever set
-            // together, below.
-            let (cur_rows, cur_cols) = lock(&p.term).parser.screen().size();
-            if (cur_cols, cur_rows) == (r.w, r.h) {
-                continue;
-            }
+        }
+        for r in todo {
             // Only resize the parser if the pty accepted the new size.
             // Resizing it regardless left vt100 and ConPTY disagreeing about
             // the grid, which renders as misplaced output.
-            match p.pty.resize(r.w, r.h) {
-                Ok(()) => lock(&p.term).resize(r.w, r.h),
-                Err(e) => eprintln!("[session] pane {} resize failed: {e}", id.0),
+            match r.pty.resize(r.rect.w, r.rect.h) {
+                Ok(()) => lock(&r.term).resize(r.rect.w, r.rect.h),
+                Err(e) => eprintln!("[session] pane {} resize failed: {e}", r.id.0),
             }
         }
-        drop(panes);
         self.revision.fetch_add(1, Ordering::Relaxed);
         // Geometry changed, so no delta can describe the transition.
         *lock(&self.last_published) = None;

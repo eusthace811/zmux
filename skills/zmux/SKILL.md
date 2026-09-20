@@ -90,6 +90,11 @@ Every mutation replies with the resulting `info`, so one call tells you where
 the new pane landed — read `focus` from that reply instead of querying again
 and racing the user.
 
+That reply is a snapshot taken right after the command, not a transaction. If
+somebody is attached and moving focus at that moment, `focus` can already be
+theirs rather than yours. When it matters, note the new pane's `id` from the
+reply and find it again by `id`, which does not move.
+
 ```bash
 NEW=$(zmux send work split-v | python -c 'import json,sys;print(json.load(sys.stdin)["focus"])')
 ```

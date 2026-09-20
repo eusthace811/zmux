@@ -146,11 +146,15 @@ fn capture_args(args: &[String]) -> Result<(Option<u8>, u16)> {
     let (mut pane, mut lines) = (None, 0u16);
     let mut rest = args;
     while let Some(flag) = rest.first().map(String::as_str) {
+        // Recognise the flag BEFORE asking for its value, or an argument that
+        // is not a flag at all comes back as "nonsense needs a number".
+        if !matches!(flag, "-p" | "--pane" | "-n" | "--lines") {
+            bail!("unexpected argument '{flag}'\n{USAGE}");
+        }
         let value = rest.get(1).with_context(|| format!("{flag} needs a number\n{USAGE}"))?;
         match flag {
             "-p" | "--pane" => pane = Some(value.parse().context(USAGE)?),
-            "-n" | "--lines" => lines = value.parse().context(USAGE)?,
-            other => bail!("unexpected argument '{other}'\n{USAGE}"),
+            _ => lines = value.parse().context(USAGE)?,
         }
         rest = &rest[2..];
     }
@@ -200,18 +204,42 @@ fn unescape(s: &str) -> Vec<u8> {
     out
 }
 
+/// Connect, turning "the pipe is not there" into "the session is not there".
+///
+/// Only that one error means a missing session. A busy pipe or a refused ACL
+/// is a different problem, and flattening it to "no such session" would send
+/// someone looking in the wrong place.
+fn connect_to(session: &str) -> Result<interprocess::local_socket::Stream> {
+    ipc::connect(session).map_err(|e| {
+        match e.downcast_ref::<std::io::Error>().map(std::io::Error::kind) {
+            Some(std::io::ErrorKind::NotFound) => anyhow::anyhow!("no such session: {session}"),
+            _ => e.context(format!("connecting to session '{session}'")),
+        }
+    })
+}
+
 /// One control round trip: connect, handshake, ask, read the single reply.
 ///
 /// A fresh connection per command on purpose. These are one-shot CLI calls,
 /// and a control connection holds no session state - nothing is gained by
 /// keeping it open, and a dropped one costs nothing.
 fn request(session: &str, msg: &ClientMsg) -> Result<ServerMsg> {
-    if !ipc::is_running(session) {
-        bail!("no such session: {session}");
-    }
-    let mut s = ipc::connect(session)?;
+    // One connection, not two. `is_running` IS a connection - it opens the
+    // pipe and drops it - so probing first cost a second daemon handler
+    // thread per command and still could not stop the daemon disappearing
+    // between the probe and the real connect. The connect error carries the
+    // same diagnosis.
+    let mut s = connect_to(session)?;
     ipc::write_msg(&mut s, &ClientMsg::Control { version: PROTOCOL_VERSION })?;
     match ipc::read_msg::<_, ServerMsg>(&mut s) {
+        // Verify the name we were ACTUALLY given, exactly as `attach` does.
+        // Pipe names are sanitised lossily, so `a/b` and `a_b` reach one
+        // daemon; a control caller that skipped this check would run its
+        // command in somebody else's session, and neither side would know.
+        Ok(Some(ServerMsg::Hello { session: served, .. })) if served != session => bail!(
+            "asked for session '{session}' but the daemon serves '{served}' - \
+             the two names collide once sanitised for a pipe name"
+        ),
         Ok(Some(ServerMsg::Hello { .. })) => {}
         Ok(Some(ServerMsg::Refused { reason })) => bail!("daemon refused: {reason}"),
         Ok(Some(other)) => bail!("unexpected handshake reply: {other:?}"),
@@ -277,10 +305,7 @@ fn main() -> Result<()> {
         }
         Some("kill") => {
             let Some(name) = args.get(1) else { bail!("usage: zmux kill <session>") };
-            if !ipc::is_running(name) {
-                bail!("no such session: {name}");
-            }
-            let mut s = ipc::connect(name)?;
+            let mut s = connect_to(name)?;
             ipc::write_msg(&mut s, &ClientMsg::Shutdown)?;
             let _ = ipc::read_msg::<_, ServerMsg>(&mut s);
             println!("killed {name}");
@@ -711,7 +736,9 @@ mod tests {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         let e = capture_args(&a(&["-p", "2", "extra"])).unwrap_err().to_string();
-        assert!(e.contains("extra"), "{e}");
+        assert!(e.contains("unexpected argument 'extra'"), "misleading error: {e}");
+        // Not "extra needs a number": it is not a flag, it is a stray word.
+        assert!(!e.contains("needs a number"), "misleading error: {e}");
         assert!(capture_args(&a(&["-p"])).is_err(), "a flag with no value must not pass");
         assert!(capture_args(&a(&["-n", "lots"])).is_err());
         assert!(capture_args(&a(&["-p", "300"])).is_err(), "no pane is beyond a u8");

@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 154 tests passing, clippy clean.
+Phases 0–6 complete. 156 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -176,6 +176,17 @@ sustained output, attach/detach churn, many splits, and malformed input.
   `C-b <digit>` renumbers with them. tmux leaves a gap instead. There are no
   window names, and only the first ten windows have a digit.
 - **Queues are bounded by message count, not bytes.**
+- **A pane whose shell has stopped reading its input can stall layout.**
+  `Pane::resize` ends in a one-byte write to the pty, and a pty write blocks
+  once ConPTY's input pipe is full. Reflow applies resizes with the pane map
+  released, so typing into other panes is unaffected, but it still holds the
+  geometry lock — so splits, resizes and window switches would wait. Fixing
+  it properly needs a bounded write, which Windows does not offer on a
+  synchronous pipe handle.
+- **A control mutation's reply is a snapshot, not a transaction.** It is read
+  immediately after the command, but a human attached at the same moment can
+  move the focus in between. `panes[].id` survives that; `focus` is only as
+  fresh as when it was read.
 
 ## One more thing that will bite you
 

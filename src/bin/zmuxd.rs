@@ -269,11 +269,22 @@ fn serve_control(
             // publish so everyone watching sees it immediately.
             ClientMsg::Command(cmd) => {
                 apply(session, cmd);
+                // Read the state back BEFORE publishing. `publish` composites
+                // a whole screen, and every millisecond of it is a millisecond
+                // in which an attached human can move the focus - so the reply
+                // would describe where THEY went, not what this command did.
+                // The gap cannot be closed entirely without a lock spanning
+                // both, so `panes[].id` is the identifier that survives it.
+                let info = session.info();
                 session.publish();
-                ServerMsg::Info(session.info())
+                ServerMsg::Info(info)
             }
             ClientMsg::Input { data } => match session.write_focused(&data) {
-                Ok(()) => ServerMsg::Info(session.info()),
+                Ok(true) => ServerMsg::Info(session.info()),
+                // The focused pane exited between resolving it and writing.
+                // An attached client shrugs that off; a caller scripting the
+                // session must not be told its command ran.
+                Ok(false) => ServerMsg::Refused { reason: "no focused pane".into() },
                 Err(e) => ServerMsg::Refused { reason: e.to_string() },
             },
             ClientMsg::InputTo { pane, data } => match session.write_pane(pane as usize, &data) {

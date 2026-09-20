@@ -33,9 +33,10 @@ impl PaneId {
     /// session and then splitting collides on ids.
     pub fn from_raw(id: u32) -> Self {
         // `id + 1` on a saved id of u32::MAX panics in debug and wraps in
-        // release, after which `alloc` hands back ids already in use. A state
-        // file can say any number; `Windows::repaired` refuses ids with no
-        // room left above them, and this keeps the arithmetic itself safe.
+        // release. Saturating keeps the arithmetic safe but not the ALLOCATOR:
+        // saturated at MAX, `alloc` hands MAX straight back. A state file can
+        // say any number, so `Windows::repaired` refuses the top of the range
+        // outright - that is the check this relies on.
         NEXT_PANE_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
         Self(id)
     }

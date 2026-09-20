@@ -72,9 +72,19 @@ impl Windows {
         // overwrite the first and leave a live shell with nothing owning it -
         // and `window_of` would only ever find one of the two. Unreachable
         // through the API; a hand-edited or corrupted file can say it.
+        //
+        // Neither is an id with no room left above it. `PaneId::from_raw`
+        // pushes the allocator past every restored id, saturating at
+        // `u32::MAX` - so a saved `u32::MAX` leaves `alloc` handing that same
+        // number straight back, and the first split would replace the
+        // restored pane in the map keyed by id. Refusing the top of the range
+        // is what makes `from_raw`'s comment true.
+        const CEILING: u32 = u32::MAX - crate::protocol::MAX_PANES as u32;
         let mut seen = std::collections::HashSet::new();
-        if !self.panes().into_iter().all(|id| seen.insert(id)) {
-            return None;
+        for id in self.panes() {
+            if !seen.insert(id) || id.0 >= CEILING {
+                return None;
+            }
         }
         let current = self.current;
         let list: Vec<Layout> = self
@@ -254,6 +264,21 @@ mod tests {
         w.push(one(2));
         assert!(!w.select(1), "no switch, so nothing to repaint or persist");
         assert_eq!(w.index(), 1);
+    }
+
+    /// A saved id at the top of the range leaves `PaneId::alloc` nothing to
+    /// hand out but that same id, so the next split would take over the
+    /// restored pane's slot in the map. Start fresh instead.
+    #[test]
+    fn a_pane_id_with_no_room_above_it_is_refused() {
+        let w = Windows::new(one(u32::MAX));
+        assert!(w.repaired().is_none(), "an exhausted id must start the session fresh");
+
+        let w = Windows::new(one(u32::MAX - 1));
+        assert!(w.repaired().is_none(), "nor one with only a handful of ids above it");
+
+        // An ordinary id is still restorable.
+        assert!(Windows::new(one(7)).repaired().is_some());
     }
 
     /// `C-b 7` with three windows must leave you where you are. Clamping would

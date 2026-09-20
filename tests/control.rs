@@ -176,3 +176,34 @@ fn capture_can_be_limited_to_the_last_lines() {
     assert!(all.lines().count() >= tail.lines().count());
     assert!(all.ends_with(&tail), "the tail is not the end of the screen:\n{all}\n---\n{tail}");
 }
+
+/// Pipe names are sanitised lossily, so `a/b` and `a_b` reach ONE daemon.
+/// The interactive client has always refused that mismatch; a control caller
+/// that did not would run its command in somebody else's session, and nothing
+/// on either side would say so.
+///
+/// Drives the real `zmux.exe`, because the check lives in the client.
+#[test]
+fn a_control_command_refuses_a_session_whose_name_only_collides() {
+    let d = Daemon::start("zmux-test-collide_x");
+    let zmux = env!("CARGO_BIN_EXE_zmux");
+
+    // The name that really is served: this must work.
+    let ok = std::process::Command::new(zmux)
+        .args(["info", &d.session])
+        .output()
+        .expect("run zmux info");
+    assert!(ok.status.success(), "info failed: {}", String::from_utf8_lossy(&ok.stderr));
+    assert!(String::from_utf8_lossy(&ok.stdout).contains(&d.session));
+
+    // A different name that sanitises to the same pipe: this must not.
+    let collided = d.session.replace('_', "/");
+    assert_ne!(collided, d.session, "the test needs two spellings of one pipe name");
+    let bad = std::process::Command::new(zmux)
+        .args(["info", &collided])
+        .output()
+        .expect("run zmux info");
+    assert!(!bad.status.success(), "a colliding name was accepted: {bad:?}");
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(err.contains("collide"), "unhelpful error: {err}");
+}

@@ -904,6 +904,14 @@ from the same round trip, so there is no follow-up query to race against the
 user doing something else. It is also the only thing that makes the CLI
 scriptable in one line.
 
+It is a snapshot, though, not a transaction: `info()` is read straight after
+the command and before `publish()` composites a frame, but no lock spans the
+two, so an attached human moving focus in that window is reported as if the
+command had done it. Closing that would mean holding a session-wide lock
+across a command and a full read-back, which is a worse trade than the
+window it removes. `PaneInfo::id` is the identifier that survives a focus
+change, and the skill says so.
+
 **Position, not `PaneId`.** Every control command takes the 1-based position
 in the current window - what the status bar shows, and what `C-b <digit>`
 means. Ids come from an allocator that never reuses a number (§9), so a

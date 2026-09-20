@@ -92,6 +92,12 @@ pub enum Query {
 
 /// The answer to `Query::Info`, and to every control mutation - a caller sees
 /// the state its own command produced without a second round trip.
+///
+/// A SNAPSHOT, not a transaction. It is read immediately after the command,
+/// before the frame is composited, but nothing locks the session across the
+/// two: an attached human moving focus in that instant is reported as though
+/// the command had done it. `PaneInfo::id` is the handle that survives a
+/// focus change; `focus` is only as fresh as the moment it was read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session: String,
