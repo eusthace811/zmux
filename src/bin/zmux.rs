@@ -13,7 +13,8 @@ use ratatui::Terminal;
 
 use zmux::ipc;
 use zmux::protocol::{
-    Cmd, ClientMsg, Frame, PaneState, Query, Report, ServerMsg, Source, Target, PROTOCOL_VERSION,
+    Cmd, ClientMsg, Frame, PaneState, Query, Report, ServerMsg, Source, Target, Until, WaitOutcome,
+    PROTOCOL_VERSION,
 };
 use zmux::render::{paint, paint_cursor, paint_overlay};
 
@@ -133,6 +134,8 @@ Driving a session without attaching (for scripts and agents):
   zmux report [<session>] [-p T] --state idle|working|blocked|done
                                            say what this pane is doing
   zmux report --check                    prove the report channel works
+  zmux wait <session> [-p T] --until settled|quiet|output TEXT|...
+                                           block until a pane does something
 
   -p chooses the pane: N its position in the current window, @N its id (which
      never moves), a name it reported, or `current` for the pane you are in.
@@ -477,6 +480,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some("report") => return report(&args[1..]),
+        Some("wait") => return wait(&args[1..]),
         Some("attach") => {
             let Some(name) = args.get(1) else { bail!("usage: zmux attach <session>") };
             if !ipc::is_running(name) {
@@ -488,6 +492,124 @@ fn main() -> Result<()> {
     }
     let session = args.first().cloned().unwrap_or_else(|| "default".into());
     attach(session)
+}
+
+const WAIT_USAGE: &str = "\
+usage: zmux wait <session> [-p T] --until <what> [--timeout MS] [--settle MS]
+
+  --until settled     the pane reports idle, done OR blocked - the usual one
+          idle | working | blocked | done
+          quiet        no shell command is running (an ordinary command, not
+                       an agent, which is one long command)
+          quiet-for MS the pane has produced no output for that long; the
+                       honest wait for a program that reports nothing
+          output TEXT  that text is in the pane's recent output (a literal
+                       substring, not a pattern; text already there matches)
+          bell         the pane rings the bell
+
+  --timeout MS   default 120000. The daemon caps this; at the cap you are
+                 told `timeout` and can ask again.
+  --settle MS    default 1500. Ignore --until until the pane has been seen
+                 doing something, or this long has passed. Without it, a
+                 wait started right after `run` can be satisfied by the
+                 quiet BEFORE the command rather than the quiet after it -
+                 the shell has not read the line yet. 0 turns it off, which
+                 is what you want when the pane is ALREADY working.
+
+Prints the session state the wait ended with, plus `outcome`: met, timeout
+or gone. Exits 0 only for `met`, so `zmux wait ... && zmux capture ...`
+does the right thing. `timeout` is a result, not an error - the pane is
+simply still going - so it is reported in the JSON like everything else.";
+
+fn wait(args: &[String]) -> Result<()> {
+    let mut rest = args;
+    let session = rest
+        .first()
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .or_else(|| std::env::var("ZMUX_SESSION").ok())
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("no session given\n{WAIT_USAGE}"))?;
+    if rest.first().is_some_and(|a| !a.starts_with('-')) {
+        rest = &rest[1..];
+    }
+
+    let (mut pane, mut until, mut timeout_ms, mut settle_ms) = (None, None, 120_000u32, 1_500u32);
+    while let Some(flag) = rest.first().map(String::as_str) {
+        let value = |n: usize| -> Result<String> {
+            rest.get(n).cloned().with_context(|| format!("{flag} needs a value\n{WAIT_USAGE}"))
+        };
+        match flag {
+            "--help" | "-h" => {
+                println!("{WAIT_USAGE}");
+                return Ok(());
+            }
+            "-p" | "--pane" => {
+                pane = Some(parse_target(&value(1)?)?);
+                rest = &rest[2..];
+            }
+            "--timeout" => {
+                timeout_ms = value(1)?.parse().context("--timeout takes milliseconds")?;
+                rest = &rest[2..];
+            }
+            "--settle" => {
+                settle_ms = value(1)?.parse().context("--settle takes milliseconds")?;
+                rest = &rest[2..];
+            }
+            "--until" => {
+                let what = value(1)?;
+                // The two that take an argument of their own consume a third
+                // word; everything else is a bare name.
+                let (u, used) = match what.as_str() {
+                    "settled" => (Until::Settled, 2),
+                    "quiet" => (Until::Quiet, 2),
+                    "bell" => (Until::Bell, 2),
+                    "quiet-for" => (
+                        Until::QuietFor(value(2)?.parse().context("quiet-for takes ms")?),
+                        3,
+                    ),
+                    "output" => (Until::Output(value(2)?), 3),
+                    name => match PaneState::parse(name) {
+                        Some(st) => (Until::State(st), 2),
+                        None => bail!("'{name}' is not something to wait for\n{WAIT_USAGE}"),
+                    },
+                };
+                until = Some(u);
+                rest = &rest[used..];
+            }
+            other => bail!("unexpected argument '{other}'\n{WAIT_USAGE}"),
+        }
+    }
+    let until = until.with_context(|| format!("--until is required\n{WAIT_USAGE}"))?;
+    if let Until::Output(text) = &until {
+        if text.chars().count() > zmux::protocol::MAX_MATCH_CHARS {
+            bail!("--until output takes at most {} characters", zmux::protocol::MAX_MATCH_CHARS);
+        }
+    }
+    let target = pane.unwrap_or(Target::Focused);
+
+    let msg = ClientMsg::Wait { target, until, timeout_ms, settle_ms };
+    let reply = request(&session, &msg)?;
+    let ServerMsg::Waited { outcome, info } = reply else {
+        bail!("unexpected reply: {reply:?}");
+    };
+    // The state the wait ENDED with, in the same shape `info` prints, so a
+    // caller acting on the answer needs no second call to race with. The
+    // outcome rides alongside rather than on its own line: every other
+    // subcommand answers with one JSON object, and this is not the place to
+    // invent a second convention.
+    let mut json = serde_json::to_value(&info)?;
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("outcome".into(), serde_json::to_value(outcome)?);
+    }
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    if outcome != WaitOutcome::Met {
+        // Deliberately not an `Err`: there is nothing to report on stderr,
+        // the answer is already on stdout, and a non-zero status is what
+        // makes `wait && capture` mean what it looks like.
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// The escape a pane writes to say what it is doing.

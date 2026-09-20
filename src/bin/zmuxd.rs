@@ -14,7 +14,9 @@ use interprocess::TryClone as _;
 
 use zmux::ipc;
 use zmux::layout::{Dir, Nav, PaneId};
-use zmux::protocol::{Cmd, ClientMsg, Query, ServerMsg, Target, PROTOCOL_VERSION};
+use zmux::protocol::{
+    Cmd, ClientMsg, Query, ServerMsg, Source, Target, Until, WaitOutcome, PROTOCOL_VERSION,
+};
 use zmux::pty::PtyEvent;
 use zmux::session::{Outbound, Session};
 
@@ -388,6 +390,15 @@ fn serve_control(
                 }
                 None => ServerMsg::Refused { reason: unknown(&target) },
             },
+            ClientMsg::Wait { target, until, timeout_ms, settle_ms } => {
+                match session.resolve(&target) {
+                    Some(id) => {
+                        let outcome = wait_for(session, id, &until, timeout_ms, settle_ms);
+                        ServerMsg::Waited { outcome, info: session.info() }
+                    }
+                    None => ServerMsg::Refused { reason: unknown(&target) },
+                }
+            }
             ClientMsg::Query(Query::Info) => ServerMsg::Info(session.info()),
             ClientMsg::Query(Query::CaptureAt { target, lines, source }) => {
                 match session
@@ -423,6 +434,77 @@ fn serve_control(
         ipc::write_msg(&mut stream, &reply)?;
     }
     Ok(())
+}
+
+/// How often a wait looks.
+///
+/// Polling, not a subscriber registry: these are one-shot CLI calls, and a
+/// notification system would need a new lock, a new ordering to get wrong,
+/// and a way to unregister a caller that died mid-wait. Twenty cheap reads a
+/// second against ONE pane costs less than any of that. herdr is event-driven
+/// because it serves many long-lived clients; this does not.
+const WAIT_POLL: Duration = Duration::from_millis(50);
+
+/// Block until `until` is true of pane `id`, or time runs out.
+///
+/// The pane is PINNED by id before this is called. Re-resolving the caller's
+/// target each tick would let a replacement satisfy the wait: ask to wait on
+/// position 2, have that pane exit, and the pane that slides into position 2
+/// would answer for it. herdr pins for the same reason.
+fn wait_for(
+    session: &Arc<Session>,
+    id: PaneId,
+    until: &Until,
+    timeout_ms: u32,
+    settle_ms: u32,
+) -> WaitOutcome {
+    let capped = zmux::session::capped_wait(timeout_ms, session.cfg.wait_timeout_max_ms);
+    let deadline = std::time::Instant::now() + Duration::from_millis(capped);
+    // The gate never outlives the wait itself, or asking to settle for longer
+    // than the timeout would test the condition exactly never.
+    let gate = std::time::Instant::now()
+        + Duration::from_millis(u64::from(settle_ms).min(capped));
+    let mut active = settle_ms == 0;
+    // Read once up front, so `Until::Bell` means "rings from here on" rather
+    // than "has ever rung".
+    let Some(start) = session.pane_status(id) else { return WaitOutcome::Gone };
+    loop {
+        let Some(now) = session.pane_status(id) else { return WaitOutcome::Gone };
+        // A pane whose shell has exited stops changing, so the layout is the
+        // authority on whether there is still anything to wait for.
+        if !session.pane_lives(id) {
+            return WaitOutcome::Gone;
+        }
+        // The pane has started doing something, so the condition is now
+        // about THIS command rather than the state before it.
+        active |= now.busy
+            || now.state == zmux::protocol::PaneState::Working
+            || now.bells > start.bells
+            || std::time::Instant::now() >= gate;
+        let met = active
+            && match until {
+                Until::Quiet => !now.busy,
+                Until::State(want) => now.state == *want,
+                Until::Settled => now.state.is_settled(),
+                Until::QuietFor(ms) => now.quiet_ms >= u64::from(*ms),
+                Until::Bell => now.bells > start.bells,
+                // Against the scrollback-backed read, so a match that
+                // scrolls past between two polls is still found. Text
+                // already on screen matches immediately, deliberately: a
+                // caller asking after the fact must not be left waiting for
+                // something that has happened.
+                Until::Output(text) => session
+                    .capture_from(id, 0, Source::RecentUnwrapped)
+                    .is_some_and(|s| s.contains(text.as_str())),
+            };
+        if met {
+            return WaitOutcome::Met;
+        }
+        if std::time::Instant::now() >= deadline {
+            return WaitOutcome::Timeout;
+        }
+        std::thread::sleep(WAIT_POLL);
+    }
 }
 
 /// How a target that resolves to nothing is reported.
@@ -628,7 +710,8 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     | ClientMsg::Query(_)
                     | ClientMsg::InputTo { .. }
                     | ClientMsg::InputAt { .. }
-                    | ClientMsg::Report { .. } => {}
+                    | ClientMsg::Report { .. }
+                    | ClientMsg::Wait { .. } => {}
                 }
             }
         }

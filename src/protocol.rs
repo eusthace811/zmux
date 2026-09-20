@@ -128,6 +128,26 @@ pub enum ClientMsg {
         /// submits it.
         enter: bool,
     },
+    /// Block until something is true of a pane, or the timeout runs out.
+    ///
+    /// Server-side because the alternative is every caller writing its own
+    /// polling loop over `info`, each with a different idea of how often to
+    /// ask and what counts as done - and each of them holding a pane's
+    /// position across the wait, which is the handle that moves.
+    Wait {
+        target: Target,
+        until: Until,
+        timeout_ms: u32,
+        /// Ignore `until` until the pane has been seen doing something, or
+        /// this many milliseconds have passed. 0 disables the gate.
+        ///
+        /// Closes the race that makes a naive "run it, then wait for quiet"
+        /// return instantly: the shell has not yet read the line, so it is
+        /// not busy yet, and the wait is satisfied by the quiet BEFORE the
+        /// command rather than the quiet after it. herdr solves the same
+        /// problem by requiring observed activity after a prompt.
+        settle_ms: u32,
+    },
     /// A pane saying what it is doing.
     ///
     /// The other way in is an OSC on the pane's own pty, which costs no
@@ -239,6 +259,60 @@ pub struct Report {
     /// arrival order.
     pub seq: Option<u64>,
 }
+
+/// What to wait for. Append-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Until {
+    /// Shell integration says no command is running. The right wait for an
+    /// ordinary command; useless for an agent, which is ONE long command.
+    Quiet,
+    /// The pane reports exactly this state.
+    State(PaneState),
+    /// The pane reports any state that has stopped: idle, done or blocked.
+    ///
+    /// `blocked` counts. A caller waiting on an agent wants to know when it
+    /// stops, and "it stopped to ask you something" is stopping - being told
+    /// only about a clean finish means waiting out the timeout on the one
+    /// case that needed a person.
+    Settled,
+    /// The pane has produced no output for this many milliseconds.
+    ///
+    /// The honest wait for a program that reports nothing about itself. It is
+    /// a measurement of silence, not a claim that the work is done, and the
+    /// caller chooses what length of silence it is willing to believe.
+    QuietFor(u32),
+    /// This text has appeared in the pane's recent output.
+    ///
+    /// A literal substring, not a pattern. A regex engine is a dependency and
+    /// a binary this project has reasons to keep small (DESIGN.md §6.1), and
+    /// `capture | grep` already exists for the cases a substring cannot
+    /// express.
+    ///
+    /// Matches text that is ALREADY there, as herdr's `wait-output` does - so
+    /// a caller that asks after the fact is not left waiting for something
+    /// that has happened.
+    Output(String),
+    /// The pane rings the bell. Works for a program that reports nothing,
+    /// because plenty of them ring it when they stop to ask.
+    Bell,
+}
+
+/// How a wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitOutcome {
+    /// The condition came true.
+    Met,
+    /// The time ran out first. NOT an error: a caller that asked to wait 30
+    /// seconds and waited 30 seconds got what it asked for, and has to be
+    /// able to tell that from a broken pipe.
+    Timeout,
+    /// The pane went away while we were waiting on it.
+    Gone,
+}
+
+/// Longest text `Until::Output` will look for.
+pub const MAX_MATCH_CHARS: usize = 200;
 
 /// Longest name a pane may claim. Long enough to be descriptive, short enough
 /// that a status bar and an error message can both show it whole.
@@ -539,6 +613,10 @@ pub enum ServerMsg {
     Info(SessionInfo),
     /// Reply to `Query::Capture`.
     Capture { text: String },
+    // --- appended. Append-only. ---
+    /// Reply to `Wait`. Carries the session state as it was when the wait
+    /// ended, so the caller does not need a second round trip to act on it.
+    Waited { outcome: WaitOutcome, info: SessionInfo },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

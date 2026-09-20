@@ -34,6 +34,25 @@ use crate::term::Term;
 
 use crate::config::Config;
 
+/// How long a `Wait` may actually block.
+///
+/// A wait holds one of the daemon's connection threads, so the CALLER does
+/// not get the last word: a script that asks to wait forever and then dies
+/// would leak one until the daemon exits. At the ceiling the caller is told
+/// `Timeout`, which it has to handle anyway, and can ask again.
+pub fn capped_wait(asked_ms: u32, max_ms: u64) -> u64 {
+    u64::from(asked_ms).min(max_ms)
+}
+
+/// One pane's answer to "what is happening in there", cheaply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneStatus {
+    pub state: crate::protocol::PaneState,
+    pub busy: bool,
+    pub bells: u32,
+    pub quiet_ms: u64,
+}
+
 /// A live session plus the channel its panes report on.
 pub type SessionHandle = (Arc<Session>, Receiver<(PaneId, PtyEvent)>);
 
@@ -463,6 +482,33 @@ impl Session {
         // whole session.
         pty.write_input(&payload)?;
         Ok(true)
+    }
+
+    /// Everything a wait condition needs from one pane, in one lock.
+    ///
+    /// `info()` would answer the same questions, but it walks every pane in
+    /// every window and takes each of their `Term` locks. A wait asks twenty
+    /// times a second, so it asks about ONE pane. `None` when the pane has
+    /// gone, which is how a wait learns to stop.
+    pub fn pane_status(&self, id: PaneId) -> Option<PaneStatus> {
+        let panes = lock(&self.panes);
+        let p = panes.get(&id)?;
+        let activity = lock(&p.term).activity();
+        Some(PaneStatus {
+            state: activity.state,
+            busy: activity.busy,
+            bells: activity.bells,
+            quiet_ms: p.pty.quiet_ms(),
+        })
+    }
+
+    /// Does this pane still exist in the layout?
+    ///
+    /// Asked of the PINNED id rather than the original target: a wait on
+    /// position 2 must not be satisfied by whatever moves into position 2
+    /// when the pane it was watching exits.
+    pub fn pane_lives(&self, id: PaneId) -> bool {
+        lock(&self.windows).panes().contains(&id)
     }
 
     /// Record what a pane says about itself, arriving over the control
@@ -1340,5 +1386,20 @@ impl Session {
                 eprintln!("[session] a ConPTY did not close within 5s; exiting anyway");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The caller does not get the last word on how long the daemon blocks.
+    #[test]
+    fn a_wait_cannot_outlast_the_daemons_ceiling() {
+        assert_eq!(capped_wait(5_000, 600_000), 5_000);
+        assert_eq!(capped_wait(u32::MAX, 600_000), 600_000);
+        // A ceiling of zero means every wait returns at once, which is a
+        // usable way to turn waiting off rather than a bug to clamp away.
+        assert_eq!(capped_wait(5_000, 0), 0);
     }
 }

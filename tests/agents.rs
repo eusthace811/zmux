@@ -5,7 +5,7 @@ mod common;
 use common::{Control, Daemon};
 
 use zmux::protocol::{
-    ClientMsg, Cmd, PaneState, Query, Report, ServerMsg, Source, Target,
+    ClientMsg, Cmd, PaneState, Query, Report, ServerMsg, Source, Target, Until, WaitOutcome,
 };
 
 /// A pane has to be able to say which pane it is, or `-p current` and every
@@ -215,18 +215,28 @@ fn an_ordinary_split_still_moves_the_focus() {
     }
 }
 
-/// A prompt goes in as one block. `bash -c 'read -r x'` with bracketed paste
-/// on is the smallest program that can tell the difference: pasted, the
-/// newline inside the text is data; typed, it ends the read.
+/// A prompt goes in as one block - but only because the DAEMON looked at
+/// the pane's live vt100 state and saw bracketed paste turned on. That
+/// lookup is the thing worth proving end to end; `src/paste.rs` covers the
+/// wrapping itself.
+///
+/// `cat -v` renders the escapes visibly, which is the same trick
+/// tests/mouse.rs uses. It is in canonical mode, so nothing appears until
+/// the Enter that rides in the same write arrives - which is also what makes
+/// the ordering visible.
 #[test]
-fn a_multi_line_prompt_reaches_a_program_as_one_paste() {
+fn a_prompt_is_pasted_when_the_program_asked_for_pastes() {
     let d = Daemon::start("zmux-test-paste");
     let mut c = Control::open(&d.session);
 
-    // Turn bracketed paste on, then read one "line" - which, inside a paste,
-    // is everything up to the end marker.
-    c.input_at(Target::Focused, "printf '\\033[?2004h'; read -r line; printf 'GOT[%s]\\n' \"$line\"", true);
-    std::thread::sleep(std::time::Duration::from_millis(900));
+    // The marker is split by quoting so the ECHOED command line does not
+    // contain it - waiting on one the echo satisfies would start pasting
+    // before `cat` is running. tests/smoke.rs plays the same trick.
+    c.input_at(Target::Focused, "printf '\\033[?2004h'; printf 'REA''DY\\n'; cat -v", true);
+    assert!(
+        c.wait_at(20, Target::Focused, |t| t.contains("READY")).is_some(),
+        "the program never started"
+    );
 
     let msg = ClientMsg::InputAt {
         target: Target::Focused,
@@ -237,11 +247,11 @@ fn a_multi_line_prompt_reaches_a_program_as_one_paste() {
     assert!(matches!(c.ask(&msg), ServerMsg::Info(_)), "the paste was refused");
 
     let screen = c
-        .wait_at(20, Target::Focused, |t| t.contains("GOT["))
-        .expect("the program never finished its read");
+        .wait_at(20, Target::Focused, |t| t.contains("^[[200~"))
+        .expect("nothing arrived at the program");
     assert!(
-        screen.contains("GOT[alpha bravo]"),
-        "the paste markers reached the program as text, or the text was mangled:\n{screen}"
+        screen.contains("^[[200~alpha bravo^[[201~"),
+        "the daemon did not wrap the text for a program that asked for pastes:\n{screen}"
     );
 }
 
@@ -586,4 +596,179 @@ fn capture_source(c: &mut Control, id: u32, lines: u16, source: Source) -> Strin
         ServerMsg::Capture { text } => text,
         other => panic!("expected Capture, got {other:?}"),
     }
+}
+
+/// Waiting for an ordinary command to finish, which is what `busy` is for.
+#[test]
+fn a_wait_returns_when_the_command_finishes() {
+    let d = Daemon::start("zmux-test-wait-quiet");
+    let mut c = Control::open(&d.session);
+    assert!(c.wait_at(20, Target::Focused, |t| t.contains('$')).is_some());
+
+    c.input_at(Target::Focused, "sleep 2; echo SLEPT", true);
+
+    // The race this exists to prove is closed: the shell has NOT read the
+    // line yet, so it is not busy yet, and a wait for quiet with no settle
+    // gate would be satisfied by the quiet before the command.
+    let started = std::time::Instant::now();
+    let outcome = waited_settling(&mut c, Target::Focused, Until::Quiet, 30_000, 3_000);
+    assert_eq!(outcome, WaitOutcome::Met);
+    let took = started.elapsed();
+    assert!(took.as_millis() >= 1000, "the wait returned before the command could run: {took:?}");
+    assert!(c.capture_at(Target::Focused).contains("SLEPT"), "waited for the wrong thing");
+}
+
+/// The wait an agent needs. `blocked` counts as settled: a caller told only
+/// about a clean finish waits out its whole timeout on the one case that
+/// needed a person.
+#[test]
+fn a_wait_for_settled_wakes_on_blocked_as_well_as_done() {
+    let d = Daemon::start("zmux-test-wait-settled");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    for state in [PaneState::Blocked, PaneState::Done, PaneState::Idle] {
+        let report = Report { state: Some(state), ..Default::default() };
+        c.ask(&ClientMsg::Report { target: Target::Id(id), report });
+        assert_eq!(
+            waited(&mut c, Target::Id(id), Until::Settled, 2_000),
+            WaitOutcome::Met,
+            "{state:?} should have settled the wait"
+        );
+    }
+
+    let report = Report { state: Some(PaneState::Working), ..Default::default() };
+    c.ask(&ClientMsg::Report { target: Target::Id(id), report });
+    assert_eq!(
+        waited(&mut c, Target::Id(id), Until::Settled, 700),
+        WaitOutcome::Timeout,
+        "a working pane satisfied a wait for settled"
+    );
+}
+
+/// Text already on screen matches at once. A caller that asks after the fact
+/// must not be left waiting for something that has already happened.
+#[test]
+fn a_wait_for_output_matches_what_is_already_there() {
+    let d = Daemon::start("zmux-test-wait-output");
+    let mut c = Control::open(&d.session);
+
+    c.input_at(Target::Focused, "echo ALREADY_PRINTED", true);
+    assert!(c
+        .wait_at(20, Target::Focused, |t| t.matches("ALREADY_PRINTED").count() >= 2)
+        .is_some());
+
+    let started = std::time::Instant::now();
+    let until = Until::Output("ALREADY_PRINTED".into());
+    assert_eq!(waited(&mut c, Target::Focused, until, 10_000), WaitOutcome::Met);
+    assert!(started.elapsed().as_millis() < 2_000, "matching existing output was slow");
+
+    let until = Until::Output("NEVER_PRINTED_AT_ALL".into());
+    assert_eq!(waited(&mut c, Target::Focused, until, 700), WaitOutcome::Timeout);
+}
+
+/// The honest wait for a program that reports nothing: a measured length of
+/// silence, with the caller choosing how much of it to believe.
+#[test]
+fn a_wait_for_silence_measures_it() {
+    let d = Daemon::start("zmux-test-wait-silence");
+    let mut c = Control::open(&d.session);
+    assert!(c.wait_at(20, Target::Focused, |t| t.contains('$')).is_some());
+
+    // A pane that is still talking cannot satisfy it.
+    c.input_at(Target::Focused, "for i in $(seq 1 40); do echo TICK_$i; sleep 0.1; done", true);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(
+        waited(&mut c, Target::Focused, Until::QuietFor(800), 1_500),
+        WaitOutcome::Timeout,
+        "a pane producing output was called quiet"
+    );
+
+    // Once it stops, it does.
+    assert_eq!(
+        waited(&mut c, Target::Focused, Until::QuietFor(800), 30_000),
+        WaitOutcome::Met
+    );
+}
+
+/// A wait pins the pane it resolved. Otherwise asking to wait on position 2,
+/// having that pane exit, and another sliding into position 2 would let the
+/// replacement answer for it.
+#[test]
+fn a_wait_ends_when_the_pane_it_watches_goes_away() {
+    let d = Daemon::start("zmux-test-wait-gone");
+    let mut c = Control::open(&d.session);
+    assert!(matches!(c.ask(&ClientMsg::Command(Cmd::SplitVertical)), ServerMsg::Info(_)));
+    assert!(d.wait_for_panes(2, 10), "the split never appeared");
+
+    let info = c.info();
+    let victim = info.focus_id;
+    assert!(info.panes.len() == 2);
+
+    // Wait on something that will never come true, while the pane exits.
+    let mut victim_c = Control::open(&d.session);
+    let handle = std::thread::spawn(move || {
+        waited(&mut victim_c, Target::Id(victim), Until::Output("NEVER".into()), 30_000)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    c.input_at(Target::Id(victim), "exit", true);
+
+    assert_eq!(handle.join().expect("the waiting thread panicked"), WaitOutcome::Gone);
+}
+
+fn waited(c: &mut Control, target: Target, until: Until, timeout_ms: u32) -> WaitOutcome {
+    // No settle gate: these tests set the pane up first and then wait, so
+    // there is nothing to wait for the pane to start doing.
+    waited_settling(c, target, until, timeout_ms, 0)
+}
+
+fn waited_settling(
+    c: &mut Control,
+    target: Target,
+    until: Until,
+    timeout_ms: u32,
+    settle_ms: u32,
+) -> WaitOutcome {
+    match c.ask(&ClientMsg::Wait { target, until, timeout_ms, settle_ms }) {
+        ServerMsg::Waited { outcome, .. } => outcome,
+        other => panic!("expected Waited, got {other:?}"),
+    }
+}
+
+/// Without the settle gate, "run it, then wait for quiet" is satisfied by
+/// the quiet BEFORE the command - the shell has not read the line yet. This
+/// pins that the gate is what closes it, rather than luck.
+#[test]
+fn without_a_settle_gate_a_wait_can_answer_about_the_wrong_moment() {
+    let d = Daemon::start("zmux-test-settle");
+    let mut c = Control::open(&d.session);
+    assert!(c.wait_at(20, Target::Focused, |t| t.contains('$')).is_some());
+
+    c.input_at(Target::Focused, "sleep 3; echo GATED", true);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        waited_settling(&mut c, Target::Focused, Until::Quiet, 30_000, 0),
+        WaitOutcome::Met
+    );
+    let ungated = started.elapsed();
+
+    // It came back essentially at once, before `sleep 3` could have ended.
+    assert!(
+        ungated.as_millis() < 2_500,
+        "the ungated race did not reproduce, so the gate proves nothing: {ungated:?}"
+    );
+    assert!(
+        !c.capture_at(Target::Focused).contains("GATED"),
+        "the command had already finished; the timing above was a coincidence"
+    );
+
+    // The same wait, gated, waits for the command it was asked about.
+    assert_eq!(
+        waited_settling(&mut c, Target::Focused, Until::Quiet, 30_000, 3_000),
+        WaitOutcome::Met
+    );
+    assert!(
+        c.wait_at(20, Target::Focused, |t| t.contains("GATED")).is_some(),
+        "the gated wait still returned before the command finished"
+    );
 }

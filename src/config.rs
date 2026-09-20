@@ -28,6 +28,13 @@ pub struct Config {
     pub status_bar: bool,
     /// Who the mouse belongs to.
     pub mouse: Mouse,
+    /// Longest a control caller may ask the daemon to block in one `wait`.
+    ///
+    /// A wait holds a connection handler thread. A caller that asks to wait
+    /// forever and then dies leaks one until the daemon exits, so there is a
+    /// ceiling; the caller gets `timeout`, which it must handle anyway, and
+    /// can simply ask again.
+    pub wait_timeout_max_ms: u64,
 }
 
 /// Who gets the mouse: zmux, or the terminal zmux is running in.
@@ -85,6 +92,7 @@ impl Default for Config {
             idle_timeout_hours: 8,
             status_bar: true,
             mouse: Mouse::default(),
+            wait_timeout_max_ms: 600_000,
         }
     }
 }
@@ -177,6 +185,13 @@ status_bar = true
 #   "off"   the terminal keeps it, and nothing inside zmux sees a mouse
 # `C-b m` cycles through them for the session without editing this file.
 mouse = "auto"
+
+# Ceiling on how long `zmux wait` may block the daemon in one call.
+#
+# A wait holds one of the daemon's connection threads, so a caller that asks
+# to wait forever and then dies would leak it. At the ceiling the caller is
+# told `timeout` - which it has to handle anyway - and can ask again.
+wait_timeout_max_ms = 600000
 "#;
 
 #[cfg(test)]
