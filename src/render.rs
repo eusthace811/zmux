@@ -113,6 +113,52 @@ pub struct BarState<'a> {
     pub scrolled: bool,
 }
 
+/// One thing on the bar: a window entry, a pane entry, a divider. Usually one
+/// span, but a pane that is running something is its number and a dot in two
+/// different colours, and nothing may come between them.
+type Token = Vec<Span>;
+
+/// Does this role get drawn on a background of its own?
+///
+/// It matters because a highlight has EDGES. A block that covers "work " but
+/// not the space in front of it puts the text hard against its left edge and
+/// a column of air inside its right, and the label reads as displaced even
+/// though the text is where it always was. So a highlighted token carries one
+/// column of its own colour on BOTH sides - and that column is the same
+/// column that would otherwise have separated it from its neighbour, so the
+/// bar does not grow and nothing below shifts.
+fn padded(role: Role) -> bool {
+    matches!(role, Role::Name | Role::ActiveWindow)
+}
+
+/// Lay tokens out with exactly one column between neighbours, letting a
+/// highlighted token's own padding be that column.
+fn assemble(tokens: Vec<Token>) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    // Does the next token still need a column in front of it? True at the
+    // start, because the bar opens with one - unless the first thing on it is
+    // a highlight, which then sits flush to the edge like a banner.
+    let mut owed = true;
+    for mut t in tokens.into_iter().filter(|t| !t.is_empty()) {
+        if padded(t[0].role) {
+            let last = t.len() - 1;
+            t[0].text.insert(0, ' ');
+            t[last].text.push(' ');
+            owed = false;
+        } else {
+            if owed {
+                out.push(span(Role::Sep, " "));
+            }
+            owed = true;
+        }
+        out.extend(t);
+    }
+    if owed {
+        out.push(span(Role::Sep, " "));
+    }
+    out
+}
+
 /// Build the status line.
 ///
 /// Pure, so the degradation ladder can be tested at every width without
@@ -124,12 +170,13 @@ pub fn status_spans(st: &BarState, width: usize) -> Vec<Span> {
     // Windows, named after what is running in them. With ONE window the index
     // is noise - there is nothing to switch to and the digit is not a
     // shortcut worth showing - so only the label is drawn.
-    let windows = |v: &mut Vec<Span>, labelled: bool| {
+    let windows = |labelled: bool| -> Vec<Token> {
+        let mut v: Vec<Token> = Vec::new();
         if st.windows.len() == 1 {
             if labelled {
-                v.push(span(Role::Info, format!("{} ", label_of(&st.windows[0], st.idle))));
+                v.push(vec![span(Role::Info, label_of(&st.windows[0], st.idle))]);
             }
-            return;
+            return v;
         }
         for (i, w) in st.windows.iter().enumerate() {
             // The digit is also the key that jumps there: `C-b <digit>`.
@@ -140,12 +187,14 @@ pub fn status_spans(st: &BarState, width: usize) -> Vec<Span> {
             } else {
                 (Role::Window, "")
             };
-            if labelled {
-                v.push(span(role, format!("{i}:{}{mark} ", label_of(w, st.idle))));
+            let text = if labelled {
+                format!("{i}:{}{mark}", label_of(w, st.idle))
             } else {
-                v.push(span(role, format!("{i}{mark} ")));
-            }
+                format!("{i}{mark}")
+            };
+            v.push(vec![span(role, text)]);
         }
+        v
     };
 
     // Panes: position, `*` if focused, `•` if running something.
@@ -154,49 +203,45 @@ pub fn status_spans(st: &BarState, width: usize) -> Vec<Span> {
     // number and star are pure noise - next to a count they read as two
     // numbers that disagreed. Whether it is BUSY is not noise, so that alone
     // survives.
-    let panes_list = |v: &mut Vec<Span>| {
+    let panes_list = || -> Vec<Token> {
+        let mut v: Vec<Token> = Vec::new();
         if panes == 1 {
             if st.busy[0] {
-                v.push(span(Role::Busy, "• "));
+                v.push(vec![span(Role::Busy, "•")]);
             }
-            return;
+            return v;
         }
         for (i, busy) in st.busy.iter().enumerate() {
             let pos = i + 1;
             let focused = pos == st.focus;
             let role = if focused { Role::ActivePane } else { Role::Info };
-            v.push(span(role, format!("{pos}{}", if focused { "*" } else { "" })));
+            let mut t = vec![span(role, format!("{pos}{}", if focused { "*" } else { "" }))];
             if *busy {
-                v.push(span(Role::Busy, "•"));
+                t.push(span(Role::Busy, "•"));
             }
-            v.push(span(Role::Sep, " "));
+            v.push(t);
         }
+        v
     };
 
     // Sections are JOINED, not concatenated with their own separators. A
     // section that turns out to be empty - one idle pane draws nothing at all
     // - used to leave the "| " that introduced it dangling at the end.
-    let join = |sections: Vec<Vec<Span>>| -> Vec<Span> {
-        let mut out = vec![span(Role::Sep, " ")];
-        let mut first = true;
+    let join = |sections: Vec<Vec<Token>>| -> Vec<Span> {
+        let mut tokens: Vec<Token> = Vec::new();
         for sec in sections.into_iter().filter(|s| !s.is_empty()) {
-            if !first {
-                out.push(span(Role::Sep, "| "));
+            if !tokens.is_empty() {
+                tokens.push(vec![span(Role::Sep, "|")]);
             }
-            first = false;
-            out.extend(sec);
+            tokens.extend(sec);
         }
-        out
+        assemble(tokens)
     };
-    let alert = || -> Vec<Span> {
-        if st.scrolled { vec![span(Role::Alert, "SCROLL ")] } else { Vec::new() }
+    let alert = || -> Vec<Token> {
+        if st.scrolled { vec![vec![span(Role::Alert, "SCROLL")]] } else { Vec::new() }
     };
-    let tail = |labelled: bool| -> Vec<Vec<Span>> {
-        let mut w = Vec::new();
-        windows(&mut w, labelled);
-        let mut p = Vec::new();
-        panes_list(&mut p);
-        vec![w, p, alert()]
+    let tail = |labelled: bool| -> Vec<Vec<Token>> {
+        vec![windows(labelled), panes_list(), alert()]
     };
 
     // Drop the least useful parts first rather than letting the whole line be
@@ -205,20 +250,23 @@ pub fn status_spans(st: &BarState, width: usize) -> Vec<Span> {
     // off the end. The labels go before the window list does: knowing WHICH
     // window you are on outranks knowing what is running in the others, and
     // dropping them lands exactly on the bar this had before labels existed.
-    let mut with_name = vec![vec![span(Role::Name, format!("{} ", st.name))]];
+    let mut with_name = vec![vec![vec![span(Role::Name, st.name)]]];
     with_name.extend(tail(true));
     let full = join(with_name);
 
     let without_name = join(tail(true));
     let without_labels = join(tail(false));
 
-    let mut count = Vec::new();
+    let mut count: Vec<Token> = Vec::new();
     if st.windows.len() > 1 {
-        count.push(span(Role::ActiveWindow, format!("{}/{} ", st.current, st.windows.len())));
+        count.push(vec![span(
+            Role::ActiveWindow,
+            format!("{}/{}", st.current, st.windows.len()),
+        )]);
     }
-    let mut counted = vec![span(Role::Info, format!("{panes}p "))];
+    let mut counted: Vec<Token> = vec![vec![span(Role::Info, format!("{panes}p"))]];
     if st.busy.iter().any(|b| *b) {
-        counted.push(span(Role::Busy, "• "));
+        counted.push(vec![span(Role::Busy, "•")]);
     }
     let short = join(vec![count, counted, alert()]);
 
@@ -228,7 +276,7 @@ pub fn status_spans(st: &BarState, width: usize) -> Vec<Span> {
         }
     }
     // Nothing fits; this is the shortest thing that is still true.
-    join(vec![vec![span(Role::Info, format!("{panes}p "))], alert()])
+    join(vec![vec![vec![span(Role::Info, format!("{panes}p"))]], alert()])
 }
 
 fn label_of<'a>(label: &'a Option<String>, idle: &'a str) -> &'a str {
@@ -569,6 +617,27 @@ mod tests {
         assert_eq!(b.text(), " work | bash | 1 2 ");
     }
 
+    /// A highlight has EDGES. Cover "work " but not the space in front of it
+    /// and the text sits hard against the left edge of its block with a
+    /// column of air inside the right - the label looks displaced even
+    /// though it never moved. So every run drawn on its own background owns
+    /// a column on each side, and owns it at NO cost: that column is the
+    /// separator it would have needed anyway, so the line is unchanged.
+    #[test]
+    fn a_highlight_is_padded_on_both_sides_and_costs_nothing() {
+        let mut b = B::new(&["", "cargo", "vim"], &[true, false]);
+        b.current = 1;
+        b.focus = 2;
+        let spans = b.at(80);
+        let lit: Vec<&Span> = spans.iter().filter(|s| padded(s.role)).collect();
+        assert_eq!(lit.len(), 2, "the name and the current window: {spans:?}");
+        for s in &lit {
+            assert!(s.text.starts_with(' '), "no column in front of {s:?}");
+            assert!(s.text.ends_with(' '), "no column behind {s:?}");
+        }
+        assert_eq!(b.text(), " work | 0:bash 1:cargo* 2:vim | 1\u{2022} 2* ");
+    }
+
     /// The window you are on is the one thing on the bar you must be able to
     /// find at a glance, so it is the only window drawn in its own colours.
     #[test]
@@ -581,7 +650,10 @@ mod tests {
             .filter(|s| s.role == Role::ActiveWindow)
             .map(|s| s.text.as_str())
             .collect();
-        assert_eq!(active, vec!["1:cargo* "], "{spans:?}");
+        // Padded on BOTH sides: see `padded`. The column in front of it is
+        // the one that would have separated it from window 0 anyway, so the
+        // bar is the same width - only the highlight moved.
+        assert_eq!(active, vec![" 1:cargo* "], "{spans:?}");
     }
 
     /// Windows and panes are both runs of small numbers on one line. Give
