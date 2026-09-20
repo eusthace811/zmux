@@ -169,10 +169,10 @@ ordinary Git Bash window.
 ## Reading the status bar
 
 ```
- work │ 0:bash 1:cargo* 2:vim │ 1• 2*
-   ▲       ▲                     ▲
-   │       │                     └─ panes in THIS window: 1 is running
-   │       │                        something, 2 is the one you are typing in
+ work │ 0:bash  1:cargo*  2:vim │ 1• 2*
+   ▲       ▲                       ▲
+   │       │                       └─ panes in THIS window: 1 is running
+   │       │                          something, 2 is the one you are typing in
    │       └─ windows, each named after what is running in it; the
    │          highlighted one is where you are, and its number is the
    │          digit that jumps back to it
@@ -184,6 +184,12 @@ A window is named after the command running in its focused pane — `cargo`,
 that is running something, so you can see a build still going in a pane you
 are not looking at. Both need zmux's shell integration, which is on unless
 you set `shell_integration = false`.
+
+Whatever is highlighted — the session name, the window you are on — keeps a
+column of its own colour inside its edges and a column of the bar's outside
+them, so the text is centred in its block and the block is not touching the
+window next to it. That is why the spacing around the highlighted window
+looks wider than the rest: one of those two columns is coloured.
 
 The window list appears only once you have more than one window, and a pane's
 number only once the window holds more than one — neither can tell you

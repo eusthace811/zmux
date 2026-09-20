@@ -118,45 +118,78 @@ pub struct BarState<'a> {
 /// different colours, and nothing may come between them.
 type Token = Vec<Span>;
 
-/// Does this role get drawn on a background of its own?
-///
-/// It matters because a highlight has EDGES. A block that covers "work " but
-/// not the space in front of it puts the text hard against its left edge and
-/// a column of air inside its right, and the label reads as displaced even
-/// though the text is where it always was. So a highlighted token carries one
-/// column of its own colour on BOTH sides - and that column is the same
-/// column that would otherwise have separated it from its neighbour, so the
-/// bar does not grow and nothing below shifts.
-fn padded(role: Role) -> bool {
-    matches!(role, Role::Name | Role::ActiveWindow)
+/// What kind of thing a token is, as far as SPACING is concerned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Drawn on a background of its own, so it is a block with edges.
+    Lit,
+    /// Punctuation between sections. It is meant to sit between things.
+    Divider,
+    /// Ordinary text on the bar's own background.
+    Item,
 }
 
-/// Lay tokens out with exactly one column between neighbours, letting a
-/// highlighted token's own padding be that column.
+fn kind(role: Role) -> Kind {
+    match role {
+        Role::Name | Role::ActiveWindow => Kind::Lit,
+        Role::Sep => Kind::Divider,
+        _ => Kind::Item,
+    }
+}
+
+/// Lay tokens out, spacing them by what they ARE.
+///
+/// A highlight has EDGES, and that makes it need two different things at
+/// once. Cover "work " but not the space in front of it and the text sits
+/// hard against the left edge of its block with a column of air inside the
+/// right: the label looks displaced though it never moved. So a block owns a
+/// column of its OWN colour on each side. But then that coloured column is
+/// all that stands between the block and the next entry's text, and the
+/// block reads as stuck to a window it has nothing to do with. So a block
+/// also keeps a column of the bar's own colour between itself and any
+/// neighbouring TEXT - a moat, one column wide, outside the padding.
+///
+/// Not against a divider, though, and not against the ends of the line: `|`
+/// is there to separate things and does not need separating from, and the
+/// edge of the screen is not something the highlight could be confused with.
+/// Those are the two places a moat would only read as slack.
 fn assemble(tokens: Vec<Token>) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
-    // Does the next token still need a column in front of it? True at the
-    // start, because the bar opens with one - unless the first thing on it is
-    // a highlight, which then sits flush to the edge like a banner.
-    let mut owed = true;
+    let mut prev: Option<Kind> = None;
     for mut t in tokens.into_iter().filter(|t| !t.is_empty()) {
-        if padded(t[0].role) {
+        let k = kind(t[0].role);
+        if gap(prev, Some(k)) {
+            out.push(span(Role::Sep, " "));
+        }
+        if k == Kind::Lit {
             let last = t.len() - 1;
             t[0].text.insert(0, ' ');
             t[last].text.push(' ');
-            owed = false;
-        } else {
-            if owed {
-                out.push(span(Role::Sep, " "));
-            }
-            owed = true;
         }
         out.extend(t);
+        prev = Some(k);
     }
-    if owed {
+    if gap(prev, None) {
         out.push(span(Role::Sep, " "));
     }
     out
+}
+
+/// Is a column of the bar's own colour wanted between these two? `None` is
+/// an end of the line.
+///
+/// Everything is one column apart, and a block's own padding IS that column
+/// where the thing on the other side is a divider or the end of the line.
+/// Everywhere else the padding is extra and the column is still wanted.
+fn gap(prev: Option<Kind>, next: Option<Kind>) -> bool {
+    // An empty bar has no sides to keep apart.
+    if prev.is_none() && next.is_none() {
+        return false;
+    }
+    // The two neighbours a block's own padding already separates it from.
+    let soft = |k: Option<Kind>| matches!(k, None | Some(Kind::Divider));
+    let lit = |k: Option<Kind>| k == Some(Kind::Lit);
+    !((lit(prev) && soft(next)) || (soft(prev) && lit(next)))
 }
 
 /// Build the status line.
@@ -591,7 +624,7 @@ mod tests {
         let mut b = B::new(&["", "cargo", "vim"], &[false, false]);
         b.current = 1;
         b.focus = 2;
-        assert_eq!(b.text(), " work | 0:bash 1:cargo* 2:vim | 1 2* ");
+        assert_eq!(b.text(), " work | 0:bash  1:cargo*  2:vim | 1 2* ");
     }
 
     #[test]
@@ -617,25 +650,38 @@ mod tests {
         assert_eq!(b.text(), " work | bash | 1 2 ");
     }
 
-    /// A highlight has EDGES. Cover "work " but not the space in front of it
-    /// and the text sits hard against the left edge of its block with a
-    /// column of air inside the right - the label looks displaced even
-    /// though it never moved. So every run drawn on its own background owns
-    /// a column on each side, and owns it at NO cost: that column is the
-    /// separator it would have needed anyway, so the line is unchanged.
+    /// A highlight has EDGES, and that makes it need two things at once.
+    ///
+    /// It needs a column of its OWN colour on each side, or the text sits
+    /// hard against the left edge of its block with a column of air inside
+    /// the right and the label looks displaced though it never moved. And it
+    /// needs a column of the BAR's colour outside that, or the block is
+    /// touching the next window's name and reads as attached to it.
     #[test]
-    fn a_highlight_is_padded_on_both_sides_and_costs_nothing() {
+    fn a_highlight_is_padded_and_then_kept_off_its_neighbours() {
         let mut b = B::new(&["", "cargo", "vim"], &[true, false]);
         b.current = 1;
         b.focus = 2;
         let spans = b.at(80);
-        let lit: Vec<&Span> = spans.iter().filter(|s| padded(s.role)).collect();
+        let lit: Vec<&Span> = spans.iter().filter(|s| kind(s.role) == Kind::Lit).collect();
         assert_eq!(lit.len(), 2, "the name and the current window: {spans:?}");
         for s in &lit {
             assert!(s.text.starts_with(' '), "no column in front of {s:?}");
             assert!(s.text.ends_with(' '), "no column behind {s:?}");
         }
-        assert_eq!(b.text(), " work | 0:bash 1:cargo* 2:vim | 1\u{2022} 2* ");
+        // Two columns between the block and the text on either side of it:
+        // one its own, one the bar's.
+        assert!(b.text().contains("0:bash  1:cargo*  2:vim"), "{}", b.text());
+    }
+
+    /// The moat is for TEXT. `|` is already a separator and the edge of the
+    /// screen is nothing the highlight could be confused with, so against
+    /// those the block's own padding is the whole gap - otherwise the bar
+    /// just looks slack at both ends of the name.
+    #[test]
+    fn a_highlight_does_not_keep_away_from_dividers_or_the_edge() {
+        let b = B::new(&["", "x"], &[false]);
+        assert!(b.text().starts_with(" work |"), "{}", b.text());
     }
 
     /// The window you are on is the one thing on the bar you must be able to
@@ -697,7 +743,7 @@ mod tests {
         // narrowest bar there is.
         let no_label =
             bars.iter().rev().find(|b| !b.contains("cargo")).expect("a rung without labels");
-        assert!(no_label.contains("0 1* 2"), "the window list must outlive the labels: {no_label}");
+        assert!(no_label.contains("0  1*  2"), "the window list must outlive the labels: {no_label}");
     }
 
     #[test]
@@ -777,3 +823,4 @@ mod tests {
         }
     }
 }
+
