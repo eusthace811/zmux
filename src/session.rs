@@ -201,7 +201,25 @@ impl Session {
     ///
     /// Called after any structural change. Failures are logged, never fatal:
     /// not being able to save a layout is no reason to lose a working session.
+    ///
+    /// Skipped once the session is shutting down. `shutdown` saves the
+    /// arrangement it means to restore and THEN drains the pane map, so a
+    /// save arriving after that would capture no panes, write a layout with
+    /// no directories in it, and every restored shell would come back in the
+    /// wrong place. `remove_pane` has refused to run during teardown since a
+    /// restarted session came back with one window instead of two; putting
+    /// the check here covers every caller, including a split that is still
+    /// retrying a shell when the session is told to stop.
     fn save_state(&self) {
+        if !self.running.load(Ordering::Relaxed) {
+            return;
+        }
+        self.save_state_now();
+    }
+
+    /// The save itself. `shutdown` uses this directly, because by then
+    /// `running` is already false and its save is the one that matters.
+    fn save_state_now(&self) {
         let _s = lock(&self.save);
         // Capture layout and panes together. Taking them under separate locks
         // allowed a split to land in between, producing a snapshot whose tree
@@ -957,18 +975,26 @@ impl Session {
         )
     }
 
+    /// Compose the current screen.
+    ///
+    /// The revision is read LAST, after the state it describes. Neither order
+    /// is exact - the two are not captured atomically, and `serve` calls this
+    /// on attach outside the `last_published` lock that serialises everything
+    /// else - so the question is only which way it should be wrong.
+    ///
+    /// Reading it FIRST was tried and reverted. It produces a frame stamped
+    /// OLDER than its contents, which a client that has already passed that
+    /// revision rejects; `last_published` then holds that stale base, every
+    /// later delta is derived from it and rejected too, and nothing asks for
+    /// a resync - the frozen display DESIGN.md §4 describes. Stamped newer,
+    /// the failure is one dropped frame that the next delta corrects, because
+    /// the base and the client agree on the number even when the contents
+    /// lagged. Degrading is better than wedging.
     pub fn snapshot(&self) -> Frame {
-        // Read the revision FIRST, before the state it is going to describe.
-        // Reading it afterwards could pick up a bump that happened while this
-        // snapshot was being taken - so the frame would carry a number newer
-        // than its own contents, and the publish that follows that bump,
-        // describing the newer state, would land at an EQUAL revision and be
-        // dropped. A revision that is a little stale is safe; one that runs
-        // ahead of its own contents is not.
-        let revision = self.revision.load(Ordering::Relaxed);
         let (cols, rows) = self.size();
         let layout = self.layout_snapshot();
         let status = self.cfg.status_bar.then(|| self.status_line());
+        let revision = self.revision.load(Ordering::Relaxed);
         let panes = lock(&self.panes);
         let mut f = composite(
             cols,
@@ -1020,7 +1046,7 @@ impl Session {
         self.broadcast(&ServerMsg::ShuttingDown);
         // Save the final directories: cwd was otherwise only persisted on
         // structural changes, so a plain `cd` before shutdown was lost.
-        self.save_state();
+        self.save_state_now();
         // Take `geometry` so a concurrent split cannot insert a pane AFTER the
         // map is drained, leaving a ConPTY outside teardown. Released before
         // closing.
