@@ -21,18 +21,31 @@ fn splitting_gives_two_independent_shells() {
         "status never reported two panes"
     );
 
-    // Focus follows the new pane; type there.
-    c.input("echo RIGHT_PANE\r");
+    // Focus follows the new pane. Set a variable there.
+    //
+    // Both panes' text is on ONE composited screen, so asserting that two
+    // markers are both visible proves only that the keystrokes landed
+    // somewhere - a single shared shell would put both on screen too. Shell
+    // STATE is what actually distinguishes them.
+    c.input("SPLITVAR=right\r");
     assert!(
-        c.wait_for(20, |t| t.contains("RIGHT_PANE")).is_some(),
-        "new pane did not run the command"
+        c.wait_for(20, |t| t.contains("SPLITVAR")).is_some(),
+        "new pane did not accept input"
     );
 
-    // Move back to the original and prove it is a DIFFERENT shell.
+    // Move back to the original and read that variable. `$SPLITVAR` is not
+    // expanded in the echoed command line, so "LEFT::" - the empty value -
+    // can only be this shell's own answer. One shared shell would say
+    // "LEFT:right:".
     c.cmd(Cmd::FocusLeft);
-    c.input("echo LEFT_PANE\r");
-    let screen = c.wait_for(20, |t| t.contains("LEFT_PANE") && t.contains("RIGHT_PANE"))
-        .expect("both panes' output should be on screen at once");
+    c.input("echo LEFT:$SPLITVAR:\r");
+    let screen = c
+        .wait_for(20, |t| t.contains("LEFT::"))
+        .expect("the original pane shares a shell with the new one");
+    assert!(
+        !screen.contains("LEFT:right:"),
+        "both panes are the same shell:\n{screen}"
+    );
 
     // A vertical divider must separate them.
     assert!(screen.contains('│'), "no divider drawn; screen was:\n{screen}");
