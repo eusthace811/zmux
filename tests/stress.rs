@@ -11,10 +11,18 @@ use std::time::{Duration, Instant};
 use zmux::ipc;
 use zmux::protocol::{ClientMsg, Cmd, ServerMsg, PROTOCOL_VERSION};
 
-/// A client that handshakes and then never reads must not take the daemon with
-/// it. Its queue fills, it gets dropped, and everyone else carries on.
+/// A client that handshakes and then never reads must not take the daemon or
+/// the other clients with it. Its writer thread wedges; nobody else notices.
+///
+/// NOT what this proves: that the silent peer is dropped. It is not. Its
+/// writer blocks in `write_msg` once the pipe buffer fills, a blocking write
+/// on a Windows pipe never times out, and the serve loop only gives up when
+/// `writer.is_finished()` - which a wedged writer never is. So it stays
+/// registered, holding the idle timer open and its viewport in the `min()`
+/// that sizes the session. This test asserts containment, which is what the
+/// design promises; see the README for the rest.
 #[test]
-fn a_client_that_stops_reading_is_dropped_not_tolerated() {
+fn a_client_that_stops_reading_is_contained_not_dropped() {
     let d = Daemon::start("zmux-test-slowclient");
     let mut good = d.attach_ready(90, 24);
 

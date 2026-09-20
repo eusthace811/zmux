@@ -194,6 +194,15 @@ sustained output, attach/detach churn, many splits, and malformed input.
   `C-b <digit>` renumbers with them. tmux leaves a gap instead. There are no
   window names, and only the first ten windows have a digit.
 - **Queues are bounded by message count, not bytes.**
+- **A client that stops reading is contained, not dropped.** Frames coalesce,
+  so it costs no memory, and its wedged writer thread takes nothing else with
+  it. But a blocking write on a Windows pipe never times out and the serve
+  loop only gives up when the writer *finishes*, so the peer stays registered:
+  it holds the idle timer open, and its viewport stays in the `min()` that
+  sizes the session for everyone. herdr drops such a peer with a write timeout
+  that resets whenever sending makes progress
+  (`server/client_transport.rs`); the Windows equivalent is a watchdog that
+  closes the handle out from under a writer that has not moved.
 - **A pane whose shell has stopped reading its input can stall layout, and
   teardown with it.** `Pane::resize` ends in a one-byte write to the pty, and
   a pty write blocks once ConPTY's input pipe is full. Reflow applies resizes
