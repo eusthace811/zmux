@@ -459,6 +459,17 @@ impl Session {
         Ok(true)
     }
 
+    /// Record what a pane says about itself, arriving over the control
+    /// connection rather than on the pane's own pty.
+    ///
+    /// False when the pane is gone or the report changed nothing. A report
+    /// does not publish: it moves no pixels, and waking every attached client
+    /// for a state change nobody can see is pure cost.
+    pub fn report(&self, id: PaneId, r: &crate::protocol::Report) -> bool {
+        let panes = lock(&self.panes);
+        panes.get(&id).is_some_and(|p| lock(&p.term).record(r))
+    }
+
     /// The visible screen of one pane by id, as text. See `capture`.
     pub fn capture_from(&self, id: PaneId, lines: u16) -> Option<String> {
         let panes = lock(&self.panes);
@@ -522,6 +533,9 @@ impl Session {
                     command: activity.command,
                     busy: activity.busy,
                     last_exit: activity.last_exit,
+                    state: activity.state,
+                    agent: activity.agent,
+                    name: activity.name,
                     quiet_ms,
                     bells: activity.bells,
                     title: activity.raw_title,

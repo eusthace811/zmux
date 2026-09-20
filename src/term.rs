@@ -140,6 +140,60 @@ pub struct Signals {
     /// instead of tracking an id. Set by the report channel (DESIGN.md §12),
     /// and cleared when the command that claimed it ends.
     pub name: Option<String>,
+    /// The last state this pane reported. See `protocol::PaneState`.
+    pub state: crate::protocol::PaneState,
+    /// What the pane says is running in it.
+    pub agent: Option<String>,
+    /// Highest `seq` accepted so far. Reset with the rest when a new
+    /// foreground command starts, so an agent restarting at 1 is not ignored.
+    pub report_seq: u64,
+}
+
+impl Signals {
+    /// Take a report, or refuse it. True when anything changed.
+    ///
+    /// Out-of-order reports are DROPPED rather than merged. Two hooks firing
+    /// close together can arrive backwards, and taking the later-arriving one
+    /// would leave a pane reading `working` after it had already gone idle -
+    /// which is the exact lie a caller waiting on that pane cannot survive.
+    pub fn record(&mut self, r: &crate::protocol::Report) -> bool {
+        if let Some(seq) = r.seq {
+            if seq <= self.report_seq {
+                return false;
+            }
+            self.report_seq = seq;
+        }
+        let mut changed = false;
+        if let Some(state) = r.state {
+            changed |= self.state != state;
+            self.state = state;
+        }
+        if let Some(agent) = r.agent.as_deref().and_then(sanitise) {
+            changed |= self.agent.as_deref() != Some(agent.as_str());
+            self.agent = Some(agent);
+        }
+        // Checked here as well as at every parse, because this is the one
+        // place both the OSC and the control message go through.
+        if let Some(name) = r.name.as_deref().filter(|n| crate::protocol::is_valid_name(n)) {
+            changed |= self.name.as_deref() != Some(name);
+            self.name = Some(name.to_string());
+        }
+        changed
+    }
+
+    /// Forget everything the last program said about itself.
+    ///
+    /// Called when a foreground command starts or ends, which is what makes
+    /// staleness exact rather than a guess with a timeout attached: OSC 133
+    /// brackets the command, so every report an agent makes arrives strictly
+    /// between the two, and when the second one lands the agent is gone.
+    fn forget_reports(&mut self) {
+        self.state = crate::protocol::PaneState::Unknown;
+        self.agent = None;
+        self.name = None;
+        // So an agent that restarts and counts from 1 again is heard.
+        self.report_seq = 0;
+    }
 }
 
 /// What a pane is doing. One lock, every fact the bar and `info` need.
@@ -148,6 +202,12 @@ pub struct Activity {
     pub command: Option<String>,
     pub busy: bool,
     pub last_exit: Option<i32>,
+    /// What the pane last said it was doing.
+    pub state: crate::protocol::PaneState,
+    /// What the pane says is running in it.
+    pub agent: Option<String>,
+    /// The name the pane claimed.
+    pub name: Option<String>,
     /// The OSC 0/2 title, and ONLY when no shell integration has been seen -
     /// otherwise it is just the directory restated.
     ///
@@ -199,6 +259,43 @@ fn sanitise(s: &str) -> Option<String> {
     (!out.is_empty()).then(|| out.to_string())
 }
 
+/// Parse `key=value` parameters into a report.
+///
+/// `None` when nothing usable was found, so a malformed sequence leaves the
+/// pane's state alone instead of blanking it. A value that is not understood
+/// (a misspelt state, a name with a capital in it) drops THAT key, for the
+/// same reason: a typo in somebody's hook must not erase a state that was
+/// true a moment ago.
+///
+/// Values may not contain `;`, because OSC parameters are split on it. States
+/// and names could not anyway, and an agent's name is a program name.
+fn parse_report(params: &[&[u8]]) -> Option<crate::protocol::Report> {
+    let mut r = crate::protocol::Report::default();
+    let mut any = false;
+    for p in params {
+        let Ok(text) = std::str::from_utf8(p) else { continue };
+        let Some((key, value)) = text.split_once('=') else { continue };
+        let value = value.trim();
+        match key.trim() {
+            "state" => {
+                r.state = crate::protocol::PaneState::parse(value);
+                any |= r.state.is_some();
+            }
+            "agent" => {
+                r.agent = sanitise(value);
+                any |= r.agent.is_some();
+            }
+            "name" => {
+                r.name = crate::protocol::is_valid_name(value).then(|| value.to_string());
+                any |= r.name.is_some();
+            }
+            "seq" => r.seq = value.parse().ok(),
+            _ => {}
+        }
+    }
+    any.then_some(r)
+}
+
 /// vt100 callback sink. OSC 7 is not a sequence vt100 handles itself, so it
 /// arrives via `unhandled_osc` - which is how we get cwd at all on Windows
 /// (DESIGN.md §4).
@@ -228,15 +325,37 @@ impl vt100::Callbacks for Hooks {
                 let Ok(mut s) = self.signals.lock() else { return };
                 s.integrated = true;
                 match params[1] {
-                    b"C" => s.busy = true,
+                    b"C" => {
+                        s.busy = true;
+                        // A new foreground command: whatever the last one
+                        // said about itself is now about a dead process.
+                        s.forget_reports();
+                    }
                     b"D" => {
                         s.busy = false;
+                        s.forget_reports();
                         s.last_exit = params
                             .get(2)
                             .and_then(|p| std::str::from_utf8(p).ok())
                             .and_then(|p| p.trim().parse().ok());
                     }
                     _ => {}
+                }
+            }
+            // OSC 1341 ; zmux ; key=value ; ...
+            //
+            // How a program in a pane says what it is doing (DESIGN.md §12).
+            // An OSC rather than a command, because it costs no process, does
+            // not need this binary on PATH or the session's name, and any
+            // terminal that does not understand it swallows it silently.
+            //
+            // The literal `zmux` is a guard: the OSC number is arbitrary
+            // and unregistered, so this makes a collision with somebody
+            // else's 1341 harmless instead of a mis-parse.
+            b"1341" if params[1] == b"zmux" => {
+                let Some(report) = parse_report(&params[2..]) else { return };
+                if let Ok(mut s) = self.signals.lock() {
+                    s.record(&report);
                 }
             }
             // OSC 633 ; E ; <command line>
@@ -312,6 +431,9 @@ impl Term {
             command: s.command.clone(),
             busy: s.busy,
             last_exit: s.last_exit,
+            state: s.state,
+            agent: s.agent.clone(),
+            name: s.name.clone(),
             title: if s.integrated { None } else { title.clone() },
             raw_title: title,
             bells: s.bells,
@@ -321,6 +443,11 @@ impl Term {
     /// The name this pane claimed for itself, if it claimed one.
     pub fn name(&self) -> Option<String> {
         self.signals.lock().ok()?.name.clone()
+    }
+
+    /// Take a report that arrived some way other than the pane's own pty.
+    pub fn record(&self, r: &crate::protocol::Report) -> bool {
+        self.signals.lock().is_ok_and(|mut s| s.record(r))
     }
 
     /// Latest reported working directory, converted to a Windows path.

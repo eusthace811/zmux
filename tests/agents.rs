@@ -4,7 +4,7 @@
 mod common;
 use common::{Control, Daemon};
 
-use zmux::protocol::{ClientMsg, Cmd, Query, ServerMsg, Target};
+use zmux::protocol::{ClientMsg, Cmd, PaneState, Query, Report, ServerMsg, Target};
 
 /// A pane has to be able to say which pane it is, or `-p current` and every
 /// self-report are guesswork. The id, not the position - positions renumber.
@@ -325,6 +325,168 @@ fn a_pane_reports_the_title_it_set() {
             break;
         }
         assert!(std::time::Instant::now() < deadline, "the title never arrived");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The whole reporting contract, through a real pty: a program writes the
+/// escape on its own output and the daemon hears it.
+///
+/// `read` after the report is not decoration - it is the shape of an agent.
+/// A claim lives exactly as long as the process that made it, so a command
+/// that reports and exits has already been forgotten by the time anyone
+/// looks. See `a_new_command_clears_what_the_last_one_claimed`.
+#[test]
+fn a_pane_can_say_what_it_is_doing() {
+    let d = Daemon::start("zmux-test-report-osc");
+    let mut c = Control::open(&d.session);
+    assert_eq!(c.info().panes[0].state, PaneState::Unknown, "a fresh pane claims nothing");
+    let id = c.info().panes[0].id;
+
+    c.input_at(Target::Focused, &agent_like("state=working;agent=ampere;name=reviewer"), true);
+    let p = wait_for_state(&mut c, PaneState::Working, 20).expect("the report never arrived");
+    assert_eq!(p.agent.as_deref(), Some("ampere"));
+    assert_eq!(p.name.as_deref(), Some("reviewer"));
+
+    // The name it claimed resolves, while it still holds the pane. Read
+    // rather than write: the pane is blocked in `read`, and typing at it
+    // would answer that instead of proving anything about the name.
+    let by_name = c.capture_at(Target::Name("reviewer".into()));
+    let by_id = c.capture_at(Target::Id(id));
+    assert_eq!(by_name, by_id, "the name resolved to a different pane than the id");
+}
+
+/// A command that reports and then waits, which is the shape of an agent
+/// sitting at its prompt. `read` holds the foreground until we send a line.
+fn agent_like(keys: &str) -> String {
+    format!(r"printf '\033]1341;zmux;{keys}\033\\'; read -r _")
+}
+
+/// Reports also arrive over the pipe, for a reporter whose output is
+/// captured and cannot reach the terminal.
+#[test]
+fn a_report_can_come_over_the_pipe_instead() {
+    let d = Daemon::start("zmux-test-report-pipe");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    let report = Report { state: Some(PaneState::Blocked), ..Default::default() };
+    match c.ask(&ClientMsg::Report { target: Target::Id(id), report }) {
+        ServerMsg::Info(i) => {
+            let p = i.panes.iter().find(|p| p.id == id).expect("the pane vanished");
+            assert_eq!(p.state, PaneState::Blocked);
+        }
+        other => panic!("the report was refused: {other:?}"),
+    }
+}
+
+/// Two hooks firing close together can arrive backwards. Taking the
+/// later-arriving one would leave a pane reading `working` after it went
+/// idle - the exact lie a caller waiting on that pane cannot survive.
+#[test]
+fn a_report_that_arrives_out_of_order_is_dropped() {
+    let d = Daemon::start("zmux-test-report-seq");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+    let send = |c: &mut Control, state, seq| {
+        let report = Report { state: Some(state), seq: Some(seq), ..Default::default() };
+        c.ask(&ClientMsg::Report { target: Target::Id(id), report })
+    };
+
+    send(&mut c, PaneState::Working, 5);
+    send(&mut c, PaneState::Idle, 6);
+    assert_eq!(state_of(&mut c, id), PaneState::Idle);
+
+    // Late, and therefore ignored - including at the same seq.
+    send(&mut c, PaneState::Working, 4);
+    assert_eq!(state_of(&mut c, id), PaneState::Idle, "a stale report overwrote a newer one");
+    send(&mut c, PaneState::Working, 6);
+    assert_eq!(state_of(&mut c, id), PaneState::Idle, "a repeated seq was accepted");
+    send(&mut c, PaneState::Working, 7);
+    assert_eq!(state_of(&mut c, id), PaneState::Working, "the seq counter stopped moving");
+}
+
+/// Staleness is solved exactly rather than with a timeout: OSC 133 brackets
+/// the foreground command, so when the command ends the agent is gone and so
+/// is everything it said about itself.
+#[test]
+fn a_new_command_clears_what_the_last_one_claimed() {
+    let d = Daemon::start("zmux-test-report-clear");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    c.input_at(Target::Focused, &agent_like("state=working;agent=ampere"), true);
+    assert!(wait_for_state(&mut c, PaneState::Working, 20).is_some());
+
+    // End the read, so the process that made the claim exits. OSC 133;D
+    // fires, and with it the claim goes - no timeout, no guessing.
+    c.input_at(Target::Focused, "", true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let p = pane_of(&mut c, id);
+        if p.state == PaneState::Unknown && p.agent.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a finished agent's claim outlived it: {:?}",
+            p.state
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A malformed or misspelt report must leave the pane alone. Blanking a
+/// state that was true because somebody's hook has a typo in it is worse
+/// than ignoring the typo.
+#[test]
+fn a_report_that_makes_no_sense_changes_nothing() {
+    let d = Daemon::start("zmux-test-report-junk");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    let report = Report { state: Some(PaneState::Working), ..Default::default() };
+    c.ask(&ClientMsg::Report { target: Target::Id(id), report });
+    assert_eq!(state_of(&mut c, id), PaneState::Working);
+
+    for junk in [
+        // A misspelt state.
+        r"printf '\033]1341;zmux;state=workingg\033\\'",
+        // No guard, so not ours at all - somebody else's OSC 1341.
+        r"printf '\033]1341;other-tool;state=idle\033\\'",
+        // A name that is not a usable handle drops the name, not the state.
+        r"printf '\033]1341;zmux;name=Reviewer\033\\'",
+    ] {
+        c.input_at(Target::Focused, junk, true);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+    }
+    // The command bracketing clears state, so assert on the thing that
+    // cannot be explained away: nothing ever became `idle`.
+    assert_ne!(state_of(&mut c, id), PaneState::Idle, "a guarded-out report was taken");
+    assert!(pane_of(&mut c, id).name.is_none(), "an unusable name was accepted");
+}
+
+fn pane_of(c: &mut Control, id: u32) -> zmux::protocol::PaneInfo {
+    c.info().panes.into_iter().find(|p| p.id == id).expect("the pane vanished")
+}
+
+fn state_of(c: &mut Control, id: u32) -> PaneState {
+    pane_of(c, id).state
+}
+
+fn wait_for_state(
+    c: &mut Control,
+    want: PaneState,
+    secs: u64,
+) -> Option<zmux::protocol::PaneInfo> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(p) = c.info().panes.into_iter().find(|p| p.state == want) {
+            return Some(p);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

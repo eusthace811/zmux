@@ -378,6 +378,16 @@ fn serve_control(
                     None => ServerMsg::Refused { reason: unknown(&target) },
                 }
             }
+            // A pane saying what it is doing. Refused for a target that
+            // does not resolve, like every other one: a report landing on
+            // whichever pane happened to be nearby is worse than none.
+            ClientMsg::Report { target, report } => match session.resolve(&target) {
+                Some(id) => {
+                    session.report(id, &report);
+                    ServerMsg::Info(session.info())
+                }
+                None => ServerMsg::Refused { reason: unknown(&target) },
+            },
             ClientMsg::Query(Query::Info) => ServerMsg::Info(session.info()),
             ClientMsg::Query(Query::CaptureAt { target, lines }) => {
                 match session.resolve(&target).and_then(|id| session.capture_from(id, lines)) {
@@ -614,7 +624,8 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     | ClientMsg::Control { .. }
                     | ClientMsg::Query(_)
                     | ClientMsg::InputTo { .. }
-                    | ClientMsg::InputAt { .. } => {}
+                    | ClientMsg::InputAt { .. }
+                    | ClientMsg::Report { .. } => {}
                 }
             }
         }

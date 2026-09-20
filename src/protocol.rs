@@ -121,6 +121,14 @@ pub enum ClientMsg {
         /// submits it.
         enter: bool,
     },
+    /// A pane saying what it is doing.
+    ///
+    /// The other way in is an OSC on the pane's own pty, which costs no
+    /// process and needs neither this binary on PATH nor the session's name.
+    /// This exists for a reporter whose output is captured and cannot reach
+    /// the terminal - a hook run as a subprocess, or a script on another
+    /// machine's behalf.
+    Report { target: Target, report: Report },
 }
 
 /// Which pane a control command means.
@@ -140,6 +148,89 @@ pub enum Target {
     Id(u32),
     /// A name the pane reported for itself. Unique among live panes.
     Name(String),
+}
+
+/// What the program in a pane says it is doing.
+///
+/// REPORTED, never inferred (DESIGN.md §12). zmux does not match a pane's
+/// screen against patterns to work this out - that is how herdr does it, and
+/// it costs 22 versioned regex manifests that break silently whenever some
+/// other project changes a spinner. A pane that says nothing is `Unknown`,
+/// and `Unknown` does not mean finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneState {
+    /// Nothing has been reported. NOT a claim that the pane is free - only
+    /// that nobody said. `quiet_ms`, `command` and `bells` are what is left.
+    #[default]
+    Unknown,
+    /// Ready for input, with nothing outstanding.
+    Idle,
+    /// Working on something.
+    Working,
+    /// Stopped, waiting for a person: an approval, a question, a choice.
+    /// Sending it a prompt would answer the wrong question.
+    Blocked,
+    /// Finished what it was asked, and nobody has looked yet.
+    Done,
+}
+
+impl PaneState {
+    /// The name the report channel uses, and what `info` prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PaneState::Unknown => "unknown",
+            PaneState::Idle => "idle",
+            PaneState::Working => "working",
+            PaneState::Blocked => "blocked",
+            PaneState::Done => "done",
+        }
+    }
+
+    /// Parse a reported state. `None` for anything unrecognised, and the
+    /// caller must then ignore the whole report rather than store `Unknown` -
+    /// a typo in a hook must not erase a state that was true.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "idle" => PaneState::Idle,
+            "working" => PaneState::Working,
+            "blocked" => PaneState::Blocked,
+            "done" => PaneState::Done,
+            "unknown" => PaneState::Unknown,
+            _ => return None,
+        })
+    }
+
+    /// Nothing more is going to happen without someone's input.
+    ///
+    /// `Blocked` counts: it is settled in the sense that matters to a caller
+    /// waiting on the pane - it has stopped, and it is not going to start
+    /// again on its own.
+    pub fn is_settled(self) -> bool {
+        matches!(self, PaneState::Idle | PaneState::Done | PaneState::Blocked)
+    }
+}
+
+/// What a pane says about itself.
+///
+/// Every field is optional because a report says only what changed: a turn
+/// boundary sets `state` and nothing else, while a startup report sets
+/// `agent` and `name` once and never again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    pub state: Option<PaneState>,
+    /// What is running, in its own words - `ampere`, `pi`, anything. Free
+    /// text on purpose: an enum of known agents is a list to maintain, and
+    /// zmux has no reason to have an opinion about which agents exist.
+    pub agent: Option<String>,
+    /// A handle for this pane, so a caller can say `reviewer` rather than
+    /// track an id. Must satisfy `is_valid_name`.
+    pub name: Option<String>,
+    /// Monotonic per pane. A report at or below the last one accepted is
+    /// DROPPED: two hooks firing out of order would otherwise leave the pane
+    /// reading `working` after it went idle. Omit it and reports are taken in
+    /// arrival order.
+    pub seq: Option<u64>,
 }
 
 /// Longest name a pane may claim. Long enough to be descriptive, short enough
@@ -287,6 +378,13 @@ pub struct PaneInfo {
     pub busy: bool,
     /// Exit status of the last finished command.
     pub last_exit: Option<i32>,
+    // --- what the pane said about itself (DESIGN.md §12) ---
+    /// The last state this pane reported. `Unknown` if it reported none.
+    pub state: PaneState,
+    /// What the pane says is running in it.
+    pub agent: Option<String>,
+    /// The name this pane claimed, usable as a `Target`.
+    pub name: Option<String>,
     // --- measured facts, never inferences (DESIGN.md §12) ---
     /// Milliseconds since this pane last produced ANY output.
     ///

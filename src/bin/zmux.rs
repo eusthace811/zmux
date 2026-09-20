@@ -12,7 +12,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use zmux::ipc;
-use zmux::protocol::{Cmd, ClientMsg, Frame, Query, ServerMsg, Target, PROTOCOL_VERSION};
+use zmux::protocol::{
+    Cmd, ClientMsg, Frame, PaneState, Query, Report, ServerMsg, Target, PROTOCOL_VERSION,
+};
 use zmux::render::{paint, paint_cursor, paint_overlay};
 
 /// Every host mouse-reporting mode we know how to turn off.
@@ -125,6 +127,9 @@ Driving a session without attaching (for scripts and agents):
   zmux run  <session> [-p T] [--paste] <command>
                                            type it and press Enter
   zmux capture <session> [-p T] [-n N]   a pane's visible screen, as text
+  zmux report [<session>] [-p T] --state idle|working|blocked|done
+                                           say what this pane is doing
+  zmux report --check                    prove the report channel works
 
   -p chooses the pane: N its position in the current window, @N its id (which
      never moves), a name it reported, or `current` for the pane you are in.
@@ -459,6 +464,7 @@ fn main() -> Result<()> {
             println!("{text}");
             return Ok(());
         }
+        Some("report") => return report(&args[1..]),
         Some("attach") => {
             let Some(name) = args.get(1) else { bail!("usage: zmux attach <session>") };
             if !ipc::is_running(name) {
@@ -470,6 +476,183 @@ fn main() -> Result<()> {
     }
     let session = args.first().cloned().unwrap_or_else(|| "default".into());
     attach(session)
+}
+
+/// The escape a pane writes to say what it is doing.
+///
+/// Built here so `--check` proves the SAME bytes a hook would send, rather
+/// than a second implementation that could drift from the first.
+fn report_osc(r: &Report) -> String {
+    let mut out = String::from("\x1b]1341;zmux");
+    if let Some(s) = r.state {
+        out.push_str(&format!(";state={}", s.as_str()));
+    }
+    if let Some(a) = &r.agent {
+        out.push_str(&format!(";agent={a}"));
+    }
+    if let Some(n) = &r.name {
+        out.push_str(&format!(";name={n}"));
+    }
+    if let Some(q) = r.seq {
+        out.push_str(&format!(";seq={q}"));
+    }
+    out.push_str("\x1b\\");
+    out
+}
+
+const REPORT_USAGE: &str = "\
+usage: zmux report [<session>] [-p T] [--state S] [--agent A] [--name N] [--seq K]
+       zmux report --check      check the channel, without changing anything
+       zmux report --osc ...    print the escape instead of sending it
+
+  --state   idle | working | blocked | done
+  --agent   what is running, in its own words
+  --name    a handle for this pane: a-z, then a-z 0-9 _ -
+  --seq     monotonic; a report at or below the last one is dropped
+
+The session defaults to $ZMUX_SESSION and the pane to $ZMUX_PANE, so
+inside a pane `zmux report --state working` is the whole command.
+
+Writing the escape to your own terminal is cheaper and needs neither this
+binary nor the session name - `zmux report --osc --state working` prints
+it. Use this command when your output is captured and cannot reach the tty.";
+
+fn report(args: &[String]) -> Result<()> {
+    let mut r = Report::default();
+    let (mut session, mut pane, mut check, mut print_osc) = (None, None, false, false);
+    let mut rest = args;
+    while let Some(arg) = rest.first().map(String::as_str) {
+        let want = |what: &str| -> Result<String> {
+            rest.get(1).cloned().with_context(|| format!("{what} needs a value\n{REPORT_USAGE}"))
+        };
+        match arg {
+            "--check" => {
+                check = true;
+                rest = &rest[1..];
+                continue;
+            }
+            "--osc" => {
+                print_osc = true;
+                rest = &rest[1..];
+                continue;
+            }
+            "--help" | "-h" => {
+                println!("{REPORT_USAGE}");
+                return Ok(());
+            }
+            "--state" => {
+                let v = want("--state")?;
+                r.state = Some(
+                    PaneState::parse(&v)
+                        .with_context(|| format!("'{v}' is not a state\n{REPORT_USAGE}"))?,
+                );
+            }
+            "--agent" => r.agent = Some(want("--agent")?),
+            "--name" => {
+                let v = want("--name")?;
+                if !zmux::protocol::is_valid_name(&v) {
+                    bail!("'{v}' is not a usable name\n{REPORT_USAGE}");
+                }
+                r.name = Some(v);
+            }
+            "--seq" => {
+                let v = want("--seq")?;
+                r.seq = Some(v.parse().with_context(|| format!("'{v}' is not a number"))?);
+            }
+            "-p" | "--pane" => pane = Some(parse_target(&want("-p")?)?),
+            // A bare word is the session, which is how every other
+            // subcommand takes it.
+            other if !other.starts_with('-') => {
+                session = Some(other.to_string());
+                rest = &rest[1..];
+                continue;
+            }
+            other => bail!("unexpected argument '{other}'\n{REPORT_USAGE}"),
+        }
+        rest = &rest[2..];
+    }
+
+    if print_osc {
+        // No trailing newline: this is meant to be written to a terminal,
+        // where a stray newline would scroll the user's screen.
+        print!("{}", report_osc(&r));
+        return Ok(());
+    }
+
+    let session = session
+        .or_else(|| std::env::var("ZMUX_SESSION").ok())
+        .filter(|s| !s.is_empty())
+        .context("no session given, and ZMUX_SESSION is not set (are you inside a pane?)")?;
+    let target = match pane {
+        Some(t) => t,
+        None => Target::Id(current_pane().context(
+            "no -p given, and ZMUX_PANE is not set - it is set only inside a zmux pane",
+        )?),
+    };
+
+    if check {
+        return check_report_channel(&session, target);
+    }
+    if r == Report::default() {
+        bail!("nothing to report\n{REPORT_USAGE}");
+    }
+    match request(&session, &ClientMsg::Report { target, report: r })? {
+        ServerMsg::Info(_) => Ok(()),
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+/// Send a report BOTH ways and read the result back.
+///
+/// The point is a machine where you cannot attach a debugger. The OSC route
+/// depends on a hook's output actually reaching the pane's terminal, which is
+/// the part that varies; this says which of the two arrived, so a wiring
+/// problem is a sentence rather than an afternoon.
+fn check_report_channel(session: &str, target: Target) -> Result<()> {
+    let state_of = |t: &Target| -> Result<PaneState> {
+        let ServerMsg::Info(i) = request(session, &ClientMsg::Query(Query::Info))? else {
+            bail!("the daemon did not answer with session state");
+        };
+        let id = match t {
+            Target::Id(id) => *id,
+            _ => i.focus_id,
+        };
+        Ok(i.panes.iter().find(|p| p.id == id).map(|p| p.state).unwrap_or_default())
+    };
+    let before = state_of(&target)?;
+
+    // The pipe. If this fails there is no channel at all.
+    let probe = Report { state: Some(PaneState::Working), ..Default::default() };
+    request(session, &ClientMsg::Report { target: target.clone(), report: probe })?;
+    let pipe_ok = state_of(&target)? == PaneState::Working;
+
+    // The escape, written to whatever terminal this process is attached to.
+    // Inside the pane it is meant for, this is the whole mechanism.
+    let osc = report_osc(&Report { state: Some(PaneState::Blocked), ..Default::default() });
+    print!("{osc}");
+    stdout().flush()?;
+    std::thread::sleep(Duration::from_millis(400));
+    let osc_ok = state_of(&target)? == PaneState::Blocked;
+
+    // Put back whatever was there, so a check changes nothing.
+    let restore = Report { state: Some(before), ..Default::default() };
+    request(session, &ClientMsg::Report { target, report: restore })?;
+
+    println!("report over the pipe:      {}", if pipe_ok { "ok" } else { "NOT ARRIVING" });
+    println!(
+        "report as an escape:       {}",
+        if osc_ok {
+            "ok"
+        } else {
+            "NOT ARRIVING - this process's output is not reaching the pane's terminal. \
+             Write it to /dev/tty, or use this command instead of the escape."
+        }
+    );
+    println!("state restored to:         {}", before.as_str());
+    if !pipe_ok {
+        bail!("the report channel is not working");
+    }
+    Ok(())
 }
 
 fn attach(session: String) -> Result<()> {
