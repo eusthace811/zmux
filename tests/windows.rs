@@ -21,19 +21,14 @@ fn echo_mark(c: &mut common::Client, mark: &str) {
 fn creating_a_window_gives_a_second_screen_with_its_own_shell() {
     let d = Daemon::start("zmux-test-win-new");
     let mut c = d.attach_ready(120, 30);
-    assert!(
-        c.wait_for(10, |t| t.contains("1 pane")).is_some(),
-        "a fresh session should report one pane"
-    );
+    assert_eq!(d.panes(), 1, "a fresh session should have one pane");
 
     c.cmd(Cmd::NewWindow);
-    let screen = c
-        .wait_for(25, |t| t.contains("0 1*"))
-        .expect("the status bar should list two windows with the second current");
     assert!(
-        screen.contains("1 pane"),
-        "a new window starts with exactly one pane:\n{screen}"
+        d.wait_for_window(1, 2, 25),
+        "there should be two windows with the second current"
     );
+    assert_eq!(d.panes(), 1, "a new window starts with exactly one pane");
 
     // And it is a real shell, not an empty grid.
     echo_mark(&mut c, "NEWWINDOWALIVE");
@@ -53,7 +48,7 @@ fn a_background_window_keeps_its_output() {
     assert!(c.wait_for(25, |t| t.contains("ZEROMARK")).is_some(), "window 0 never ran anything");
 
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "second window never appeared");
+    assert!(d.wait_for_window(1, 2, 25), "second window never appeared");
     let screen = c.current(3).expect("a screen");
     assert!(
         !screen.contains("ZEROMARK"),
@@ -72,7 +67,7 @@ fn a_background_window_keeps_its_output() {
         !back.contains("ONEMARK"),
         "window 0 is showing window 1's output:\n{back}"
     );
-    assert!(back.contains("0* 1"), "the status bar should mark window 0 as current:\n{back}");
+    assert!(d.wait_for_window(0, 2, 5), "the session should be on window 0");
 
     // The display must keep updating after the switch. If the switch had left
     // the client and the daemon disagreeing about the delta base, every later
@@ -90,20 +85,14 @@ fn next_and_previous_wrap_around() {
     let d = Daemon::start("zmux-test-win-cycle");
     let mut c = d.attach_ready(120, 30);
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+    assert!(d.wait_for_window(1, 2, 25), "no second window");
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1 2*")).is_some(), "no third window");
+    assert!(d.wait_for_window(2, 3, 25), "no third window");
 
     c.cmd(Cmd::NextWindow);
-    assert!(
-        c.wait_for(20, |t| t.contains("0* 1 2")).is_some(),
-        "next from the last window should wrap to the first"
-    );
+    assert!(d.wait_for_window(0, 3, 20), "next from the last window should wrap to the first");
     c.cmd(Cmd::PrevWindow);
-    assert!(
-        c.wait_for(20, |t| t.contains("0 1 2*")).is_some(),
-        "previous from the first window should wrap to the last"
-    );
+    assert!(d.wait_for_window(2, 3, 20), "previous from the first window should wrap to the last");
 }
 
 /// `C-b <digit>` jumps straight to a window by the number the status bar
@@ -116,28 +105,25 @@ fn a_digit_jumps_straight_to_that_window() {
     assert!(c.wait_for(25, |t| t.contains("DIGITZERO")).is_some(), "window 0 never ran anything");
 
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+    assert!(d.wait_for_window(1, 2, 25), "no second window");
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1 2*")).is_some(), "no third window");
+    assert!(d.wait_for_window(2, 3, 25), "no third window");
 
     // Two windows back in one keystroke, not two.
     c.cmd(Cmd::SelectWindow(0));
+    assert!(d.wait_for_window(0, 3, 20), "the digit did not select window 0");
     let screen = c
-        .wait_for(20, |t| t.contains("0* 1 2"))
-        .expect("the digit did not select window 0");
-    assert!(
-        screen.contains("DIGITZERO"),
-        "landed somewhere, but not on the window that has window 0's output:\n{screen}"
-    );
+        .wait_for(20, |t| t.contains("DIGITZERO"))
+        .expect("landed somewhere, but not on the window that has window 0's output");
+    let _ = screen;
 
     // And a window that does not exist leaves you where you are, rather than
     // clamping onto some other window.
     c.cmd(Cmd::SelectWindow(7));
     std::thread::sleep(std::time::Duration::from_millis(600));
-    let after = c.current(3).expect("a screen");
     assert!(
-        after.contains("0* 1 2"),
-        "selecting a window that does not exist moved us:\n{after}"
+        d.wait_for_window(0, 3, 3),
+        "selecting a window that does not exist moved us"
     );
 }
 
@@ -146,23 +132,18 @@ fn splits_belong_to_one_window_only() {
     let d = Daemon::start("zmux-test-win-splits");
     let mut c = d.attach_ready(120, 30);
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+    assert!(d.wait_for_window(1, 2, 25), "no second window");
 
     c.cmd(Cmd::SplitHorizontal);
-    assert!(
-        c.wait_for(25, |t| t.contains("2 panes")).is_some(),
-        "the split did not happen in window 1"
-    );
+    assert!(d.wait_for_panes(2, 25), "the split did not happen in window 1");
 
     c.cmd(Cmd::PrevWindow);
-    let screen = c
-        .wait_for(20, |t| t.contains("0* 1"))
-        .expect("did not switch back to window 0");
+    assert!(d.wait_for_window(0, 2, 20), "did not switch back to window 0");
+    assert_eq!(d.panes(), 1, "window 0 inherited window 1's split");
     assert!(
-        screen.contains("1 pane") && !screen.contains("2 panes"),
-        "window 0 inherited window 1's split:\n{screen}"
+        c.wait_for(20, |t| !t.contains('│')).is_some(),
+        "window 0 should have no divider"
     );
-    assert!(!screen.contains('│'), "window 0 should have no divider:\n{screen}");
 }
 
 /// tmux closes a window when its last pane goes. Without that, a window
@@ -175,7 +156,7 @@ fn closing_the_last_pane_of_a_window_closes_the_window() {
     assert!(c.wait_for(25, |t| t.contains("SURVIVOR")).is_some(), "window 0 never ran anything");
 
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+    assert!(d.wait_for_window(1, 2, 25), "no second window");
 
     c.cmd(Cmd::ClosePane);
     let back = c
@@ -197,7 +178,7 @@ fn a_shell_exiting_in_a_background_window_does_not_move_you() {
     assert!(c.wait_for(25, |t| t.contains("STAYPUT")).is_some(), "window 0 never ran anything");
 
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+    assert!(d.wait_for_window(1, 2, 25), "no second window");
     // Wait for window 1's shell to actually be up. The window list appears as
     // soon as the window exists, which is BEFORE bash is reading input, and a
     // command typed into a shell that has not started yet simply vanishes.
@@ -209,21 +190,23 @@ fn a_shell_exiting_in_a_background_window_does_not_move_you() {
     // exiting the shell you are watching is an ordinary close.
     c.input("sleep 3; exit\r");
     c.cmd(Cmd::PrevWindow);
+    assert!(d.wait_for_window(0, 2, 20), "did not switch back to window 0");
     let on_zero = c
-        .wait_for(20, |t| t.contains("0* 1"))
-        .expect("did not switch back to window 0");
-    assert!(on_zero.contains("STAYPUT"), "window 0 lost its output:\n{on_zero}");
+        .wait_for(20, |t| t.contains("STAYPUT"))
+        .expect("window 0 lost its output");
+    let _ = on_zero;
 
     // Window 1 dies in the background. We must still be on window 0, with its
     // output intact, and the window list must be gone with one window left.
-    let after = c
-        .wait_for(25, |t| !t.contains("0*"))
-        .expect("the background window's shell exited but its window stayed");
     assert!(
-        after.contains("STAYPUT"),
-        "a background window closing disturbed the window we were on:\n{after}"
+        d.wait_for_window(0, 1, 25),
+        "the background window's shell exited but its window stayed"
     );
-    assert!(after.contains("1 pane"), "should be back to a single window:\n{after}");
+    assert!(
+        c.wait_for(25, |t| t.contains("STAYPUT")).is_some(),
+        "a background window closing disturbed the window we were on"
+    );
+    assert_eq!(d.panes(), 1, "should be back to a single window");
 }
 
 #[test]
@@ -234,15 +217,17 @@ fn windows_survive_detach_and_reattach() {
         echo_mark(&mut c, "BEFOREDETACH");
         assert!(c.wait_for(25, |t| t.contains("BEFOREDETACH")).is_some(), "nothing ran");
         c.cmd(Cmd::NewWindow);
-        assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+        assert!(d.wait_for_window(1, 2, 25), "no second window");
         // Dropping the client detaches without touching the session.
     }
     std::thread::sleep(std::time::Duration::from_millis(400));
 
     let mut c2 = d.attach_ready(120, 30);
-    let screen = c2
-        .wait_for(20, |t| t.contains("0 1*"))
-        .expect("both windows should still be there, still on the second");
+    assert!(
+        d.wait_for_window(1, 2, 20),
+        "both windows should still be there, still on the second"
+    );
+    let screen = c2.current(20).expect("a screen after reattach");
     assert!(
         !screen.contains("BEFOREDETACH"),
         "reattached onto the wrong window:\n{screen}"
@@ -264,9 +249,9 @@ fn windows_survive_a_daemon_restart() {
         let d = Daemon::start_preserving_state(name);
         let mut c = d.attach_ready(120, 30);
         c.cmd(Cmd::NewWindow);
-        assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+        assert!(d.wait_for_window(1, 2, 25), "no second window");
         c.cmd(Cmd::SplitHorizontal);
-        assert!(c.wait_for(25, |t| t.contains("2 panes")).is_some(), "no split in window 1");
+        assert!(d.wait_for_panes(2, 25), "no split in window 1");
         std::thread::sleep(std::time::Duration::from_millis(800));
     }
     std::thread::sleep(std::time::Duration::from_millis(600));
@@ -274,7 +259,7 @@ fn windows_survive_a_daemon_restart() {
     let d2 = Daemon::start_preserving_state(name);
     let mut c2 = d2.attach_ready(120, 30);
     assert!(
-        c2.wait_for(25, |t| t.contains("0 1*") && t.contains("2 panes")).is_some(),
+        d2.wait_for_window(1, 2, 25) && d2.wait_for_panes(2, 25),
         "the restarted daemon did not restore both windows with window 1 split"
     );
 
@@ -285,8 +270,9 @@ fn windows_survive_a_daemon_restart() {
     // prompt by then. Asserting on the frame that first showed the switch
     // fails under load and passes when idle.
     c2.cmd(Cmd::PrevWindow);
+    assert!(d2.wait_for_window(0, 2, 25), "the switch back to window 0 never landed");
     assert!(
-        c2.wait_for(25, |t| t.contains("0* 1") && t.contains('$')).is_some(),
+        c2.wait_for(25, |t| t.contains('$')).is_some(),
         "window 0 was restored without a working shell"
     );
 
@@ -310,7 +296,7 @@ fn a_new_window_inherits_the_focused_directory() {
     std::thread::sleep(std::time::Duration::from_millis(800));
 
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+    assert!(d.wait_for_window(1, 2, 25), "no second window");
     c.input("pwd\r");
     assert!(
         c.wait_for(25, |t| t.contains("/c/Windows")).is_some(),
@@ -331,7 +317,7 @@ fn switching_windows_resends_the_whole_screen() {
     let d = Daemon::start("zmux-test-win-fullframe");
     let mut c = d.attach_ready(120, 30);
     c.cmd(Cmd::NewWindow);
-    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+    assert!(d.wait_for_window(1, 2, 25), "no second window");
 
     // Let both shells go quiet, so the only thing that can produce a message
     // is the switch itself.

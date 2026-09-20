@@ -29,7 +29,7 @@ fn a_new_pane_inherits_the_focused_pane_directory() {
     std::thread::sleep(std::time::Duration::from_millis(800));
 
     c.cmd(Cmd::SplitHorizontal);
-    assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some(), "split did not happen");
+    assert!(d.wait_for_panes(2, 20), "split did not happen");
 
     // The new pane is focused; ask it where it is.
     //
@@ -139,7 +139,7 @@ fn layout_and_directories_survive_a_daemon_restart() {
         assert!(c.wait_for(20, |t| t.contains("CD_OK:/c/Windows")).is_some(), "cd did not take");
         std::thread::sleep(std::time::Duration::from_millis(800));
         c.cmd(Cmd::SplitHorizontal);
-        assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some(), "split failed");
+        assert!(d.wait_for_panes(2, 20), "split failed");
         std::thread::sleep(std::time::Duration::from_millis(800));
         // Daemon is shut down cleanly when `d` drops.
     }
@@ -148,10 +148,11 @@ fn layout_and_directories_survive_a_daemon_restart() {
     // Fresh daemon, same session name, saved state intentionally intact.
     let d2 = Daemon::start_preserving_state(name);
     let mut c2 = d2.attach_ready(120, 30);
-    let screen = c2
-        .wait_for(20, |t| t.contains("2 panes"))
-        .expect("restarted daemon did not restore the split layout");
-    assert!(screen.contains('│'), "divider missing after restart:\n{screen}");
+    assert!(d2.wait_for_panes(2, 20), "restarted daemon did not restore the split layout");
+    assert!(
+        c2.wait_for(20, |t| t.contains('│')).is_some(),
+        "divider missing after restart"
+    );
 
     // And the restored pane starts where it left off.
     c2.input("pwd\r");

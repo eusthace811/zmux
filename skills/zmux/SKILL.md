@@ -54,8 +54,10 @@ JSON, and the authority for everything else:
   "session": "work", "cols": 120, "rows": 40,
   "window": 0, "windows": 3, "focus": 2,
   "panes": [
-    {"position": 1, "id": 1, "cols": 59, "rows": 39, "cwd": "C:\\work"},
-    {"position": 2, "id": 7, "cols": 60, "rows": 39, "cwd": "C:\\work\\api"}
+    {"position": 1, "id": 1, "cols": 59, "rows": 39, "cwd": "C:\\work",
+     "command": "cargo test", "busy": true, "last_exit": null},
+    {"position": 2, "id": 7, "cols": 60, "rows": 39, "cwd": "C:\\work\\api",
+     "command": "npm run build", "busy": false, "last_exit": 0}
   ]
 }
 ```
@@ -70,6 +72,18 @@ JSON, and the authority for everything else:
   keystrokes go.
 - `window` is 0-based, matching the status bar and `select-window`.
 - `cwd` is the last directory the shell reported; absent if it reported none.
+- `busy` is whether the pane is running something **right now**. Poll this
+  instead of sleeping and hoping: run a command, then read `info` until the
+  pane goes quiet.
+- `command` is the last command line the shell reported starting. It stays
+  after the command ends, so `busy: false` with a `command` and a `last_exit`
+  reads as "that ran, and this is how it went".
+- `last_exit` is that command's status. `0` is success; `null` means nothing
+  has finished in this pane yet.
+- All three need zmux's shell integration, which is on by default but off
+  when `shell_integration = false` or when the pane is running something other
+  than the shell zmux started. They are then absent or `false`; treat them
+  as a hint, not a contract.
 
 Positions shift when a pane closes. Re-read `info` rather than reusing a
 position across anything that could have changed the layout.

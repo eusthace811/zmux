@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 /// v4 added `Cmd::SelectWindow`, for the same reason.
 /// v5 added the control connection - `ClientMsg::Control`, `Query`, `InputTo`
 /// and the `Info`/`Capture` replies.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6 added `PaneInfo::command`, `busy` and `last_exit`. `PaneInfo` is a
+/// bincode STRUCT, and bincode does not tag fields - so unlike appending an
+/// enum variant, a new field changes the encoding for every existing reader.
+/// The handshake already refuses a mismatch with instructions, which is why
+/// this costs a version rather than a corrupt frame.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -36,6 +41,11 @@ pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 
 /// Largest number of panes one session will tile.
 pub const MAX_PANES: usize = 64;
+
+/// Cap the reported command line. It comes from the shell, so it is as long as
+/// whatever someone pasted; the status bar shows a word of it and `info`
+/// carries the rest, and neither wants an unbounded string on the wire.
+pub const MAX_COMMAND_CHARS: usize = 200;
 
 /// Clamp client geometry into something we are willing to allocate.
 pub fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
@@ -128,6 +138,15 @@ pub struct PaneInfo {
     pub rows: u16,
     /// Last directory the shell reported through OSC 7, if it reported one.
     pub cwd: Option<String>,
+    /// The last command the shell reported starting, if shell integration is
+    /// live. Kept after it finishes: with `busy` false and `last_exit` set,
+    /// this says what just ran and how it went.
+    pub command: Option<String>,
+    /// Running something right now. A caller can poll this instead of
+    /// sleeping and hoping.
+    pub busy: bool,
+    /// Exit status of the last finished command.
+    pub last_exit: Option<i32>,
 }
 
 /// Pane management. Append-only, like everything else on this wire.

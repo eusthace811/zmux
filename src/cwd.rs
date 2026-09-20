@@ -69,12 +69,53 @@ __zmux_osc7() {
   printf '\033]7;file://%s%s\033\\' "${HOSTNAME:-localhost}" "$(__zmux_urlencode "$PWD")"
 }
 
+# What is running, so the status bar can say so.
+#
+# OSC 133 is the FinalTerm/iTerm2 semantic-prompt convention (VS Code and
+# WezTerm speak it too): `;C` means a command started, `;D;<status>` means it
+# finished. The command TEXT is not part of OSC 133, so it rides in VS Code's
+# `OSC 633;E;<line>` rather than in a sequence number we invented.
+#
+# Deliberately NOT a `trap ... DEBUG`. A DEBUG trap fires for every simple
+# command, including the OTHER entries in PROMPT_COMMAND - and Git Bash
+# installs one in git-prompt.sh - so the bar would sit showing somebody's
+# prompt helper as the running command. PS0 is expanded exactly once per
+# command line, after it is read and before it runs, and never for a
+# PROMPT_COMMAND entry. Measured: the trap version also reported only `echo a`
+# for `echo a; echo b`, where this reports the whole line.
+__zmux_report() {
+  printf '\033]133;C\033\\'
+  local c
+  c=$(HISTTIMEFORMAT= history 1)
+  c=${c#"${c%%[![:space:]]*}"}   # drop leading spaces
+  c=${c#* }                      # drop the history number
+  c=${c#"${c%%[![:space:]]*}"}   # and the spaces after it
+  # No history (HISTSIZE=0, or the line was suppressed by HISTCONTROL) just
+  # means no text; the pane is still correctly reported as busy.
+  [ -n "$c" ] && printf '\033]633;E;%s\033\\' "$c"
+}
+
+__zmux_precmd() {
+  # FIRST line: this is the finished command's exit status.
+  local e=$?
+  # Unconditional, not only after a `;C`. Being at a prompt IS being idle, so
+  # this re-asserts it even if a `;C` was lost, and an empty line costs one
+  # sequence.
+  printf '\033]133;D;%s\033\\' "$e"
+  __zmux_osc7
+}
+
 # PROMPT_COMMAND is an array in bash 5.1+; appending a string would break it.
+# PREPENDED in both forms, not appended: `$?` inside __zmux_precmd has to be
+# the user's command's status, and anything running before us replaces it.
 if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
-  PROMPT_COMMAND+=(__zmux_osc7)
+  PROMPT_COMMAND=(__zmux_precmd "${PROMPT_COMMAND[@]}")
 else
-  PROMPT_COMMAND="__zmux_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+  PROMPT_COMMAND="__zmux_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 fi
+
+# Keep whatever PS0 the user had; ours only prints escape sequences.
+PS0='$(__zmux_report)'"${PS0:-}"
 
 # Report immediately so a pane knows its directory before the first command.
 __zmux_osc7

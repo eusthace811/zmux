@@ -169,22 +169,30 @@ ordinary Git Bash window.
 ## Reading the status bar
 
 ```
- work │ 0 1* 2 │ 2 panes │ pane 1
-   ▲      ▲         ▲         ▲
-   │      │         │         └─ which pane has focus, counting from 1
-   │      │         └─ panes in THIS window
-   │      └─ windows; the highlighted one is where you are, and its
-   │         number is the digit that jumps back to it
+ work │ 0:bash 1:cargo* 2:vim │ 1• 2*
+   ▲       ▲                     ▲
+   │       │                     └─ panes in THIS window: 1 is running
+   │       │                        something, 2 is the one you are typing in
+   │       └─ windows, each named after what is running in it; the
+   │          highlighted one is where you are, and its number is the
+   │          digit that jumps back to it
    └─ session name
 ```
 
-The window list appears only once you have more than one window, and the
-focused pane only once the window holds more than one — neither can tell you
-anything otherwise. `SCROLL` appears in amber while you are looking at
-history rather than the live screen.
+A window is named after the command running in its focused pane — `cargo`,
+`vim`, `ssh` — and after the shell itself when nothing is. `•` marks a pane
+that is running something, so you can see a build still going in a pane you
+are not looking at. Both need zmux's shell integration, which is on unless
+you set `shell_integration = false`.
 
-On a narrow terminal the line drops its least useful parts first, ending at
-` 1/3 | 2p ` — which window of how many, and how many panes.
+The window list appears only once you have more than one window, and a pane's
+number only once the window holds more than one — neither can tell you
+anything otherwise, though a single pane still gets its `•`. `SCROLL` appears
+in amber while you are looking at history rather than the live screen.
+
+On a narrow terminal the line drops its least useful parts first: the window
+names go before the window list does, and the last rung is ` 1/3 | 2p • ` —
+which window of how many, how many panes, and whether anything is running.
 
 ---
 

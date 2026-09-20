@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 160 tests passing, clippy clean.
+Phases 0–6 complete. 168 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -17,6 +17,7 @@ Phases 0–6 complete. 160 tests passing, clippy clean.
 | Multi-client | several clients on one session, sized to the smallest |
 | Config | `%APPDATA%\zmux\config.toml`, all optional |
 | Keys | xterm encoding: Alt, F1–F12, modified navigation, application cursor mode |
+| Activity | the bar names each window after what is running in it, and marks panes that are busy |
 | Wire | row deltas, not a full grid per frame |
 
 ## Use
@@ -56,6 +57,10 @@ mutation answers with the resulting `info`, so a caller learns where its new
 pane landed without a second, racy query. `zmux --skill` prints the whole
 agent-facing contract.
 
+`info` also reports what each pane is doing — `"command"`, `"busy"` and
+`"last_exit"` — so a script can run something and then poll until that pane
+goes quiet, instead of sleeping and hoping.
+
 | Key | |
 | --- | --- |
 | `C-b d` | detach (the session keeps running) |
@@ -77,13 +82,13 @@ agent-facing contract.
 | `src/protocol.rs` | Wire messages. Versioned, bounded, **append-only** enums. Frames and row deltas. |
 | `src/ipc.rs` | Named pipe, length-prefixed framing, restricted ACL. |
 | `src/pty.rs` | ConPTY via `portable-pty`; Git Bash fingerprint; reader thread; explicit teardown. |
-| `src/term.rs` | `vt100` + **terminal query responder** + scrollback. |
+| `src/term.rs` | `vt100` + **terminal query responder** + scrollback + what each pane is running (OSC 133/633). |
 | `src/layout.rs` | BSP tiling tree. |
 | `src/windows.rs` | Several layouts per session. A window **is** a `Layout`. |
 | `src/render.rs` | vt100 cells → composited `Frame` → ratatui `Buffer`. |
 | `src/session.rs` | Owns panes, layout and clients. Outlives any connection. |
 | `src/persist.rs` | Layout + cwd to `%APPDATA%`. |
-| `src/cwd.rs` | OSC 7 parsing and the bash integration snippet. |
+| `src/cwd.rs` | OSC 7 parsing and the bash integration snippet, which also reports what is running. |
 | `src/config.rs` | `config.toml`. |
 | `src/keys.rs` | Key events → xterm byte sequences, including application cursor mode. |
 | `src/harden.rs` | `SetDefaultDllDirectories`, before anything can `LoadLibrary`; and the job-object check behind the daemon-survival warning. |
@@ -100,7 +105,7 @@ Everything outside `src/`:
 | `x` | Build, test and install, from WSL or Git Bash. |
 | `docs/` | `GUIDE.md` to use it, `DESIGN.md` for why it is built this way. |
 
-## Eight things that will bite you if you change them
+## Nine things that will bite you if you change them
 
 **1. Terminal query replies are mandatory.** ConPTY is created with
 `PSEUDOCONSOLE_INHERIT_CURSOR` and emits `ESC[6n` at startup. Unanswered, the
@@ -150,7 +155,18 @@ laptop is where it is likeliest to fire. `pty::pane_command` clears the merge
 and puts this process's own environment back, which is what should reach a
 pane anyway. herdr vendors a patched `portable-pty` for the same bug.
 
-**8. The waiter thread and `close()` share ONE child handle.** They used to
+**8. The shell integration reports commands from `PS0`, not a `DEBUG` trap.**
+A `DEBUG` trap fires for every simple command — including the *other* entries
+in `PROMPT_COMMAND`, and Git Bash installs one in `git-prompt.sh` — so the bar
+would sit showing somebody's prompt helper as the running command. `PS0` is
+expanded exactly once per command line, after it is read and before it runs,
+and never for a `PROMPT_COMMAND` entry. Measured against a real Git Bash: the
+trap version also reported only `echo a` for `echo a; echo b`, where this
+reports the whole line. `__zmux_precmd` is **prepended** to `PROMPT_COMMAND`
+for the same class of reason — `$?` has to be the user's command's status, and
+anything running before us replaces it.
+
+**9. The waiter thread and `close()` share ONE child handle.** They used to
 hold separate slots, and the constructor filled `Pane::child` by *taking* the
 child out of the waiter's — so the waiter found `None` on its first tick and
 returned, and `PtyEvent::Exited` could never fire for any pane. Typing `exit`

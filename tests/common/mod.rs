@@ -77,6 +77,50 @@ impl Daemon {
         Self { child, session: session.into(), preserve_state }
     }
 
+    /// Wait until the current window holds `n` panes, asking the DAEMON.
+    ///
+    /// Tests used to match the status bar - `t.contains("2 panes")` - which
+    /// asserts a layout fact through a spelling. The bar is presentation and
+    /// has now changed shape; `info` is the thing that actually knows. A
+    /// control connection is not registered as a client, so polling one does
+    /// not disturb the session's size or its idle timer.
+    /// How many panes the current window holds, right now.
+    pub fn panes(&self) -> usize {
+        Control::open(&self.session).info().panes.len()
+    }
+
+    pub fn wait_for_panes(&self, n: usize, secs: u64) -> bool {
+        self.wait_until(secs, |i| i.panes.len() == n)
+    }
+
+
+    /// Wait until the session is on window `index` of `of` windows.
+    pub fn wait_for_window(&self, index: usize, of: usize, secs: u64) -> bool {
+        self.wait_until(secs, |i| i.window == index && i.windows == of)
+    }
+
+    /// Wait until the focused pane is at `position` in the current window.
+    pub fn wait_for_focus(&self, position: usize, secs: u64) -> bool {
+        self.wait_until(secs, |i| i.focus == position)
+    }
+
+    fn wait_until(
+        &self,
+        secs: u64,
+        pred: impl Fn(&zmux::protocol::SessionInfo) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            if pred(&Control::open(&self.session).info()) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     pub fn attach(&self, cols: u16, rows: u16) -> Client {
         Client::connect(&self.session, cols, rows)
     }

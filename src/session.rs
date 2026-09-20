@@ -22,7 +22,7 @@ use crate::protocol::{
 };
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
-use crate::render::{composite, frame_from_screen, pane_area_with, status_spans, Span};
+use crate::render::{composite, frame_from_screen, pane_area_with, status_spans, BarState, Span};
 use crate::term::Term;
 
 use crate::config::Config;
@@ -431,12 +431,23 @@ impl Session {
                     focus = position;
                 }
                 let rect = rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r);
+                // One lock per pane, taken once for both facts.
+                let (cwd, activity) = match panes.get(&id) {
+                    Some(p) => {
+                        let t = lock(&p.term);
+                        (t.cwd_windows(), t.activity())
+                    }
+                    None => (None, crate::term::Activity::default()),
+                };
                 PaneInfo {
                     position,
                     id: id.0,
                     cols: rect.map_or(0, |r| r.w),
                     rows: rect.map_or(0, |r| r.h),
-                    cwd: panes.get(&id).and_then(|p| lock(&p.term).cwd_windows()),
+                    cwd,
+                    command: activity.command,
+                    busy: activity.busy,
+                    last_exit: activity.last_exit,
                 }
             })
             .collect();
@@ -963,25 +974,54 @@ impl Session {
         }
     }
 
+    /// What to call a window that is not running anything: the shell's own
+    /// name, as tmux does. `C:\\Program Files\\Git\\bin\\bash.exe` -> `bash`.
+    fn idle_name(&self) -> String {
+        let path = if self.cfg.shell.is_empty() {
+            crate::pty::GIT_BASH_DEFAULT
+        } else {
+            &self.cfg.shell
+        };
+        std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("shell")
+            .to_string()
+    }
+
     fn status_line(&self) -> Vec<Span> {
-        let (panes, focus, windows, current) = {
+        // Under the windows lock, work out WHICH panes the bar needs; under
+        // the pane lock, ask them. Never the other way round - `geometry ->
+        // save -> windows -> panes -> Term` is the order the whole daemon
+        // takes these in.
+        let (focus_ids, current_ids, focus_pos, current) = {
             let w = lock(&self.windows);
+            let focus_ids: Vec<PaneId> = w.all().iter().map(|l| l.focus()).collect();
             let l = w.current();
-            // The bar names the focused pane by POSITION in this window, not
-            // by `PaneId`: ids come from an allocator that never reuses a
-            // number, so after a few splits and closes the bar would say
-            // "pane 7" of two.
             let ids = l.panes();
             let pos = ids.iter().position(|id| *id == l.focus()).map_or(0, |i| i + 1);
-            (ids.len(), pos, w.len(), w.index())
+            (focus_ids, ids, pos, w.index())
+        };
+        let (labels, busy) = {
+            let panes = lock(&self.panes);
+            let activity = |id: &PaneId| {
+                panes.get(id).map(|p| lock(&p.term).activity()).unwrap_or_default()
+            };
+            (
+                focus_ids.iter().map(|id| activity(id).label()).collect::<Vec<_>>(),
+                current_ids.iter().map(|id| activity(id).busy).collect::<Vec<_>>(),
+            )
         };
         status_spans(
-            &self.name,
-            windows,
-            current,
-            panes,
-            focus,
-            self.focused_is_scrolled(),
+            &BarState {
+                name: &self.name,
+                windows: &labels,
+                current,
+                busy: &busy,
+                focus: focus_pos,
+                idle: &self.idle_name(),
+                scrolled: self.focused_is_scrolled(),
+            },
             self.size().0 as usize,
         )
     }

@@ -288,3 +288,84 @@ fn an_input_that_echoes_nothing_still_snaps_the_pane_back_to_live_output() {
         "writing to the pane left it showing history it had already left:\n{live}"
     );
 }
+
+/// The whole "what is running" pipeline, end to end through a real ConPTY:
+/// our rcfile emits OSC 133/633, the daemon parses them, and `info` says so.
+///
+/// Each piece is unit-tested, but only this proves they are wired together -
+/// and that the sequences survive a real Git Bash rather than the hand-written
+/// approximation they were designed against.
+#[test]
+fn info_reports_what_a_pane_is_running() {
+    let d = Daemon::start("zmux-test-ctl-busy");
+    let mut c = Control::open(&d.session);
+
+    // Wait for the shell to reach its first prompt, which is the first time
+    // the integration reports anything at all.
+    assert!(
+        c.wait_for(25, None, |t| t.contains('$')).is_some(),
+        "no prompt, so the rcfile never ran"
+    );
+
+    // Something slow enough to still be running when we look.
+    c.ask(&ClientMsg::Input { data: b"sleep 4; echo SLEPT\r".to_vec() });
+
+    let mut seen: Option<zmux::protocol::PaneInfo> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        let p = c.info().panes.into_iter().next().expect("a pane");
+        if p.busy {
+            seen = Some(p);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let busy = seen.expect("the pane never reported itself busy");
+    assert_eq!(
+        busy.command.as_deref(),
+        Some("sleep 4; echo SLEPT"),
+        "the WHOLE command line, not just the first of its parts"
+    );
+
+    // And it goes quiet again, carrying the exit status.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    loop {
+        let p = c.info().panes.into_iter().next().expect("a pane");
+        if !p.busy {
+            assert_eq!(p.last_exit, Some(0), "the finished command's status");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the pane never went idle again");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A failing command is reported as having failed, which is the thing tmux
+/// cannot tell you and the reason the exit status is on the wire at all.
+#[test]
+fn a_failed_command_reports_its_status() {
+    let d = Daemon::start("zmux-test-ctl-exit");
+    let mut c = Control::open(&d.session);
+    assert!(c.wait_for(25, None, |t| t.contains('$')).is_some(), "no prompt");
+
+    c.ask(&ClientMsg::Input { data: b"(exit 3)\r".to_vec() });
+    assert!(
+        c.wait_for(25, None, |t| t.contains("exit 3")).is_some(),
+        "the command never echoed"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let p = c.info().panes.into_iter().next().expect("a pane");
+        if p.last_exit == Some(3) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw status 3, last was {:?} (busy={})",
+            p.last_exit,
+            p.busy
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}

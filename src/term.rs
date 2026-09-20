@@ -115,6 +115,64 @@ pub struct Signals {
     pub title: Option<String>,
     /// Bell since last checked.
     pub bell: bool,
+    /// Last command line the shell reported (OSC 633;E). Kept after the
+    /// command ends, so `busy=false` plus this plus `last_exit` reads as
+    /// "that finished, this is how".
+    pub command: Option<String>,
+    /// Between OSC 133;C and OSC 133;D.
+    pub busy: bool,
+    /// Status carried by the last OSC 133;D.
+    pub last_exit: Option<i32>,
+    /// Any OSC 133 has arrived, i.e. our rcfile is live in this pane. Until
+    /// then the window title is the only clue about what is running, and it
+    /// is a poor one - Git Bash points it at the directory.
+    pub integrated: bool,
+}
+
+/// What a pane is doing. One lock, every fact the bar and `info` need.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Activity {
+    pub command: Option<String>,
+    pub busy: bool,
+    pub last_exit: Option<i32>,
+    /// The OSC 0/2 title, and ONLY when no shell integration has been seen -
+    /// otherwise it is just the directory restated.
+    pub title: Option<String>,
+}
+
+impl Activity {
+    /// One word for the window list, the way tmux names a window after what is
+    /// running in it. `None` means "nothing to say, use the shell's name".
+    pub fn label(&self) -> Option<String> {
+        if self.busy {
+            if let Some(c) = self.command.as_deref() {
+                // The first word, not the whole line: `cargo`, not
+                // `cargo test --all -- --nocapture`.
+                if let Some(w) = c.split_whitespace().next() {
+                    // `./x` and `/usr/bin/foo` read better as the file name.
+                    let w = w.rsplit(['/', '\\']).next().unwrap_or(w);
+                    if !w.is_empty() {
+                        return Some(w.to_string());
+                    }
+                }
+            }
+        }
+        self.title.clone()
+    }
+}
+
+/// Keep a shell-supplied string fit for a status bar, a JSON field and a wire.
+///
+/// Control bytes would move the cursor or break the line; an unbounded length
+/// would ride on every frame.
+fn sanitise(s: &str) -> Option<String> {
+    let out: String = s
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(crate::protocol::MAX_COMMAND_CHARS)
+        .collect();
+    let out = out.trim();
+    (!out.is_empty()).then(|| out.to_string())
 }
 
 /// vt100 callback sink. OSC 7 is not a sequence vt100 handles itself, so it
@@ -126,15 +184,54 @@ pub struct Hooks {
 
 impl vt100::Callbacks for Hooks {
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        // OSC 7 ; file://host/path
-        if params.len() >= 2 && params[0] == b"7" {
-            if let Ok(payload) = std::str::from_utf8(params[1]) {
-                if let Some(path) = crate::cwd::parse_osc7(payload) {
-                    if let Ok(mut s) = self.signals.lock() {
-                        s.cwd = Some(path);
+        if params.len() < 2 {
+            return;
+        }
+        match params[0] {
+            // OSC 7 ; file://host/path
+            b"7" => {
+                if let Ok(payload) = std::str::from_utf8(params[1]) {
+                    if let Some(path) = crate::cwd::parse_osc7(payload) {
+                        if let Ok(mut s) = self.signals.lock() {
+                            s.cwd = Some(path);
+                        }
                     }
                 }
             }
+            // OSC 133 ; C            a command started
+            // OSC 133 ; D ; <status> it finished
+            b"133" => {
+                let Ok(mut s) = self.signals.lock() else { return };
+                s.integrated = true;
+                match params[1] {
+                    b"C" => s.busy = true,
+                    b"D" => {
+                        s.busy = false;
+                        s.last_exit = params
+                            .get(2)
+                            .and_then(|p| std::str::from_utf8(p).ok())
+                            .and_then(|p| p.trim().parse().ok());
+                    }
+                    _ => {}
+                }
+            }
+            // OSC 633 ; E ; <command line>
+            //
+            // The payload is REJOINED on ';': OSC parameters are split on it,
+            // so `echo "a;b"` arrives as two of them and taking params[2]
+            // alone would silently truncate every command with a semicolon in
+            // it. Measured against a real Git Bash, not assumed.
+            b"633" if params[1] == b"E" => {
+                let joined = params[2..]
+                    .iter()
+                    .filter_map(|p| std::str::from_utf8(p).ok())
+                    .collect::<Vec<_>>()
+                    .join(";");
+                if let Ok(mut s) = self.signals.lock() {
+                    s.command = sanitise(&joined);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -174,6 +271,23 @@ impl Term {
             signals,
             responder: QueryResponder::default(),
             scroll: 0,
+        }
+    }
+
+    /// What this pane is doing right now.
+    ///
+    /// The title is handed back ONLY when no OSC 133 has ever arrived. With
+    /// our rcfile live the title adds nothing - Git Bash points it at the
+    /// directory, which OSC 7 already reports - but in a pane running
+    /// something else (`cmd.exe`, a bare `python`) it is the only signal
+    /// there is, and `vim`/`ssh`/`less` all set it.
+    pub fn activity(&self) -> Activity {
+        let Ok(s) = self.signals.lock() else { return Activity::default() };
+        Activity {
+            command: s.command.clone(),
+            busy: s.busy,
+            last_exit: s.last_exit,
+            title: if s.integrated { None } else { s.title.as_deref().and_then(sanitise) },
         }
     }
 

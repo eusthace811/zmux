@@ -31,6 +31,9 @@ const NAME_BG: u32 = idx(24);
 const ACTIVE_FG: u32 = idx(235);
 const ACTIVE_BG: u32 = idx(214);
 const ALERT_FG: u32 = idx(214);
+/// A running pane. Green rather than the alert orange: busy is normal, and
+/// the bar should not look like something is wrong every time a build runs.
+const BUSY_FG: u32 = idx(114);
 /// Dividers recede. They are structure, not content - drawn in the default
 /// foreground they were the brightest thing on the screen.
 const DIVIDER_FG: u32 = idx(240);
@@ -51,6 +54,12 @@ pub enum Role {
     ActiveWindow,
     /// Something that wants noticing, like being scrolled off the live view.
     Alert,
+    /// The pane you are on. Deliberately NOT `ActiveWindow`: windows and panes
+    /// are both lists of small numbers on one line, and giving them the same
+    /// highlight makes the bar unreadable.
+    ActivePane,
+    /// A pane that is running something.
+    Busy,
 }
 
 impl Role {
@@ -62,6 +71,8 @@ impl Role {
             Role::Window => (WINDOW_FG, BAR_BG, 0),
             Role::ActiveWindow => (ACTIVE_FG, ACTIVE_BG, MOD_BOLD),
             Role::Alert => (ALERT_FG, BAR_BG, MOD_BOLD),
+            Role::ActivePane => (ACTIVE_BG, BAR_BG, MOD_BOLD),
+            Role::Busy => (BUSY_FG, BAR_BG, MOD_BOLD),
         }
     }
 }
@@ -81,95 +92,147 @@ fn width_of(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.text.chars().count()).sum()
 }
 
+/// Everything the bar draws, gathered by the session in one pass.
+pub struct BarState<'a> {
+    pub name: &'a str,
+    /// One label per window, in order: what is running in it, or `None` for
+    /// nothing. Named after the focused pane's command, as tmux does.
+    pub windows: &'a [Option<String>],
+    /// 0-based index of the window being shown.
+    pub current: usize,
+    /// One flag per pane of the CURRENT window, in the order the bar counts
+    /// them: is it running something.
+    pub busy: &'a [bool],
+    /// POSITION of the focused pane in this window, counting from 1, or 0 when
+    /// it cannot be placed. Deliberately not the `PaneId`: that is an
+    /// allocator counter, so after a few splits and closes the bar read
+    /// "2 panes | pane 7" and invited you to look for panes 3 to 6.
+    pub focus: usize,
+    /// What to call a window with nothing running - the shell's own name.
+    pub idle: &'a str,
+    pub scrolled: bool,
+}
+
 /// Build the status line.
-///
-/// `focus` is the focused pane's POSITION in the current window, counting
-/// from 1, or 0 when it cannot be placed. It is deliberately not the `PaneId`:
-/// that is an allocator counter, so after a few splits and closes the bar read
-/// "2 panes | pane 7" and invited you to look for panes 3 to 6.
 ///
 /// Pure, so the degradation ladder can be tested at every width without
 /// starting a daemon and a shell - it used to be reachable only through a live
 /// session, so only the widest rung was ever exercised.
-#[allow(clippy::too_many_arguments)]
-pub fn status_spans(
-    name: &str,
-    windows: usize,
-    current: usize,
-    panes: usize,
-    focus: usize,
-    scrolled: bool,
-    width: usize,
-) -> Vec<Span> {
-    let plural = if panes == 1 { "" } else { "s" };
+pub fn status_spans(st: &BarState, width: usize) -> Vec<Span> {
+    let panes = st.busy.len();
 
-    // The window list appears only once there IS more than one window. With a
-    // single window it would be a constant "0*" taking space from the parts
-    // that actually vary on a narrow terminal.
-    let list = |v: &mut Vec<Span>| {
-        if windows > 1 {
-            for i in 0..windows {
-                // The digit is also the key that jumps there: `C-b <digit>`.
-                // The `*` is belt and braces - the colour says the same thing,
-                // and this keeps it legible if one of them is lost.
-                let (role, mark) = if i == current {
-                    (Role::ActiveWindow, "*")
-                } else {
-                    (Role::Window, "")
-                };
+    // Windows, named after what is running in them. With ONE window the index
+    // is noise - there is nothing to switch to and the digit is not a
+    // shortcut worth showing - so only the label is drawn.
+    let windows = |v: &mut Vec<Span>, labelled: bool| {
+        if st.windows.len() == 1 {
+            if labelled {
+                v.push(span(Role::Info, format!("{} ", label_of(&st.windows[0], st.idle))));
+            }
+            return;
+        }
+        for (i, w) in st.windows.iter().enumerate() {
+            // The digit is also the key that jumps there: `C-b <digit>`.
+            // The `*` is belt and braces - the colour says the same thing,
+            // and this keeps it legible if one of them is lost.
+            let (role, mark) = if i == st.current {
+                (Role::ActiveWindow, "*")
+            } else {
+                (Role::Window, "")
+            };
+            if labelled {
+                v.push(span(role, format!("{i}:{}{mark} ", label_of(w, st.idle))));
+            } else {
                 v.push(span(role, format!("{i}{mark} ")));
             }
-            v.push(span(Role::Sep, "| "));
         }
     };
-    let alert = |v: &mut Vec<Span>| {
-        if scrolled {
-            v.push(span(Role::Sep, "| "));
-            v.push(span(Role::Alert, "SCROLL "));
+
+    // Panes: position, `*` if focused, `•` if running something.
+    //
+    // With one pane there is nothing to be focused BUT that pane, so its
+    // number and star are pure noise - next to a count they read as two
+    // numbers that disagreed. Whether it is BUSY is not noise, so that alone
+    // survives.
+    let panes_list = |v: &mut Vec<Span>| {
+        if panes == 1 {
+            if st.busy[0] {
+                v.push(span(Role::Busy, "• "));
+            }
+            return;
+        }
+        for (i, busy) in st.busy.iter().enumerate() {
+            let pos = i + 1;
+            let focused = pos == st.focus;
+            let role = if focused { Role::ActivePane } else { Role::Info };
+            v.push(span(role, format!("{pos}{}", if focused { "*" } else { "" })));
+            if *busy {
+                v.push(span(Role::Busy, "•"));
+            }
+            v.push(span(Role::Sep, " "));
         }
     };
-    let tail = |v: &mut Vec<Span>| {
-        list(v);
-        v.push(span(Role::Info, format!("{panes} pane{plural} ")));
-        // With one pane there is nothing to be focused BUT that pane, so
-        // saying so was pure noise - and next to the count it read as two
-        // numbers that disagreed.
-        if panes > 1 && focus > 0 {
-            v.push(span(Role::Sep, "| "));
-            v.push(span(Role::Info, format!("pane {focus} ")));
+
+    // Sections are JOINED, not concatenated with their own separators. A
+    // section that turns out to be empty - one idle pane draws nothing at all
+    // - used to leave the "| " that introduced it dangling at the end.
+    let join = |sections: Vec<Vec<Span>>| -> Vec<Span> {
+        let mut out = vec![span(Role::Sep, " ")];
+        let mut first = true;
+        for sec in sections.into_iter().filter(|s| !s.is_empty()) {
+            if !first {
+                out.push(span(Role::Sep, "| "));
+            }
+            first = false;
+            out.extend(sec);
         }
-        alert(v);
+        out
+    };
+    let alert = || -> Vec<Span> {
+        if st.scrolled { vec![span(Role::Alert, "SCROLL ")] } else { Vec::new() }
+    };
+    let tail = |labelled: bool| -> Vec<Vec<Span>> {
+        let mut w = Vec::new();
+        windows(&mut w, labelled);
+        let mut p = Vec::new();
+        panes_list(&mut p);
+        vec![w, p, alert()]
     };
 
     // Drop the least useful parts first rather than letting the whole line be
     // truncated. On a narrow pane the old format showed a clipped session name
     // and nothing else - the pane count, which is what you actually need, fell
-    // off the end. Which window you are on outranks the pane count: getting
-    // lost between windows is worse than not knowing how many panes this one
-    // holds.
-    let mut full = vec![span(Role::Name, format!(" {name} ")), span(Role::Sep, "| ")];
-    tail(&mut full);
+    // off the end. The labels go before the window list does: knowing WHICH
+    // window you are on outranks knowing what is running in the others, and
+    // dropping them lands exactly on the bar this had before labels existed.
+    let mut with_name = vec![vec![span(Role::Name, format!("{} ", st.name))]];
+    with_name.extend(tail(true));
+    let full = join(with_name);
 
-    let mut without_name = vec![span(Role::Sep, " ")];
-    tail(&mut without_name);
+    let without_name = join(tail(true));
+    let without_labels = join(tail(false));
 
-    let mut short = vec![span(Role::Sep, " ")];
-    if windows > 1 {
-        short.push(span(Role::ActiveWindow, format!("{current}/{windows} ")));
-        short.push(span(Role::Sep, "| "));
+    let mut count = Vec::new();
+    if st.windows.len() > 1 {
+        count.push(span(Role::ActiveWindow, format!("{}/{} ", st.current, st.windows.len())));
     }
-    short.push(span(Role::Info, format!("{panes}p ")));
-    alert(&mut short);
+    let mut counted = vec![span(Role::Info, format!("{panes}p "))];
+    if st.busy.iter().any(|b| *b) {
+        counted.push(span(Role::Busy, "• "));
+    }
+    let short = join(vec![count, counted, alert()]);
 
-    for rung in [full, without_name, short] {
+    for rung in [full, without_name, without_labels, short] {
         if width_of(&rung) <= width {
             return rung;
         }
     }
     // Nothing fits; this is the shortest thing that is still true.
-    let mut last = vec![span(Role::Info, format!(" {panes}p "))];
-    alert(&mut last);
-    last
+    join(vec![vec![span(Role::Info, format!("{panes}p "))], alert()])
+}
+
+fn label_of<'a>(label: &'a Option<String>, idle: &'a str) -> &'a str {
+    label.as_deref().unwrap_or(idle)
 }
 
 fn pack(c: vt100::Color) -> u32 {
@@ -402,64 +465,143 @@ mod tests {
         spans.iter().map(|s| s.text.as_str()).collect()
     }
 
+    fn lab(v: &[&str]) -> Vec<Option<String>> {
+        v.iter().map(|s| (!s.is_empty()).then(|| s.to_string())).collect()
+    }
+
     /// Three windows, on the second, showing two panes with the second one
-    /// focused.
+    /// focused and the first one running something.
     fn at(width: usize) -> String {
-        plain(&status_spans("work", 3, 1, 2, 2, false, width))
+        let w = lab(&["", "cargo", ""]);
+        plain(&status_spans(
+            &BarState {
+                name: "work",
+                windows: &w,
+                current: 1,
+                busy: &[true, false],
+                focus: 2,
+                idle: "bash",
+                scrolled: false,
+            },
+            width,
+        ))
+    }
+
+    /// Build a bar from a compact description, so a test reads as the thing
+    /// it is checking rather than seven positional arguments.
+    struct B {
+        windows: Vec<Option<String>>,
+        current: usize,
+        busy: Vec<bool>,
+        focus: usize,
+        scrolled: bool,
+    }
+
+    impl B {
+        fn new(windows: &[&str], busy: &[bool]) -> Self {
+            Self {
+                windows: lab(windows),
+                current: 0,
+                busy: busy.to_vec(),
+                focus: 1,
+                scrolled: false,
+            }
+        }
+        fn at(&self, width: usize) -> Vec<Span> {
+            status_spans(
+                &BarState {
+                    name: "work",
+                    windows: &self.windows,
+                    current: self.current,
+                    busy: &self.busy,
+                    focus: self.focus,
+                    idle: "bash",
+                    scrolled: self.scrolled,
+                },
+                width,
+            )
+        }
+        fn text(&self) -> String {
+            plain(&self.at(80))
+        }
+    }
+
+    /// One window has no list worth drawing - the index is not a shortcut to
+    /// anywhere - so the space goes to what is actually running.
+    #[test]
+    fn a_single_window_is_named_not_numbered() {
+        let mut b = B::new(&["cargo"], &[false]);
+        assert_eq!(b.text(), " work | cargo ");
+        b.windows = lab(&[""]);
+        assert_eq!(b.text(), " work | bash ", "an idle window falls back to the shell");
+    }
+
+    /// tmux names a window after what is running in it; so do we, using the
+    /// focused pane's command.
+    #[test]
+    fn several_windows_are_named_after_what_runs_in_them() {
+        let mut b = B::new(&["", "cargo", "vim"], &[false, false]);
+        b.current = 1;
+        b.focus = 2;
+        assert_eq!(b.text(), " work | 0:bash 1:cargo* 2:vim | 1 2* ");
     }
 
     #[test]
-    fn a_single_window_shows_no_window_list() {
-        // The list would be a constant "0*", which tells you nothing.
-        assert_eq!(plain(&status_spans("work", 1, 0, 1, 1, false, 80)), " work | 1 pane ");
+    fn a_running_pane_is_marked() {
+        let mut b = B::new(&["cargo"], &[true, false]);
+        b.focus = 2;
+        assert_eq!(b.text(), " work | cargo | 1• 2* ");
     }
 
-    /// "1 pane | pane 1" read as two numbers that disagreed. With one pane
-    /// there is nothing else it could be focused on.
+    /// With one pane there is nothing else it could be focused on, so its
+    /// number and star are noise. Whether it is BUSY is not.
     #[test]
-    fn one_pane_is_not_also_announced_as_the_focused_one() {
-        let s = plain(&status_spans("work", 1, 0, 1, 1, false, 80));
-        assert_eq!(s.matches("pane").count(), 1, "the bar says it twice: {s}");
-    }
-
-    #[test]
-    fn several_windows_mark_the_current_one() {
-        assert_eq!(plain(&status_spans("work", 3, 1, 2, 2, false, 80)),
-                   " work | 0 1* 2 | 2 panes | pane 2 ");
-    }
-
-    /// The focused pane is a POSITION in this window. The caller passing a
-    /// `PaneId` is what produced "2 panes | pane 7" - a number with nothing
-    /// on screen to match it.
-    #[test]
-    fn the_focused_pane_is_numbered_within_the_window() {
-        let s = plain(&status_spans("work", 1, 0, 3, 3, false, 80));
-        assert!(s.ends_with("3 panes | pane 3 "), "{s}");
+    fn one_pane_shows_only_whether_it_is_busy() {
+        assert_eq!(B::new(&["bash"], &[false]).text(), " work | bash ");
+        assert_eq!(B::new(&["cargo"], &[true]).text(), " work | cargo | • ");
     }
 
     /// A focus that cannot be placed is left out rather than shown as pane 0.
     #[test]
     fn an_unplaceable_focus_is_simply_not_shown() {
-        let s = plain(&status_spans("work", 1, 0, 2, 0, false, 80));
-        assert_eq!(s, " work | 2 panes ");
+        let mut b = B::new(&["bash"], &[false, false]);
+        b.focus = 0;
+        assert_eq!(b.text(), " work | bash | 1 2 ");
     }
 
     /// The window you are on is the one thing on the bar you must be able to
     /// find at a glance, so it is the only window drawn in its own colours.
     #[test]
     fn only_the_current_window_gets_the_active_role() {
-        let spans = status_spans("work", 3, 1, 2, 2, false, 80);
+        let mut b = B::new(&["", "cargo", ""], &[false, false]);
+        b.current = 1;
+        let spans = b.at(80);
         let active: Vec<&str> = spans
             .iter()
             .filter(|s| s.role == Role::ActiveWindow)
             .map(|s| s.text.as_str())
             .collect();
-        assert_eq!(active, vec!["1* "], "{spans:?}");
+        assert_eq!(active, vec!["1:cargo* "], "{spans:?}");
+    }
+
+    /// Windows and panes are both runs of small numbers on one line. Give
+    /// them the same highlight and the bar stops being readable at a glance.
+    #[test]
+    fn the_focused_pane_and_the_current_window_do_not_look_alike() {
+        let mut b = B::new(&["", "x"], &[false, false]);
+        b.current = 1;
+        b.focus = 2;
+        let spans = b.at(80);
+        assert!(spans.iter().any(|s| s.role == Role::ActiveWindow), "{spans:?}");
+        assert!(spans.iter().any(|s| s.role == Role::ActivePane), "{spans:?}");
+        assert_ne!(Role::ActiveWindow.style(), Role::ActivePane.style());
     }
 
     #[test]
     fn scrolling_is_flagged() {
-        let spans = status_spans("work", 1, 0, 1, 1, true, 80);
+        let mut b = B::new(&["bash"], &[false]);
+        b.scrolled = true;
+        let spans = b.at(80);
         assert!(plain(&spans).ends_with("| SCROLL "), "{spans:?}");
         assert!(spans.iter().any(|s| s.role == Role::Alert), "SCROLL must stand out: {spans:?}");
     }
@@ -469,23 +611,43 @@ mod tests {
         let full = at(80);
         let narrower = at(full.chars().count() - 1);
         assert!(!narrower.contains("work"), "the name should have been dropped: {narrower}");
-        assert!(narrower.contains("0 1* 2"), "the window list must survive: {narrower}");
-        assert!(narrower.contains("2 panes"), "{narrower}");
+        assert!(narrower.contains("cargo"), "the labels must survive one more rung: {narrower}");
+    }
+
+    /// Knowing WHICH window you are on outranks knowing what is running in the
+    /// others, so the labels go before the list does - and what is left is
+    /// exactly the bar this had before labels existed.
+    #[test]
+    fn the_labels_are_dropped_before_the_window_list_is() {
+        let widths: Vec<usize> = (8..60).collect();
+        let bars: Vec<String> = widths.iter().map(|w| at(*w)).collect();
+        // Widest first: the NEXT rung down from the labelled one, not the
+        // narrowest bar there is.
+        let no_label =
+            bars.iter().rev().find(|b| !b.contains("cargo")).expect("a rung without labels");
+        assert!(no_label.contains("0 1* 2"), "the window list must outlive the labels: {no_label}");
     }
 
     #[test]
     fn the_window_position_outlives_the_pane_count() {
         // Getting lost between windows is worse than not knowing how many
         // panes the current one holds.
-        let s = at(12);
-        assert_eq!(s, " 1/3 | 2p ");
+        assert_eq!(at(14), " 1/3 | 2p • ");
+    }
+
+    /// The one thing the narrow rungs must not quietly drop: a pane can be
+    /// running a long build, and "is anything happening" is the whole point.
+    #[test]
+    fn a_busy_pane_is_still_flagged_on_the_short_rung() {
+        assert!(at(14).contains('•'), "{}", at(14));
     }
 
     #[test]
     fn something_true_is_always_returned_however_narrow() {
         for width in 0..40 {
             let s = at(width);
-            assert!(s.contains("2p") || s.contains("2 pane"), "width {width}: {s}");
+            // Either the panes are listed, or they are counted. Never neither.
+            assert!(s.contains("2*") || s.contains("2p"), "width {width}: {s}");
         }
     }
 
@@ -508,7 +670,7 @@ mod tests {
     #[test]
     fn the_status_bar_is_painted_across_the_whole_width() {
         let mut f = Frame::blank(40, 3);
-        let spans = status_spans("w", 1, 0, 1, 1, false, 40);
+        let spans = B::new(&["bash"], &[false]).at(40);
         let text = width_of(&spans) as u16;
         draw_status(&mut f, &spans);
         for x in 0..40 {

@@ -14,12 +14,9 @@ fn splitting_gives_two_independent_shells() {
     let mut c = d.attach_ready(100, 30);
 
     c.cmd(Cmd::SplitHorizontal);
-    // The status line reports the pane count, so it is a reliable signal that
-    // the split actually took effect server-side.
-    assert!(
-        c.wait_for(20, |t| t.contains("2 panes")).is_some(),
-        "status never reported two panes"
-    );
+    // Ask the daemon, not the status bar: the bar is presentation and its
+    // wording has changed twice, while `info` is the thing that knows.
+    assert!(d.wait_for_panes(2, 20), "the daemon never reported two panes");
 
     // Focus follows the new pane. Set a variable there.
     //
@@ -38,14 +35,11 @@ fn splitting_gives_two_independent_shells() {
     // can only be this shell's own answer. One shared shell would say
     // "LEFT:right:".
     c.cmd(Cmd::FocusLeft);
-    // Confirm the focus actually moved before typing. The status line names
-    // the focused pane, and without this the input races the focus change -
-    // if it lands in the right-hand pane it reads that shell's own variable
-    // and the test fails for a reason that has nothing to do with the claim.
-    assert!(
-        c.wait_for(20, |t| t.contains("pane 1")).is_some(),
-        "focus never moved back to the original pane"
-    );
+    // Confirm the focus actually moved before typing, or the input races the
+    // focus change - if it lands in the right-hand pane it reads that shell's
+    // own variable and the test fails for a reason that has nothing to do
+    // with the claim.
+    assert!(d.wait_for_focus(1, 20), "focus never moved back to the original pane");
     c.input("echo LEFT:$SPLITVAR:\r");
     let screen = match c.wait_for(20, |t| t.contains("LEFT::")) {
         Some(s) => s,
@@ -68,9 +62,11 @@ fn a_divider_separates_stacked_panes() {
     let d = Daemon::start("zmux-test-splitv");
     let mut c = d.attach_ready(100, 30);
     c.cmd(Cmd::SplitVertical);
-    let screen = c.wait_for(20, |t| t.contains("2 panes") && t.contains('─'))
-        .expect("no horizontal divider after a vertical split");
-    assert!(screen.contains('─'));
+    assert!(d.wait_for_panes(2, 20), "the vertical split never took effect");
+    assert!(
+        c.wait_for(20, |t| t.contains('─')).is_some(),
+        "no horizontal divider after a vertical split"
+    );
 }
 
 #[test]
@@ -79,12 +75,14 @@ fn closing_a_pane_returns_its_space_and_keeps_the_session() {
     let mut c = d.attach_ready(100, 30);
 
     c.cmd(Cmd::SplitHorizontal);
-    assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some());
+    assert!(d.wait_for_panes(2, 20));
 
     c.cmd(Cmd::ClosePane);
-    let screen = c.wait_for(20, |t| t.contains("1 pane "))
-        .expect("pane count never returned to one");
-    assert!(!screen.contains('│'), "divider still drawn after close:\n{screen}");
+    assert!(d.wait_for_panes(1, 20), "pane count never returned to one");
+    assert!(
+        c.wait_for(20, |t| !t.contains('│')).is_some(),
+        "divider still drawn after close"
+    );
 
     // The surviving shell still works.
     c.input("echo STILL_ALIVE\r");
@@ -105,7 +103,7 @@ fn each_pane_gets_its_own_pty_size() {
     let d = Daemon::start("zmux-test-panesize");
     let mut c = d.attach_ready(100, 30);
     c.cmd(Cmd::SplitHorizontal);
-    assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some());
+    assert!(d.wait_for_panes(2, 20));
 
     // Ask for an unambiguous marker rather than a bare number: a prompt or a
     // path contains "4" or "5" too, so the old check could pass before tput
@@ -132,7 +130,7 @@ fn splits_survive_detach_and_reattach() {
     {
         let mut c = d.attach_ready(100, 30);
         c.cmd(Cmd::SplitHorizontal);
-        assert!(c.wait_for(20, |t| t.contains("2 panes")).is_some());
+        assert!(d.wait_for_panes(2, 20));
         c.send(&ClientMsg::Detach);
     }
     std::thread::sleep(std::time::Duration::from_millis(400));
@@ -142,8 +140,8 @@ fn splits_survive_detach_and_reattach() {
         Some(ServerMsg::Frame(f)) => common::text_of(&f),
         other => panic!("expected a Frame on attach, got {other:?}"),
     };
-    assert!(first.contains("2 panes"), "layout was lost across detach:\n{first}");
-    assert!(first.contains('│'), "divider missing after reattach");
+    assert_eq!(d.panes(), 2, "layout was lost across detach");
+    assert!(first.contains('│'), "divider missing after reattach:\n{first}");
 }
 
 #[test]
@@ -172,14 +170,15 @@ fn a_shell_exiting_closes_only_its_own_pane() {
     let d = Daemon::start("zmux-test-exit-one");
     let mut c = d.attach_ready(120, 30);
     c.cmd(Cmd::SplitHorizontal);
-    assert!(c.wait_for(25, |t| t.contains("2 panes")).is_some(), "split failed");
+    assert!(d.wait_for_panes(2, 25), "split failed");
     // Focus follows the new pane, so `exit` lands in it.
     assert!(c.wait_for(20, |t| t.contains('$')).is_some(), "no prompt in the new pane");
 
     c.input("exit\r");
-    let screen = c
-        .wait_for(25, |t| t.contains("1 pane"))
-        .expect("the exited pane was never reclaimed");
-    assert!(!screen.contains('│'), "the survivor should reclaim the divider:\n{screen}");
+    assert!(d.wait_for_panes(1, 25), "the exited pane was never reclaimed");
+    assert!(
+        c.wait_for(25, |t| !t.contains('│')).is_some(),
+        "the survivor should reclaim the divider"
+    );
     assert!(ipc::is_running(&d.session), "one shell exiting must not end the session");
 }

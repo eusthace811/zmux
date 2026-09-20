@@ -125,19 +125,13 @@ fn many_splits_then_closing_them_all_ends_with_one_working_pane() {
         c.cmd(dir);
         std::thread::sleep(Duration::from_millis(350));
     }
-    assert!(
-        c.wait_for(20, |t| t.contains("5 panes")).is_some(),
-        "splits did not all take effect"
-    );
+    assert!(d.wait_for_panes(5, 20), "splits did not all take effect");
 
     for _ in 0..4 {
         c.cmd(Cmd::ClosePane);
         std::thread::sleep(Duration::from_millis(350));
     }
-    assert!(
-        c.wait_for(25, |t| t.contains("1 pane ")).is_some(),
-        "panes did not all close"
-    );
+    assert!(d.wait_for_panes(1, 25), "panes did not all close");
 
     // The survivor is a live shell, not a corpse.
     c.input("echo SURVIVOR\r");
