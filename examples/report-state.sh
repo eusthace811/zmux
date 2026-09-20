@@ -70,6 +70,10 @@ zmux_report_via_pipe() {
 #     claimed when the foreground command ends (OSC 133;D), so a claim cannot
 #     outlive the process that made it.
 #   - `agent=` is free text. zmux has no list of known agents to be added to.
+#   - If you are testing this by TYPING it into a pane with `zmux run`,
+#     write \033 and not \e. `run` unescapes \e itself, so the Escape byte
+#     lands in the command line and the shell's line editor eats it before
+#     your printf ever runs.
 #
 # Check it with, from inside the pane:
 #

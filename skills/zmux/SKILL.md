@@ -189,6 +189,12 @@ Escapes in the text: `\r` Enter, `\n`, `\t`, `\e` Escape, `\xNN` any byte —
 `\x03` is Ctrl-C. Anything else after a backslash is left alone, so Windows
 paths survive.
 
+That unescaping happens **before** the pane sees the text, which matters if
+the command you are sending contains escapes of its own. `run ... 'printf
+"\e]1341;..."'` sends a raw Escape byte into the middle of the command line,
+where the shell's line editor eats it. Write `\033` instead: zmux leaves it
+alone, and the pane's own `printf` turns it into the escape.
+
 Asking for a pane that does not exist is **refused**, not redirected — a
 wrong `-p` never lands in the wrong shell.
 
