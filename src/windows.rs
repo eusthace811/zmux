@@ -49,7 +49,7 @@ impl Windows {
     ///
     /// Returns `None` for a list with no windows: the caller must start fresh
     /// rather than be handed a session with nothing to display.
-    pub fn from_saved(list: Vec<Layout>, current: usize) -> Option<Self> {
+    fn from_saved(list: Vec<Layout>, current: usize) -> Option<Self> {
         if list.is_empty() {
             return None;
         }
@@ -71,7 +71,6 @@ impl Windows {
         let list: Vec<Layout> = self
             .list
             .into_iter()
-            .filter(|l| !l.panes().is_empty())
             .map(|l| Layout::from_saved(l.root_snapshot(), l.focus()))
             .collect();
         Self::from_saved(list, current)
@@ -109,7 +108,7 @@ impl Windows {
         self.list.iter().flat_map(|l| l.panes()).collect()
     }
 
-    pub fn window_of(&self, id: PaneId) -> Option<usize> {
+    fn window_of(&self, id: PaneId) -> Option<usize> {
         self.list.iter().position(|l| l.panes().contains(&id))
     }
 
@@ -139,15 +138,6 @@ impl Windows {
             return false;
         }
         self.current = (self.current + self.list.len() - 1) % self.list.len();
-        true
-    }
-
-    /// Switch to a window by index. False if it does not exist or is current.
-    pub fn select(&mut self, i: usize) -> bool {
-        if i >= self.list.len() || i == self.current {
-            return false;
-        }
-        self.current = i;
         true
     }
 
@@ -277,7 +267,7 @@ mod tests {
         let mut w = Windows::new(one(1));
         w.push(one(2));
         w.push(one(3));
-        w.select(0);
+        w.select_next(); // wrap from the third window round to the first
         assert_eq!(w.close_pane(PaneId(3)), Closed::Window);
         assert_eq!(w.index(), 0, "closing window 2 must not move us");
         assert_eq!(w.current().focus(), PaneId(1));
@@ -308,20 +298,10 @@ mod tests {
         let mut w = Windows::new(one(1));
         w.push(one(2));
         w.push(one(3));
-        w.select(1);
+        w.select_previous();
         assert_eq!(w.close_pane(PaneId(2)), Closed::Window);
         assert_eq!(w.index(), 1, "the window that was after us takes our index");
         assert_eq!(w.current().focus(), PaneId(3));
-    }
-
-    #[test]
-    fn select_rejects_an_index_that_does_not_exist() {
-        let mut w = Windows::new(one(1));
-        w.push(one(2));
-        assert!(!w.select(7));
-        assert!(!w.select(1), "already current");
-        assert!(w.select(0));
-        assert_eq!(w.index(), 0);
     }
 
     #[test]
@@ -351,19 +331,11 @@ mod tests {
     }
 
     #[test]
-    fn repairing_drops_a_window_that_lost_all_its_panes() {
-        // Not reachable through the API, but a hand-edited file can say it.
-        let json = r#"{"list":[{"root":{"Leaf":1},"focus":1}],"current":0}"#;
-        let w: Windows = serde_json::from_str(json).unwrap();
-        assert!(w.repaired().is_some());
-    }
-
-    #[test]
     fn windows_survive_a_serde_round_trip() {
         let mut w = Windows::new(one(1));
         w.current_mut().split(Dir::Vertical, area(), PaneId(2)).unwrap();
         w.push(one(3));
-        w.select(0);
+        w.select_previous();
         let json = serde_json::to_string(&w).unwrap();
         let back: Windows = serde_json::from_str(&json).unwrap();
         assert_eq!(back.len(), 2);

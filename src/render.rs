@@ -112,7 +112,7 @@ use crate::layout::{Dir, Divider, Layout, PaneId, Rect as LRect};
 /// asynchronous, so a frame produced just before the resize lands can be
 /// larger than the rect it must go in. Without clipping that scribbles over
 /// the neighbouring pane.
-pub fn blit(dst: &mut Frame, src: &Frame, at: LRect) {
+fn blit(dst: &mut Frame, src: &Frame, at: LRect) {
     for row in 0..src.rows.min(at.h) {
         for col in 0..src.cols.min(at.w) {
             let (x, y) = (at.x + col, at.y + row);
@@ -133,7 +133,7 @@ fn put(dst: &mut Frame, x: u16, y: u16, ch: char, mods: u16) {
     }
 }
 
-pub fn draw_dividers(dst: &mut Frame, dividers: &[Divider]) {
+fn draw_dividers(dst: &mut Frame, dividers: &[Divider]) {
     for d in dividers {
         let ch = match d.dir {
             Dir::Horizontal => '│',
@@ -148,7 +148,7 @@ pub fn draw_dividers(dst: &mut Frame, dividers: &[Divider]) {
 }
 
 /// One-line status bar along the bottom.
-pub fn draw_status(dst: &mut Frame, text: &str) {
+fn draw_status(dst: &mut Frame, text: &str) {
     if dst.rows == 0 {
         return;
     }
@@ -162,7 +162,7 @@ pub fn draw_status(dst: &mut Frame, text: &str) {
 }
 
 /// Mark the focused pane so it is obvious which one takes input.
-pub fn highlight_focus(dst: &mut Frame, dividers: &[Divider], focus: LRect) {
+fn highlight_focus(dst: &mut Frame, dividers: &[Divider], focus: LRect) {
     let _ = dividers;
     // A bold top-left corner marker is cheap and does not steal a row.
     if focus.w > 0 && focus.h > 0 {
@@ -174,10 +174,6 @@ pub fn highlight_focus(dst: &mut Frame, dividers: &[Divider], focus: LRect) {
 }
 
 /// The area available to panes: everything above the status bar.
-pub fn pane_area(cols: u16, rows: u16) -> LRect {
-    pane_area_with(cols, rows, true)
-}
-
 pub fn pane_area_with(cols: u16, rows: u16, status_bar: bool) -> LRect {
     LRect::new(0, 0, cols, if status_bar { rows.saturating_sub(1) } else { rows })
 }

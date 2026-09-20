@@ -127,10 +127,9 @@ impl Session {
         // Bounded: forwarding each pane's bounded queue into an unbounded one
         // would defeat the bound entirely.
         let (events_tx, events_rx) = std::sync::mpsc::sync_channel(EVENT_QUEUE);
-        let restored = restore_layout(name);
-        let windows = match &restored {
-            Some((w, _)) => w.clone(),
-            None => Windows::new(Layout::new(PaneId::alloc())),
+        let (windows, cwds) = match restore_layout(name) {
+            Some(restored) => restored,
+            None => (Windows::new(Layout::new(PaneId::alloc())), HashMap::new()),
         };
         let session = Arc::new(Self {
             name: name.to_string(),
@@ -155,7 +154,6 @@ impl Session {
             let w = lock(&session.windows);
             w.all().iter().flat_map(|l| l.compute(area).0).collect()
         };
-        let cwds = restored.map(|(_, c)| c).unwrap_or_default();
         for (id, rect) in planned {
             let dir = cwds
                 .get(&id.0)
@@ -173,7 +171,7 @@ impl Session {
         if lock(&session.panes).is_empty() {
             let id = PaneId::alloc();
             *lock(&session.windows) = Windows::new(Layout::new(id));
-            session.spawn_pane(id, area.w, area.h)?;
+            session.spawn_pane_retrying(id, area.w, area.h, None)?;
         }
         session.save_state();
         Ok((session, events_rx))
@@ -183,7 +181,7 @@ impl Session {
     ///
     /// Called after any structural change. Failures are logged, never fatal:
     /// not being able to save a layout is no reason to lose a working session.
-    pub fn save_state(&self) {
+    fn save_state(&self) {
         // Capture layout and panes together. Taking them under separate locks
         // allowed a split to land in between, producing a snapshot whose tree
         // and directories described different moments.
@@ -221,11 +219,6 @@ impl Session {
         }
         let path = std::path::PathBuf::from(dir);
         path.is_dir().then_some(path)
-    }
-
-    /// Create the pty for `id` and start forwarding its events.
-    fn spawn_pane(&self, id: PaneId, cols: u16, rows: u16) -> Result<()> {
-        self.spawn_pane_in(id, cols, rows, None)
     }
 
     /// Spawn a pane, retrying a transient failure.
@@ -299,24 +292,12 @@ impl Session {
         lock(&self.windows).current().focus()
     }
 
-    pub fn window_count(&self) -> usize {
-        lock(&self.windows).len()
-    }
-
-    pub fn window_index(&self) -> usize {
-        lock(&self.windows).index()
-    }
-
-    pub fn pane_count(&self) -> usize {
-        lock(&self.panes).len()
-    }
-
     pub fn size(&self) -> (u16, u16) {
         *lock(&self.size)
     }
 
     /// The CURRENT window's layout - the one that gets composited.
-    pub fn layout_snapshot(&self) -> Layout {
+    fn layout_snapshot(&self) -> Layout {
         lock(&self.windows).current().clone()
     }
 
@@ -376,8 +357,7 @@ impl Session {
     /// that, a window created with `NewWindow` could only be dismissed by
     /// exiting its shell.
     pub fn close_focused(&self) -> bool {
-        let id = self.focus();
-        self.remove_pane(id) != Closed::LastPane
+        matches!(self.remove_pane(self.focus()), Closed::Pane | Closed::Window)
     }
 
     /// Remove one pane and tear its pty down, whichever window holds it.
@@ -463,10 +443,6 @@ impl Session {
         self.switch_window(|w| w.select_previous())
     }
 
-    pub fn select_window(&self, index: usize) -> bool {
-        self.switch_window(|w| w.select(index))
-    }
-
     /// Change which window is composited.
     ///
     /// `reflow_locked` is what makes this correct rather than just convenient:
@@ -525,14 +501,14 @@ impl Session {
     }
 
     /// True when the focused pane is showing history rather than live output.
-    pub fn focused_is_scrolled(&self) -> bool {
+    fn focused_is_scrolled(&self) -> bool {
         let id = self.focus();
         let panes = lock(&self.panes);
         panes.get(&id).is_some_and(|p| lock(&p.term).scroll_offset() > 0)
     }
 
     /// Typing snaps the view back to live output, as a terminal does.
-    pub fn follow_focused(&self) {
+    fn follow_focused(&self) {
         let id = self.focus();
         let panes = lock(&self.panes);
         if let Some(p) = panes.get(&id) {
@@ -571,33 +547,32 @@ impl Session {
         };
         let panes = lock(&self.panes);
         for (id, r) in rects {
-            if let Some(p) = panes.get(&id) {
-                if r.w > 0 && r.h > 0 {
-                    // Only resize the parser if the pty accepted the new size.
-                    // Resizing it regardless left vt100 and ConPTY disagreeing
-                    // about the grid, which renders as misplaced output.
-                    match p.pty.resize(r.w, r.h) {
-                        Ok(()) => lock(&p.term).resize(r.w, r.h),
-                        Err(e) => eprintln!("[session] pane {} resize failed: {e}", id.0),
-                    }
-                }
+            let Some(p) = panes.get(&id) else { continue };
+            if r.w == 0 || r.h == 0 {
+                continue;
+            }
+            // Skip panes already at this size. `ResizePseudoConsole` is not
+            // free and makes the shell redraw, and reflow runs on every window
+            // switch - where nothing has actually moved - so resizing
+            // unconditionally would churn every pane in every window on each
+            // C-b n. The parser's size is the pty's: they are only ever set
+            // together, below.
+            let (cur_rows, cur_cols) = lock(&p.term).parser.screen().size();
+            if (cur_cols, cur_rows) == (r.w, r.h) {
+                continue;
+            }
+            // Only resize the parser if the pty accepted the new size.
+            // Resizing it regardless left vt100 and ConPTY disagreeing about
+            // the grid, which renders as misplaced output.
+            match p.pty.resize(r.w, r.h) {
+                Ok(()) => lock(&p.term).resize(r.w, r.h),
+                Err(e) => eprintln!("[session] pane {} resize failed: {e}", id.0),
             }
         }
         drop(panes);
         self.revision.fetch_add(1, Ordering::Relaxed);
         // Geometry changed, so no delta can describe the transition.
         *lock(&self.last_published) = None;
-    }
-
-    /// Public reflow: takes the geometry lock, then republishes so attached
-    /// clients see the new grid immediately instead of waiting for the next
-    /// byte of pty output.
-    pub fn reflow(&self) {
-        {
-            let _g = lock(&self.geometry);
-            self.reflow_locked();
-        }
-        self.publish();
     }
 
     /// Compose once, then send each client either a full frame or just the
@@ -746,7 +721,7 @@ impl Session {
         }
     }
 
-    pub fn status_line(&self) -> String {
+    fn status_line(&self) -> String {
         let (n, focus, windows, current) = {
             let w = lock(&self.windows);
             (w.current().len(), w.current().focus().0, w.len(), w.index())
@@ -755,42 +730,35 @@ impl Session {
         let width = self.size().0 as usize;
         let plural = if n == 1 { "" } else { "s" };
 
-        // The window list appears only once there IS more than one window.
-        // With a single window it would be a constant "0*" occupying space
-        // that the parts which actually vary need on a narrow terminal.
-        let wins = if windows > 1 {
+        // Both window forms appear only once there IS more than one window.
+        // With a single window they would be a constant "0*" and "0/1" taking
+        // space from the parts that actually vary on a narrow terminal.
+        let (wins, wshort) = if windows > 1 {
             let list = (0..windows)
                 .map(|i| if i == current { format!("{i}*") } else { i.to_string() })
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!("{list} | ")
+            (format!("{list} | "), format!("{current}/{windows} | "))
         } else {
-            String::new()
+            (String::new(), String::new())
         };
 
         // Drop the least useful parts first rather than letting the whole line
         // be truncated. On a narrow pane the old format showed a clipped
         // session name and nothing else - the pane count, which is what you
-        // actually need, fell off the end.
-        let full = format!(" {} | {wins}{n} pane{plural} | pane {focus}{scrolled} ", self.name);
-        if full.chars().count() <= width {
-            return full;
-        }
-        let medium = format!(" {wins}{n} pane{plural} | pane {focus}{scrolled} ");
-        if medium.chars().count() <= width {
-            return medium;
-        }
-        // Which window you are on outranks how many panes it holds: getting
-        // lost between windows is worse than not knowing the pane count.
-        let short = if windows > 1 {
-            format!(" {current}/{windows} | {n}p{scrolled} ")
-        } else {
-            format!(" {n}p{scrolled} ")
-        };
-        if short.chars().count() <= width || windows <= 1 {
-            return short;
-        }
-        format!(" {n}p{scrolled} ")
+        // actually need, fell off the end. Which window you are on outranks
+        // the pane count: getting lost between windows is worse than not
+        // knowing how many panes this one holds.
+        let ladder = [
+            format!(" {} | {wins}{n} pane{plural} | pane {focus}{scrolled} ", self.name),
+            format!(" {wins}{n} pane{plural} | pane {focus}{scrolled} "),
+            format!(" {wshort}{n}p{scrolled} "),
+        ];
+        ladder
+            .into_iter()
+            .find(|s| s.chars().count() <= width)
+            // Nothing fits; this is the shortest thing that is still true.
+            .unwrap_or_else(|| format!(" {n}p{scrolled} "))
     }
 
     pub fn snapshot(&self) -> Frame {

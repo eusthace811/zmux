@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 117 tests passing, clippy clean.
+Phases 0–6 complete. 116 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -33,6 +33,7 @@ zmux work               a named session
 zmux ls                 list live sessions
 zmux attach work        attach without creating
 zmux kill work          terminate a session
+zmux config             write a commented default config, print its path
 ```
 
 | Key | |

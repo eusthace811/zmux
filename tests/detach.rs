@@ -71,11 +71,19 @@ fn reattaching_at_a_different_size_resizes_the_pty() {
         "the session never resized to the reattaching client's 100 columns"
     );
     // `tput cols` reports what the pty believes, which is what we changed.
-    c2.input("tput cols\r");
-    assert!(
-        c2.wait_for(20, |t| t.contains("100")).is_some(),
-        "pty was not resized to the reattaching client's viewport"
-    );
+    //
+    // Ask repeatedly. ConPTY hands a resize to the attached process
+    // asynchronously, so a query issued in the same breath as the resize can
+    // still read the old width - this failed roughly one run in six. The
+    // property worth asserting is that the shell CONVERGES on the new size,
+    // not that it sees it instantly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut agreed = false;
+    while !agreed && std::time::Instant::now() < deadline {
+        c2.input("tput cols\r");
+        agreed = c2.wait_for(3, |t| t.contains("100")).is_some();
+    }
+    assert!(agreed, "pty was not resized to the reattaching client's viewport");
 }
 
 #[test]

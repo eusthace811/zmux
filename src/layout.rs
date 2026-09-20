@@ -196,13 +196,6 @@ impl Layout {
         true
     }
 
-    /// Remove the focused pane. Returns the removed id, or `None` if it is the
-    /// last one (a session always keeps at least one pane).
-    pub fn close_focused(&mut self) -> Option<PaneId> {
-        let removed = self.focus;
-        self.close(removed).then_some(removed)
-    }
-
     /// Geometry for every pane, plus the dividers between them.
     pub fn compute(&self, area: Rect) -> (Vec<(PaneId, Rect)>, Vec<Divider>) {
         let mut panes = Vec::new();
@@ -491,7 +484,7 @@ mod tests {
         let mut l = Layout::new(PaneId(1));
         l.split(Dir::Horizontal, area(), PaneId(2)).unwrap();
         assert_eq!(l.focus(), PaneId(2));
-        assert_eq!(l.close_focused(), Some(PaneId(2)));
+        assert!(l.close(PaneId(2)));
         assert_eq!(l.panes(), vec![PaneId(1)]);
         assert_eq!(l.focus(), PaneId(1));
         assert_eq!(l.compute(area()).0[0].1, area(), "survivor reclaims the space");
@@ -519,7 +512,7 @@ mod tests {
     #[test]
     fn the_last_pane_cannot_be_closed() {
         let mut l = Layout::new(PaneId(1));
-        assert_eq!(l.close_focused(), None);
+        assert!(!l.close(PaneId(1)));
         assert_eq!(l.len(), 1);
     }
 

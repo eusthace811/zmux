@@ -65,6 +65,7 @@ zmux - tmux-style panes for Windows
   zmux attach <session>   attach to an existing session (does not create)
   zmux ls                 list live sessions
   zmux kill <session>     terminate a session and its daemon
+  zmux config             write a commented default config, print its path
   zmux --help
 
 In a session (Ctrl-b is the prefix):
@@ -92,6 +93,12 @@ fn main() -> Result<()> {
                     println!("{s}");
                 }
             }
+            return Ok(());
+        }
+        Some("config") => {
+            // Config::write_default keeps an existing file; this only ever
+            // creates the template, never overwrites what someone has edited.
+            println!("{}", zmux::config::Config::write_default()?.display());
             return Ok(());
         }
         Some("kill") => {

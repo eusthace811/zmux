@@ -153,13 +153,24 @@ fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEve
     }
 }
 
-fn apply(session: &Arc<Session>, cmd: Cmd) -> Result<()> {
+/// Run one client command.
+///
+/// Infallible on purpose. Creating a pane can fail - the shell may not start
+/// under resource pressure - and propagating that ended the CONNECTION, so a
+/// transient failure threw the user out of a session that was otherwise
+/// perfectly healthy. A command that cannot be carried out is logged and does
+/// not happen; that is all it should ever cost.
+fn apply(session: &Arc<Session>, cmd: Cmd) {
     match cmd {
         Cmd::SplitHorizontal => {
-            session.split(Dir::Horizontal)?;
+            if let Err(e) = session.split(Dir::Horizontal) {
+                eprintln!("[zmuxd] split failed: {e}");
+            }
         }
         Cmd::SplitVertical => {
-            session.split(Dir::Vertical)?;
+            if let Err(e) = session.split(Dir::Vertical) {
+                eprintln!("[zmuxd] split failed: {e}");
+            }
         }
         Cmd::ClosePane => {
             session.close_focused();
@@ -194,7 +205,9 @@ fn apply(session: &Arc<Session>, cmd: Cmd) -> Result<()> {
         Cmd::ScrollPageDown => session.scroll_focused(Some(-10)),
         Cmd::ScrollToBottom => session.scroll_focused(None),
         Cmd::NewWindow => {
-            session.new_window()?;
+            if let Err(e) = session.new_window() {
+                eprintln!("[zmuxd] new window failed: {e}");
+            }
         }
         Cmd::NextWindow => {
             session.next_window();
@@ -203,7 +216,6 @@ fn apply(session: &Arc<Session>, cmd: Cmd) -> Result<()> {
             session.prev_window();
         }
     }
-    Ok(())
 }
 
 fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) -> Result<()> {
@@ -333,7 +345,7 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     // clients must see, and a direct write would bypass the
                     // delta base, leaving the next delta unapplicable.
                     ClientMsg::Command(cmd) => {
-                        apply(&session, cmd)?;
+                        apply(&session, cmd);
                         session.publish();
                     }
                     ClientMsg::Click { x, y } => {

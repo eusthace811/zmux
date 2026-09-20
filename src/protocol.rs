@@ -89,6 +89,10 @@ pub enum ServerMsg {
     /// A full grid snapshot. Phase 1 sends these; deltas come later.
     Frame(Frame),
     PaneExited { code: i32 },
+    /// Reserved. Nothing sends this: a detach is complete when the daemon
+    /// drops the connection, and the client has already stopped reading by
+    /// then. Kept because variants are append-only - removing it would
+    /// renumber every variant below.
     Detached,
     // --- appended after v1 shipped. Append-only. ---
     /// Daemon is shutting down.

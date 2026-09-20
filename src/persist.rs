@@ -145,7 +145,7 @@ mod tests {
         let name = "zmux-unit-windows";
         let mut s = snapshot(name);
         s.windows.push(Layout::new(PaneId(7)));
-        s.windows.select(0);
+        s.windows.select_previous();
         save(&s).expect("save");
         let back = load(name).expect("load");
         assert_eq!(back.windows.len(), 2);

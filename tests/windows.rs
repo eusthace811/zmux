@@ -3,7 +3,7 @@
 mod common;
 
 use common::Daemon;
-use zmux::protocol::Cmd;
+use zmux::protocol::{Cmd, ServerMsg};
 
 /// Type a command whose OUTPUT is `mark` but whose ECHOED TEXT is not.
 ///
@@ -264,4 +264,44 @@ fn a_new_window_inherits_the_focused_directory() {
         c.wait_for(25, |t| t.contains("/c/Windows")).is_some(),
         "a new window should start in the focused pane's directory, as a split does"
     );
+}
+
+/// A window switch must resend the WHOLE screen.
+///
+/// Every cell changes, so a row diff against the screen the client was showing
+/// describes nothing. Worse, the client would refuse it and keep refusing -
+/// nothing asks for a resync - and the display would freeze at the last
+/// revision it managed to apply. `switch_window` gets this from
+/// `reflow_locked`, which clears `last_published`; this asserts it directly
+/// rather than trusting that the call stays.
+#[test]
+fn switching_windows_resends_the_whole_screen() {
+    let d = Daemon::start("zmux-test-win-fullframe");
+    let mut c = d.attach_ready(120, 30);
+    c.cmd(Cmd::NewWindow);
+    assert!(c.wait_for(25, |t| t.contains("0 1*")).is_some(), "no second window");
+
+    // Let both shells go quiet, so the only thing that can produce a message
+    // is the switch itself.
+    let _ = c.current(3);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let _ = c.current(1);
+
+    c.cmd(Cmd::PrevWindow);
+    let mut first = None;
+    for _ in 0..40 {
+        match c.next_msg(500) {
+            Some(ServerMsg::Frame(_)) => {
+                first = Some("frame");
+                break;
+            }
+            Some(ServerMsg::Delta(_)) => {
+                first = Some("delta");
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert_eq!(first, Some("frame"), "a window switch must send a full frame, not a delta");
 }
