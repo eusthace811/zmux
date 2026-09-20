@@ -211,16 +211,27 @@ impl Session {
     /// the check here covers every caller, including a split that is still
     /// retrying a shell when the session is told to stop.
     fn save_state(&self) {
+        let _s = lock(&self.save);
+        // Checked UNDER the lock, not before it. `shutdown` clears `running`
+        // and then takes this same lock to write the arrangement it means to
+        // restore; a save that read `true` a moment earlier would otherwise
+        // queue up behind it and overwrite it with one taken after the pane
+        // map was drained.
         if !self.running.load(Ordering::Relaxed) {
             return;
         }
-        self.save_state_now();
+        self.save_locked();
     }
 
-    /// The save itself. `shutdown` uses this directly, because by then
-    /// `running` is already false and its save is the one that matters.
+    /// The save `shutdown` performs, which must happen although `running` is
+    /// already false by then.
     fn save_state_now(&self) {
         let _s = lock(&self.save);
+        self.save_locked();
+    }
+
+    /// Capture and write. The caller holds `save`.
+    fn save_locked(&self) {
         // Capture layout and panes together. Taking them under separate locks
         // allowed a split to land in between, producing a snapshot whose tree
         // and directories described different moments.
@@ -1044,14 +1055,22 @@ impl Session {
             return; // already shutting down
         }
         self.broadcast(&ServerMsg::ShuttingDown);
-        // Save the final directories: cwd was otherwise only persisted on
-        // structural changes, so a plain `cd` before shutdown was lost.
-        self.save_state_now();
-        // Take `geometry` so a concurrent split cannot insert a pane AFTER the
-        // map is drained, leaving a ConPTY outside teardown. Released before
-        // closing.
+        // Take `geometry` BEFORE saving, not just before draining. A split
+        // holds it across the whole insert-spawn-rollback sequence, and
+        // saving without it could capture the tree mid-split - persisting a
+        // leaf whose shell then failed to start, to be restored with a shell
+        // of its own next time. The split's own corrective save cannot fix
+        // that, because by then `running` is false. Waiting here means the
+        // tree has settled before it is written.
+        //
+        // Held on through the drain, so a concurrent split cannot insert a
+        // pane AFTER the map is emptied and leave a ConPTY outside teardown.
+        // Released before closing.
         let panes: Vec<_> = {
             let _g = lock(&self.geometry);
+            // Save the final directories: cwd was otherwise only persisted on
+            // structural changes, so a plain `cd` before shutdown was lost.
+            self.save_state_now();
             lock(&self.panes).drain().map(|(_, p)| p).collect()
         };
         // Close OFF-THREAD and wait with a bound. ClosePseudoConsole can wait
