@@ -1,7 +1,8 @@
 # zmux — design and implementation record (v5)
 
 tmux-style panes for Windows with persistent, detachable sessions.
-Git Bash is the pane shell. A locked-down corporate laptop is the runtime target.
+Git Bash is the pane shell. A locked-down corporate laptop is the runtime
+target.
 
 Rule: **do what herdr does, reuse herdr's code, build nothing new unless
 forced.** Divergences are justified inline.
@@ -103,7 +104,7 @@ Windows Terminal stays supported, tested second.
 ### 0.2 No WMI. ✅ PASS here — ⚠️ must be re-confirmed on the work laptop
 
 herdr escapes the console job object with WMI `Win32_Process.Create`
-(`windows.rs:1207`). On a bank laptop that is MITRE ATT&CK **T1047**, a
+(`windows.rs:1207`). On a managed laptop that is MITRE ATT&CK **T1047**, a
 high-signal EDR detection. Policy: do not use it.
 
 **Result, 2026-09-19 — with the mechanism now understood, not just observed:**
@@ -142,7 +143,7 @@ rung is not needed here.**
 | **Hand-clicked window close** | `CloseMainWindow()` was attempted; mintty ignored WM_CLOSE while a foreground command was running. A graceful close still deserves one manual confirmation. |
 
 **`probe-c.exe` now self-diagnoses** — it reports `IsProcessInJob` plus
-`KILL_ON_JOB_CLOSE` / `BREAKAWAY_OK` / `SILENT_BREAKAWAY` flags. On the the work laptop
+`KILL_ON_JOB_CLOSE` / `BREAKAWAY_OK` / `SILENT_BREAKAWAY` flags. On the work
 laptop you get the answer directly instead of inferring it from survival. Note
 the standing caveat: `QueryInformationJobObject(NULL, …)` reports only the
 **immediate** job, so an ancestor carrying `KILL_ON_JOB_CLOSE` still yields a
@@ -158,7 +159,7 @@ against crates.io:
 | --- | --- |
 | **`vt100` 0.16.2** | **Chosen.** 3 runtime deps (`itoa`, `unicode-width`, `vte`), no platform code, no build script. |
 | `alacritty_terminal` 0.26.0 | Rejected — 17 runtime deps incl. its own PTY stack (`rustix-openpty`, `miow`, `polling`). Fights `portable-pty`. |
-| `wezterm-term` | **Does not exist on crates.io** (`{"errors":[{"detail":"crate \`wezterm-term\` does not exist"}]}`). Only wezterm's *support* crates are published. It therefore cannot be in Artifactory either — a crates.io remote is a caching proxy. The only published relative is `tattoy-wezterm-term 0.1.0-fork.5`, an unofficial prerelease fork: worse for a bank review than `vt100`. |
+| `wezterm-term` | **Does not exist on crates.io** (`{"errors":[{"detail":"crate \`wezterm-term\` does not exist"}]}`). Only wezterm's *support* crates are published. It therefore cannot be in Artifactory either — a crates.io remote is a caching proxy. The only published relative is `tattoy-wezterm-term 0.1.0-fork.5`, an unofficial prerelease fork: worse for a security review than `vt100`. |
 
 **`vt100` is adequate, not complete.** Honest gaps (`src/cell.rs`):
 
@@ -241,13 +242,15 @@ Two contracts that path still imposes, both learned from herdr:
 ## 1. Phase 0 — probe before building (1 day, was ½)
 
 No production code. **Development happens on a personal Windows 11 PC; the
-result is handed to the work laptop later (§8).** That splits the probes in two:
+result is handed to the work laptop later (§8).** That splits the probes in
+two:
 
 - **Answerable now** (C, D, E) — run them, they gate the design.
-- **A is ANSWERED** (2026-09-19): the corporate Artifactory carries a Cargo remote and
-  **all 76 crates in the closure resolve**, including `shared_library`. It is a
-  caching proxy, not a curated allowlist. Per-crate availability is no longer a
-  question and §6.1's tiering is now only a historical record.
+- **A is ANSWERED** (2026-09-19): the corporate Artifactory carries a Cargo
+  remote and **all 76 crates in the closure resolve**, including
+  `shared_library`. It is a caching proxy, not a curated allowlist. Per-crate
+  availability is no longer a question and §6.1's tiering is now only a
+  historical record.
 
 **B — ConPTY + Git Bash.** ~60 lines: `native_pty_system()` → spawn
 `C:\Program Files\Git\bin\bash.exe -l` → echo output, forward stdin, one resize.
@@ -393,8 +396,8 @@ returns exactly `["-l"]`. Bash is already interactive when stdin is a pty, and
    > **The startup CPR handshake is universal, not version-gated.** What may
    > vary pre/post-24H2 is `ClosePseudoConsole` behaviour once you *have*
    > answered. So this is not a "works on my machine" trap that hides until
-   > the work laptop — it fails immediately, everywhere, and must be handled in the first
-   > 50 lines of Phase 1.
+   > the work laptop — it fails immediately, everywhere, and must be handled
+   > in the first 50 lines of Phase 1.
    >
    > Two details the probe surfaced:
    > - A query can straddle a read boundary. Scan a rolling buffer, not each
@@ -531,9 +534,9 @@ harvest that does not exist (§2.1) and deferred work that cannot be deferred.
 
 ### 6.1 Artifactory — RESOLVED: all 76 available
 
-**Checked on the corporate network 2026-09-19: a Cargo remote exists and every crate in the
-closure resolves.** Caching proxy, not an allowlist. This section is kept as a
-record and for the day someone changes the policy.
+**Checked on the corporate network 2026-09-19: a Cargo remote exists and every
+crate in the closure resolves.** Caching proxy, not an allowlist. This section
+is kept as a record and for the day someone changes the policy.
 
 
 
@@ -623,7 +626,7 @@ expensive way to do it.
 
 ### 8.1 Three rules, applied from the first commit
 
-1. **Commit `Cargo.lock`.** Pins all 76 crates to exact versions, so the the work laptop
+1. **Commit `Cargo.lock`.** Pins all 76 crates to exact versions, so the work
    build resolves identically and cannot drift.
 2. **`cargo vendor --versioned-dirs`, committed — now insurance, not the
    critical path.** Artifactory resolves all 76 crates (§6.1), so this is no
@@ -636,12 +639,12 @@ expensive way to do it.
    (last published 2018) and closes the relative-`conpty.dll` DLL-hijack path
    in stock 0.9.0 — a security decision, not an availability one (§2.3).
 3. **CRT linkage: dynamic (Rust's default) — static is a fallback, not the plan.**
-   Corporate IT already installs the VC++ Redistributable via their own tooling, so
-   `vcruntime140.dll` is present. That removes the reason to static-link, and
-   there is a real argument *against* it on a bank laptop: a dynamic CRT gets
-   patched by Windows Update, while a statically-linked one freezes whatever
-   CRT the binary was built with, so a CRT CVE would require us to rebuild and
-   redistribute.
+   Corporate IT already installs the VC++ Redistributable via their own
+   tooling, so `vcruntime140.dll` is present. That removes the reason to
+   static-link, and there is a real argument *against* it on a managed
+   laptop: a dynamic CRT gets patched by Windows Update, while a
+   statically-linked one freezes whatever CRT the binary was built with, so a
+   CRT CVE would require us to rebuild and redistribute.
 
    The `vcruntime140.dll` ABI has been stable since VS2015, so any 2015–2022
    redist satisfies a Rust MSVC build. Version mismatch risk is low.
@@ -682,8 +685,8 @@ when policy forbids unsigned executables but permits building from source.
 | **Older Windows build** | ConPTY teardown deadlock (§2.5); degraded sequence fidelity. The dev PC is 25H2 and will hide both. |
 | **EDR (endpoint security)** | Watches the detached daemon. §0.2's no-WMI policy is the main mitigation. |
 | **AppLocker / WDAC** | May block an unsigned `.exe` from a user directory. Test with a trivial binary **early** — before writing 3 weeks of code. |
-| **No admin rights** | Cannot install a missing redist or toolchain. Confirmed non-issue for the redist — Corporate IT ships it. |
-| **Group-policy job objects** | Probe C's answer on this PC may not hold on the work laptop. **Re-run Probe C there** — it is zero-dependency precisely so it can run anywhere, first, with nothing installed. |
+| **No admin rights** | Cannot install a missing redist or toolchain. Confirmed non-issue for the redist — corporate IT ships it. |
+| **Group-policy job objects** | Probe C's answer on this PC may not hold there. **Re-run Probe C there** — it is zero-dependency precisely so it can run anywhere, first, with nothing installed. |
 | **Different Git for Windows version** | Changes the Probe D (mintty/ConPTY) answer. Re-run it. |
 
 ### 8.4 Minimum viable validation on the work laptop

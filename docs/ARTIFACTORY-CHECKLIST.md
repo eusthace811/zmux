@@ -1,9 +1,9 @@
 # Artifactory checklist — RESOLVED 2026-09-19
 
-> **Outcome: the corporate Artifactory has a Cargo remote and all 76 crates resolve,
-> `shared_library` included. It is a caching proxy, not a curated allowlist.**
-> Nothing below is blocking. Kept as a record of the closure and as a
-> starting point if the policy ever changes.
+> **Outcome: the corporate Artifactory has a Cargo remote and all 76 crates
+> resolve, `shared_library` included. It is a caching proxy, not a curated
+> allowlist.** Nothing below is blocking. Kept as a record of the closure and
+> as a starting point if the policy ever changes.
 >
 > One recommendation survives on *security* grounds, not availability:
 > vendor `portable-pty` from herdr's tree to drop `shared_library` and close
@@ -32,7 +32,7 @@ Three possible answers:
 | --- | --- | --- |
 | **A Cargo remote repo exists**, proxying crates.io | Caching proxy. Individual crate availability is a non-question. | Nothing. Use it. The per-crate list below is then pure diagnostics. |
 | **Cargo repo exists but is curated/allowlisted** | Each crate needs approval | Work the Tier 1 list below, or vendor |
-| **No Cargo repo at all** | Most likely outcome at a bank | **Vendoring is not a fallback — it is the plan** (DESIGN.md §8.1 rule 2). Requesting a new repo type is a long procurement conversation; `cargo vendor` skips it entirely. |
+| **No Cargo repo at all** | Most likely outcome in a locked-down shop | **Vendoring is not a fallback — it is the plan** (DESIGN.md §8.1 rule 2). Requesting a new repo type is a long procurement conversation; `cargo vendor` skips it entirely. |
 
 ### Two follow-ups for the platform team
 
@@ -58,7 +58,7 @@ Three possible answers:
 
 ---
 
-**Only needed if you intend to build from a live registry on the work laptop.** If we
+**Only needed if you intend to build from the corporate registry.** If we
 follow DESIGN.md §8.1 rule 2 (`cargo vendor --versioned-dirs`, committed), the
 build needs zero network and none of this matters. Check anyway — it is cheap,
 and it tells you which mode you are in.
@@ -106,7 +106,8 @@ lose overlay support, which copy-mode selection needs.
 
 ## The one-command answer
 
-Rather than checking names by hand, resolve the whole graph on the work laptop:
+Rather than checking names by hand, resolve the whole graph on the corporate
+network:
 
 ```
 cargo new probe-a && cd probe-a
@@ -133,7 +134,7 @@ a crate nobody has pulled yet, not evidence that it is blocked.
 **It does not matter either way — we are removing this dependency.**
 
 `shared_library` 0.1.9 was last published **2018-07-10**. An 8-year-unmaintained
-crate is exactly what a bank's dependency scanner flags. More importantly,
+crate is exactly what a corporate dependency scanner flags. More importantly,
 stock `portable-pty` uses it to load `conpty.dll` **through the relative DLL
 search path** — a DLL-hijack vector, and the thing herdr's patch 0001 exists to
 fix (DESIGN.md §2.3).

@@ -30,9 +30,9 @@ Reading it:
 
 **If neither mode survives from either host:** under the no-WMI policy
 (DESIGN.md §0.2) we do not have a persistent multiplexer. That is a real
-decision point — either take WMI to corporate security as an approved exception, or
-drop to a single-process multiplexer with no detach. Do not start Phase 1 until
-this is answered.
+decision point — either take WMI to corporate security as an approved
+exception, or drop to a single-process multiplexer with no detach. Do not
+start Phase 1 until this is answered.
 
 ### 2. PROBE A/D/E — network, host, Windows build
 In a **Git Bash** window:
