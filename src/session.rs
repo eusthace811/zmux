@@ -475,6 +475,15 @@ impl Session {
             // Roll the tree back: a leaf with no runtime would render as a
             // dead hole and confuse focus and reflow.
             lock(&self.windows).current_mut().close(new_id);
+            // Then reflow, exactly as an accepted split does. The survivors
+            // were sized against a layout that included this pane, and if any
+            // output arrived while its shell was being retried the pump will
+            // have published that layout already. Without this the correction
+            // carries the revision the client ALREADY has, and a frame at an
+            // equal revision is dropped - leaving a pane on screen that does
+            // not exist. `reflow_locked` moves the revision on and clears the
+            // delta base, so what follows is a full frame that lands.
+            self.reflow_locked();
             return Err(e);
         }
         self.reflow_locked();
