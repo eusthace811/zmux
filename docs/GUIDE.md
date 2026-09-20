@@ -121,22 +121,24 @@ A session can also be driven from outside, without attaching — for scripts,
 and for coding agents:
 
 ```bash
-zmux info work                      # layout, windows, focus, as JSON
-zmux send work split-v              # any keybinding, by name
-zmux run  work -p 2 "cargo test"    # type it into pane 2 and press Enter
-zmux keys work -p 2 "text"          # type it, no Enter
-zmux capture work -p 2 -n 20        # that pane's last 20 visible lines
+zmux info work                        # layout, windows, focus, as JSON
+zmux send work split-v                # any keybinding, by name
+zmux run  work -p 2 "cargo test"      # type it into pane 2 and press Enter
+zmux keys work -p 2 "text"            # type it, no Enter
+zmux capture work -p 2 -n 20          # that pane's last 20 lines
+zmux wait work -p 2 --until quiet     # block until it finishes
 ```
 
-`-p N` is a pane's position in the current window — the numbering the status
-bar counts — and targeting a pane this way does **not** move your focus, so
-someone else can keep working while a script types in another pane. `send`
-with no command prints the list. Every command that changes something answers
-with the new `info`, so a script learns where its new pane landed without
-asking twice.
+`-p` names the pane — `2` its position in the current window, `@2` its id,
+`current` the pane you are in — and targeting one this way does **not** move
+your focus, so someone else can keep working while a script types in another
+pane. `send` with no command prints the list. Every command that changes
+something answers with the new `info`, so a script learns where its new pane
+landed without asking twice.
 
-Two limits worth knowing: `capture` reads only what is on screen, not
-scrollback, and only the current window's panes are reachable.
+**Two agents, one session** below has the rest: making a pane without
+stealing the focus, reading past the visible rows, and knowing when the thing
+in a pane has stopped.
 
 Everything else — `zmux`, `zmux <name>`, `zmux attach` — opens the
 full-screen client and does not return until you detach.
@@ -298,6 +300,139 @@ selection takes text from both; tmux has the same problem for the same reason.
 
 ---
 
+## Two agents, one session
+
+A pane can be driven from outside without anyone attaching, which is how a
+coding agent gets a second pane to work in — and how it finds out what
+happened there. None of this moves the cursor of whoever is using the session.
+
+Inside a pane, the shell already knows where it is:
+
+```bash
+echo "$ZMUX"          # 1
+echo "$ZMUX_SESSION"  # the session that owns this pane
+echo "$ZMUX_PANE"     # this pane's id
+```
+
+`ZMUX_PANE` is an **id**, not a position. Positions renumber when a pane
+closes; ids never do, and never get reused. Anything that outlives a single
+command should hold the id.
+
+### Make a pane and put something in it
+
+```bash
+S=$ZMUX_SESSION
+NEW=$(zmux send "$S" split-v-bg | python -c 'import json,sys;print(json.load(sys.stdin)["created"])')
+zmux run "$S" -p "@$NEW" "ampere"
+```
+
+`split-v-bg` splits **without taking the focus**, so the user keeps typing
+where they were. Because the focus did not move, the reply's `created` field
+is what names the new pane.
+
+`-p` accepts four things:
+
+| | |
+| --- | --- |
+| `3` | position in the current window, as the status bar counts |
+| `@3` | pane id — works in a window that is not on screen |
+| `reviewer` | a name the pane claimed for itself |
+| `current` | the pane you are running in (`$ZMUX_PANE`) |
+
+A target that matches no pane is **refused**, never redirected to something
+nearby.
+
+### Give it a prompt
+
+```bash
+zmux run "$S" -p "@$NEW" --paste "Review the diff and report only what is actionable."
+```
+
+`--paste` matters for anything with a text box. Without it every newline in a
+multi-line prompt submits a fragment, and you get three turns instead of one.
+zmux only wraps the text when the program in that pane has actually asked
+for bracketed paste, so `--paste` at a plain shell prompt is harmless.
+
+### Find out when it is done
+
+```bash
+zmux wait "$S" -p "@$NEW" --until settled --timeout 120000
+```
+
+| `--until` | |
+| --- | --- |
+| `settled` | it reported idle, done **or** blocked — the usual one |
+| `idle` `working` `blocked` `done` | one specific reported state |
+| `quiet` | no shell command running. Right for `cargo test`; useless for an agent, which *is* one long command |
+| `quiet-for MS` | the pane has produced no output for that long |
+| `output TEXT` | that text is in the pane's recent output |
+| `bell` | the pane rang the bell |
+
+It prints the session state the wait ended with, plus `outcome`: `met`,
+`timeout` or `gone`. Only `met` exits 0, so `zmux wait … && zmux capture …`
+does what it looks like. A `timeout` is a result, not a failure — the pane is
+simply still going.
+
+`--settle` (default 1.5s) fixes a race you would otherwise hit immediately:
+run a command and wait for `quiet` in the next breath, and the shell has not
+read the line yet, so the wait is satisfied by the quiet *before* your
+command. The gate ignores the condition until the pane is seen doing
+something. Pass `--settle 0` when the pane is already working.
+
+### Read the answer
+
+```bash
+zmux capture "$S" -p "@$NEW" --source unwrapped -n 120
+```
+
+| `--source` | |
+| --- | --- |
+| `screen` | the rows on screen (the default) |
+| `recent` | recent output, reaching back into scrollback |
+| `unwrapped` | the same, with lines joined where the pane was too narrow to hold them |
+
+Use `unwrapped` for a transcript. A pane is only as wide as its share of the
+window, so a long answer comes back broken at that width — and those breaks
+are your layout, not the text. Reading history does **not** move the pane's
+scroll position, so it is safe to do while somebody is reading their own
+output.
+
+### Teaching your agent to say what it is doing
+
+zmux never guesses at a pane's state by reading its screen. A pane's state
+is what the pane **said**, and a pane that said nothing is `unknown` — which
+does not mean finished.
+
+An agent reports by writing one escape to its own terminal:
+
+```
+ESC ] 1341 ; zmux ; state=working ; agent=ampere ; seq=12 ESC ```
+
+No process, no `zmux` on `PATH`, no session name, and a terminal that does
+not understand it ignores it — so the same build still works outside zmux.
+`examples/report-state.sh` has a shell helper and the three lines to add to an
+agent you own. From a script whose output is captured and cannot reach the
+terminal:
+
+```bash
+zmux report --state working --agent ampere    # defaults to your own pane
+zmux report --check                           # does the channel work here?
+```
+
+A claim is cleared when the command that made it ends, so nothing goes stale
+and a name lives exactly as long as the process that claimed it.
+
+**For an agent that reports nothing**, `zmux info` still gives you four
+facts it actually measured — `command` (is something running), `quiet_ms` (how
+long it has been silent), `bells` (did it ask for attention) and `title` (what
+it says it is doing). `--until quiet-for 3000` is the honest "it has probably
+finished" for those.
+
+A pane's reports are only as trustworthy as what runs in that pane, which is
+why nothing destructive keys off them.
+
+---
+
 ## Configuration
 
 ```bash
@@ -318,6 +453,7 @@ have. A malformed file is reported and ignored rather than being fatal.
 | `idle_timeout_hours` | `8` | how long an unattended daemon lingers |
 | `status_bar` | `true` | turning it off gives panes one more row |
 | `mouse` | `"auto"` | who owns the mouse: `"auto"`, `"on"` or `"off"` (see **Selecting text**) |
+| `wait_timeout_max_ms` | `600000` | ceiling on one `zmux wait` (see **Two agents, one session**) |
 
 `prefix` and `mouse` are read by the client, so a new `zmux` picks them up. Everything
 else is read by the daemon when the session is created — `zmux kill` the

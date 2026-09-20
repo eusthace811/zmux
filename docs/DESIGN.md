@@ -965,3 +965,230 @@ Code can install it as a plugin. `ZMUX=1` and `ZMUX_SESSION` are set on
 the daemon before the first pane spawns, so every pane shell inherits them and
 "am I inside, and inside what?" has an answer that does not involve walking
 process ancestry.
+
+## 12. Agent coordination
+
+§11 gave a script a way to drive a session. This gives one *agent* a way to
+drive another: make a pane, start something in it, give it work, know when it
+has stopped, and read the answer — without touching the screen of the person
+whose session it is.
+
+### The decision the rest follows from: reported, never inferred
+
+herdr learns an agent's state by matching the bottom of the pane against
+versioned regex manifests — 22 of them in `src/detect/manifests/`. They are
+real engineering: priorities, regions, arbitration against hook-reported
+state. They are also pinned to other people's user interfaces. `pi.toml`
+matches the literal border
+
+```
+── ⠋ Working ─
+```
+
+The day pi changes that glyph, every herdr user gets a wrong answer. Silently,
+because there is no test in either repo that can notice. The manifests carry
+`version` and `updated_at` fields precisely because they rot.
+
+zmux does not ship patterns. A pane's state is what the pane **said** it
+was, and a pane that has said nothing is `unknown` — which does not mean
+finished, and nothing here treats it as if it did.
+
+This is cheaper *and* better here, for a reason specific to the target
+machine: the agent that will run in these panes is built in-house. When you
+own the reporter, a reporting contract beats reverse-engineering its output.
+
+### The contract
+
+```
+ESC ] 1341 ; zmux ; state=working ; agent=ampere ; name=reviewer ; seq=12 ESC \
+```
+
+Written by the program to its own stdout. No process spawned, no `zmux` on
+`PATH`, no session name to look up, and a terminal that does not understand it
+swallows it — so the same binary still works outside zmux.
+
+- **The literal `zmux` is a guard.** 1341 is unregistered and arbitrary.
+  The guard makes a collision with somebody else's 1341 a no-op rather than a
+  mis-parse, which means the number is cheap to change if it ever conflicts.
+- **`agent` is free text.** An enum of known agents is a list to maintain, and
+  zmux has no reason to hold an opinion about which agents exist. `ampere`,
+  `pi`, anything.
+- **A report says only what changed.** A turn boundary sets `state`; a startup
+  report sets `agent` and `name` once.
+- **Out of order is dropped.** Two hooks firing close together can arrive
+  backwards, and taking the later-arriving one leaves a pane reading `working`
+  after it went idle — the one lie a caller waiting on that pane cannot
+  survive. `seq` is monotonic per pane; at or below the last accepted value,
+  the report is discarded whole.
+- **Nonsense drops the key, not the report.** A misspelt state or a name with
+  a capital in it is ignored; the rest is taken. A typo in somebody's hook must
+  not erase a state that was true.
+
+`ClientMsg::Report` carries the same thing over the pipe, for a reporter whose
+stdout is captured and cannot reach the tty. `zmux report --check` sends
+both ways and reads the result back, so on a machine where you cannot attach a
+debugger, "the escape is not reaching the terminal" is a sentence rather than
+an afternoon.
+
+### Staleness is exact, not a timeout
+
+A reported state becomes a lie the moment the process that reported it exits.
+The usual fix is a TTL, which is a guess with a number attached.
+
+OSC 133 already brackets the foreground command, and every report an agent
+makes necessarily arrives between the two. So `133;C` and `133;D` both clear
+everything the pane claimed. When `D` lands, the agent is gone, and so is its
+state, its name and its agent label. No timer, no guess.
+
+A consequence worth stating: a **name lives exactly as long as the process
+that claimed it**. That is herdr's rule too, and for the same reason — a name
+that outlives its owner points at whatever moved in afterwards.
+
+### Four things zmux measured, for agents that report nothing
+
+Refusing to guess is not the same as having nothing to say. These are
+observations, handed over verbatim, for a caller to draw its own conclusions
+from:
+
+| | |
+| --- | --- |
+| `command` | OSC 633;E — is an agent running here at all |
+| `quiet_ms` | how long since the pane produced a byte |
+| `bells` | how many times it asked for attention |
+| `title` | what it says it is doing |
+
+Three of these were already arriving and being dropped. `Signals::bell` had
+been set by the vt100 callback since the beginning and read by nothing.
+
+`bells` is a **count**, not a flag, because a flag has to be cleared to be
+useful twice and the status bar and a control caller would race to clear it,
+each swallowing the other's notification. `quiet_ms` is stamped by the reader
+thread into an atomic on the pane itself — not a map the pump would lock
+hundreds of times a second — and measured against a monotonic process clock,
+so an NTP correction cannot make a pane look like it spoke in the future.
+
+`title` is now reported whenever there is one. The status bar still suppresses
+it when shell integration is live, where it is only the directory restated;
+that is a *presentation* rule, and `Activity::raw_title` is what crosses the
+wire.
+
+### Waiting
+
+A wait belongs in the daemon, not in every caller's loop. Three things it gets
+right that a hand-rolled poll does not:
+
+**The pane is pinned.** The target resolves once, to an id, and the wait
+follows that id. Re-resolving each tick would let a replacement answer: wait
+on position 2, have that pane exit, and whatever slides into position 2
+satisfies the wait. A pinned pane that vanishes is `gone`. herdr pins for
+exactly this reason.
+
+**`--settle` closes a race that is otherwise invisible.** Run a command and
+immediately wait for quiet, and the shell has not read the line yet — so the
+wait is satisfied by the quiet *before* the command, instantly and wrongly.
+The gate ignores the condition until the pane is seen doing something, or the
+settle time elapses. herdr solves the same problem by requiring observed
+activity after a prompt.
+`without_a_settle_gate_a_wait_can_answer_about_the_wrong_moment` pins both
+halves: that the race reproduces, and that the gate closes it.
+
+**The daemon caps the timeout, not the caller.** A wait holds a connection
+thread; a script that asks to wait forever and then dies leaks one until the
+daemon exits. At the ceiling the caller is told `timeout` — which it has to
+handle anyway — and can ask again. `timeout` is a *result*, not an error: it
+rides in the JSON like everything else, and only the exit status says `met`.
+
+It polls at 50ms against **one** pane, via `pane_status` rather than `info`,
+which walks every pane in every window. A subscriber registry would need a new
+lock, a new ordering to get wrong, and a way to unregister a caller that died
+mid-wait. herdr is event-driven because it serves many long-lived clients;
+this serves one-shot CLI calls.
+
+`Until::Settled` counts `blocked`. A caller told only about a clean finish
+waits out its entire timeout on the one case that actually needed a person.
+
+`Until::Output` takes a literal substring. A regex engine would be the tenth
+direct dependency (§6.1) on a binary this project has reasons to keep small,
+and `capture | grep` already covers what a substring cannot express.
+
+### Reading history without the screen jumping
+
+`capture` could only ever return the visible rows, and the skill said so as a
+limitation. The reason was real: reading scrollback means moving vt100's
+scrollback offset, and that offset is the pane's own user-visible state.
+Borrow it while somebody is reading their output and their terminal jumps.
+
+One lock closes that. Every reader of a pane's screen takes the same
+`Mutex<Term>`, so `read_recent` moves the offset, collects, and puts it back
+with nobody able to observe the middle. The restore goes through the same path
+scrolling uses, so `Term::scroll` and vt100 cannot end up disagreeing about
+where the user is.
+
+Collection walks a screenful at a time, because vt100 shows `rows` at once,
+and each window contributes only the rows the step revealed —
+`set_scrollback` clamps, so consecutive windows otherwise overlap by however
+far the clamp moved. `RecentUnwrapped` joins rows that only ended because they
+ran out of width: a pane is as wide as its share of the window, so those breaks
+are the layout talking rather than the text. It is the source to read a
+transcript with.
+
+### Addressing
+
+`ZMUX_PANE` is set per pane, to the **id**. Positions renumber when a pane
+closes, so a shell that read its own position at startup would be telling a
+caller to type into somebody else's pane an hour later.
+
+There is deliberately no `ZMUX_WINDOW`: closing a window shifts every index
+after it. A pane's window is a question for `info`, which answers it fresh.
+
+`info` now spans every window. It used to report the visible one only, which
+made a background window's panes unreachable *and* undiscoverable — finding
+out what was in a window meant switching to it, moving the user's screen.
+`position` stays within its window, so it still means what the status bar
+shows, and `focus_id` is the handle that needs no pairing with `window`.
+
+`-p` takes a position (`3`), an id (`@3`), a name (`reviewer`) or `current`.
+Bare digits are positions and a name may not begin with one, so the four
+cannot collide; `current` is a reserved name.
+
+### Trust
+
+A pane's reports are exactly as trustworthy as whatever runs in that pane.
+`cat` a hostile file and it can claim any state and any name — just as it can
+already lie about the working directory through OSC 7, which zmux has
+believed since Phase 4.
+
+That is why state is advisory and **nothing destructive keys off it**. Nothing
+in zmux closes a pane, kills a shell or writes a file because of a reported
+state. The worst a forged report can do is make a waiting caller stop waiting,
+or make a name resolve to the wrong pane — and a caller that cares holds an
+`@id`, which no report can influence.
+
+The pipe's ACL is unchanged. `InputAt` reaches any pane in the session, but
+anyone who can open the pipe could already type into the focused one, so the
+trust boundary is where it was.
+
+### Wire
+
+v8. `PaneInfo` gained `window`, `state`, `agent`, `name`, `quiet_ms`, `bells`
+and `title`; `SessionInfo` gained `focus_id` and `created`. Struct fields, so
+they cost a version exactly as `PaneInfo::command` did in v6 — bincode does
+not tag fields, and a new one changes the encoding for every existing reader.
+`Target`, `InputAt`, `Report`, `Wait`, `Query::CaptureAt` and the background
+splits are appended variants, which are free.
+
+One trap worth recording, because it fails silently: **do not put
+`skip_serializing_if` on a field that crosses this wire.** bincode 2 goes
+through the `Serialize` impl, so a skipped field is skipped *on the wire*, and
+the decoder then reads the next field's bytes as this one. `SessionInfo::created`
+is a plain `Option` and shows as `null` in JSON for that reason.
+
+### What this deliberately does not do
+
+- **No screen-pattern manifests**, per the argument above.
+- **No process detection.** herdr's `CreateToolhelp32Snapshot` route is MITRE
+  T1057 Process Discovery (§0.2's neighbour), and it was not adopted for the
+  same reason WMI was not.
+- **No event subscription stream.** `Wait` covers the agent case.
+- **No regex matching**, **no remote**, **no automatic editing of anyone's
+  agent configuration**, and **no pane creation inside a background window**.

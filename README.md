@@ -5,7 +5,8 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete. 191 tests passing, clippy clean.
+Phases 0–6 complete, plus agent coordination (DESIGN §12). 226 tests
+passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -44,22 +45,28 @@ a coding agent uses. These return immediately instead of taking over the
 terminal:
 
 ```
-zmux info work                      layout, windows and focus, as JSON
-zmux send work split-v              any keybinding, by name
-zmux run  work -p 2 "cargo test"    type it into pane 2 and press Enter
-zmux keys work -p 2 "text"          type it, no Enter
-zmux capture work -p 2 -n 20        that pane's last 20 visible lines
+zmux info work                        layout, windows and focus, as JSON
+zmux send work split-v-bg             any keybinding, by name
+zmux run  work -p @7 "cargo test"     type it into pane 7 and press Enter
+zmux keys work -p @7 "text"           type it, no Enter
+zmux capture work -p @7 -n 20         that pane's last 20 lines
+zmux wait work -p @7 --until settled  block until it stops
+zmux report --state working           say what THIS pane is doing
 ```
 
-`-p N` is a pane's position in the current window and does **not** move the
-focus, so a script can work in one pane while someone types in another. Every
-mutation answers with the resulting `info`, so a caller learns where its new
-pane landed without a second, racy query. `zmux --skill` prints the whole
-agent-facing contract.
+`-p` takes a position (`3`), an id (`@3`), a name a pane claimed, or
+`current`. It does **not** move the focus, so a script can work in one pane
+while someone types in another. Every mutation answers with the resulting
+`info`, so a caller learns where its new pane landed without a second, racy
+query. `zmux --skill` prints the whole agent-facing contract.
 
-`info` also reports what each pane is doing — `"command"`, `"busy"` and
-`"last_exit"` — so a script can run something and then poll until that pane
-goes quiet, instead of sleeping and hoping.
+`info` also reports what each pane is doing. Two kinds of fact, kept
+distinct: what zmux **measured** — `"command"`, `"busy"`, `"last_exit"`,
+`"quiet_ms"`, `"bells"`, `"title"` — and what the pane **said about itself**,
+`"state"`, `"agent"` and `"name"`. zmux never reads a pane's screen to guess
+at the second kind; a pane that said nothing is `"unknown"`, which is not a
+synonym for finished. DESIGN §12 has the argument, and
+`examples/report-state.sh` the few lines that make an agent report.
 
 | Key | |
 | --- | --- |
@@ -88,6 +95,7 @@ goes quiet, instead of sleeping and hoping.
 | `src/layout.rs` | BSP tiling tree. |
 | `src/help.rs` | The shortcut list. `--help` and `C-b ?` are both generated from it. |
 | `src/mouse.rs` | One mouse event → the bytes the program in that pane asked for. |
+| `src/paste.rs` | Submitting a prompt as one block, and why an end marker in it cannot break out. |
 | `src/windows.rs` | Several layouts per session. A window **is** a `Layout`. |
 | `src/render.rs` | vt100 cells → composited `Frame` → ratatui `Buffer`. |
 | `src/session.rs` | Owns panes, layout and clients. Outlives any connection. |
@@ -103,6 +111,7 @@ Everything outside `src/`:
 | --- | --- |
 | `tests/` | Integration tests. They drive a real daemon over the real pipe. |
 | `examples/dump.rs` | Prints a live session's screen as text. Needs no console, so it works from WSL. |
+| `examples/report-state.sh` | The reporting contract (DESIGN §12), and the few lines to add to an agent you own. |
 | `probes/` | The Phase 0 go/no-go experiments, kept for **re-validation on the work laptop** (DESIGN §8.4): does a detached daemon survive its parent, does mintty give a real console. Separate crates, deliberately outside the build — `probes/RUNBOOK.md` says how to run them and has the table to fill in. |
 | `skills/zmux/SKILL.md` | What a coding agent needs to know about zmux. Bundled into the binary, so `zmux --skill` always prints the one that matches the build. |
 | `.claude-plugin/` | Manifests that let Claude Code install that skill as a plugin: `claude plugin marketplace add <this repo>`, then `claude plugin install zmux@zmux`. |
