@@ -67,6 +67,15 @@ impl Windows {
     /// DESIGN.md §2.2 exists to prevent. An out-of-range `current` would also
     /// panic on first index.
     pub fn repaired(self) -> Option<Self> {
+        // A pane id in two windows is not repairable. Restore spawns a shell
+        // per leaf and keys the pane map by id, so the second spawn would
+        // overwrite the first and leave a live shell with nothing owning it -
+        // and `window_of` would only ever find one of the two. Unreachable
+        // through the API; a hand-edited or corrupted file can say it.
+        let mut seen = std::collections::HashSet::new();
+        if !self.panes().into_iter().all(|id| seen.insert(id)) {
+            return None;
+        }
         let current = self.current;
         let list: Vec<Layout> = self
             .list
@@ -328,6 +337,16 @@ mod tests {
         assert_eq!(back.panes(), vec![PaneId(50_000)]);
         let fresh = PaneId::alloc();
         assert!(fresh.0 > 50_000, "alloc() reused a restored id: {fresh:?}");
+    }
+
+    #[test]
+    fn a_pane_in_two_windows_is_refused_rather_than_spawned_twice() {
+        // Restore spawns a shell per leaf; the duplicate would overwrite the
+        // first in the pane map and orphan its ConPTY.
+        let json = r#"{"list":[{"root":{"Leaf":4},"focus":4},
+                               {"root":{"Leaf":4},"focus":4}],"current":0}"#;
+        let w: Windows = serde_json::from_str(json).unwrap();
+        assert!(w.repaired().is_none(), "a duplicated pane id must start the session fresh");
     }
 
     #[test]

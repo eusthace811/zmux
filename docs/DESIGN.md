@@ -752,6 +752,12 @@ allocator past restored ids (§2.2) and repairs focus naming a missing pane.
 Deserialising straight into the runtime type would have reintroduced the
 id-collision bug this design exists to avoid.
 
+It also refuses a file that puts one pane id in two windows. That is not
+repairable: restore spawns a shell per leaf and keys the pane map by id, so
+the second spawn would overwrite the first and leave a live shell with
+nothing owning it. Unreachable through the API, reachable by editing the
+file.
+
 ### Wire
 
 `PROTOCOL_VERSION` 3 appends `Cmd::{NewWindow, NextWindow, PrevWindow}`. The
