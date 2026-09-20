@@ -23,6 +23,7 @@ Phases 0–6 complete. 137 tests passing, clippy clean.
 
 ```bash
 ./x release                    # build (see docs/DESIGN.md §7 for why ./x)
+./x install                    # ...or build and copy both binaries to ~/bin
 ```
 
 Then from a **Git Bash window** (installing to `~/bin` for everyday use is in

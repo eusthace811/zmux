@@ -588,8 +588,20 @@ MSVC toolchain. Three facts make that work, each found by hitting it:
 ```bash
 ./x test              # cargo test
 ./x release           # optimised build
+./x install [dir]     # release build, then both binaries into dir (~/bin)
 ./x clippy            # anything else is passed through to cargo
 ```
+
+`./x` also runs on the work laptop, where there is no WSL: it checks `uname`
+and, under Git Bash, uses plain `cargo` with plain paths — none of the three
+facts above apply when the host is already Windows. The Windows home comes
+from `%USERPROFILE%` rather than a hardcoded name, so nothing in the script
+assumes this machine; `ZMUX_WINHOME` overrides it.
+
+`install` copies **both** binaries, because the client starts the daemon by
+looking next to itself, and refuses to run while a `zmux` process is alive —
+Windows will not replace a running `.exe`, and the failure otherwise arrives
+as a bare *Access is denied* from the linker.
 
 ### Original notes
 

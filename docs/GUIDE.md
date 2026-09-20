@@ -11,37 +11,42 @@ PowerShell, no WSL — see [Troubleshooting](#troubleshooting).
 
 ## Install for global use
 
-`./x release` puts both binaries in `C:\Users\<you>\.zmux-target\release`.
-Two rules:
-
-- **Copy both.** `zmux.exe` starts `zmuxd.exe` by looking *next to itself*,
-  so the daemon must sit in the same folder as the client.
-- **Do not rename them.** The client looks for that exact file name.
+From the repo, in WSL or in Git Bash — the script works out which host it is
+on:
 
 ```bash
-mkdir -p ~/bin
-cp "$HOME/.zmux-target/release/zmux.exe"  ~/bin/
-cp "$HOME/.zmux-target/release/zmuxd.exe" ~/bin/
+./x install            # build --release, then copy both binaries to ~/bin
 hash -r
 zmux --help
 ```
 
-Git Bash already puts `~/bin` on `PATH` — unconditionally, in
-`/etc/profile.d/env.sh` — so this works in the window you are in, and `hash -r`
-is only there to clear bash's memory of what it could not find before. If
-`zmux --help` still says *command not found*, your setup overrides `PATH`
-somewhere; add it yourself and reopen the window:
+Run from WSL it installs into the **Windows** home (`C:\Users\<you>\bin`),
+which is the `~/bin` Git Bash sees — the shells run on Windows, so that is the
+only home that matters.
+
+`~/bin` is on Git Bash's `PATH` already (it exports `$HOME/bin:$PATH`
+unconditionally, in `/etc/profile.d/env.sh`), so `hash -r` is only there to
+clear bash's memory of a command it could not find before. To install
+somewhere else — a shared tools folder, say — name it:
 
 ```bash
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+./x install /c/Tools/zmux
 ```
 
-To install for every shell on the machine instead, copy both `.exe`s to a
-folder such as `C:\Tools\zmux` and add that folder to your Windows `PATH`
-(System Properties → Environment Variables → `Path`). Git Bash inherits it.
+and add that folder to `PATH` yourself; the script prints the line to add. To
+reach `zmux` from `cmd` or PowerShell as well, add the folder to the Windows
+`PATH` (System Properties → Environment Variables → `Path`).
 
-**Upgrading:** Windows will not let a running `.exe` be replaced. Detach and
-`zmux kill` every session first, or the copy fails with *Access is denied*.
+Two rules the script follows, and you should too if you ever copy the
+binaries by hand:
+
+- **Both, always.** `zmux.exe` starts `zmuxd.exe` by looking *next to
+  itself*, so a half-installed pair fails at the first attach.
+- **Do not rename them.** The client looks for that exact file name.
+
+**Upgrading:** Windows will not let a running `.exe` be replaced. `./x install`
+checks first and tells you which sessions to `zmux kill`, rather than
+letting the build fail with *Access is denied*.
 
 ---
 
