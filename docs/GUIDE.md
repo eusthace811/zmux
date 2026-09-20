@@ -33,6 +33,15 @@ hash -r
 zmux --help
 ```
 
+Git Bash can reach that same repo folder over the WSL share, which is handy
+for reading the source or running `git` from the Windows side:
+
+```bash
+cd //wsl.localhost/Ubuntu/home/<you>/projects/Experiments/zmux/zmux
+```
+
+Reach it, yes — but do not build it from there; see the warning below.
+
 Run from WSL, `./x` compiles with the *Windows* cargo and installs into the
 **Windows** home (`C:\Users\<you>\bin`), which is the `~/bin` Git Bash sees —
 the shells run on Windows, so that is the only home that matters.
@@ -47,10 +56,11 @@ hash -r
 ```
 
 Do **not** run `./x install` from Git Bash against the WSL copy of the repo
-(`//wsl.localhost/Ubuntu/home/...`): cargo would put `target/` on the 9p
+(the `//wsl.localhost/...` path above): cargo would put `target/` on the 9p
 share, which has no file locks, and the build fails part-way. From Git Bash,
 build a repo that lives on the Windows disk; from WSL, `./x` already takes
-care of it.
+care of it — it compiles with the Windows cargo and keeps `target/` on `C:`
+for exactly this reason.
 
 `~/bin` is on Git Bash's `PATH` already (it exports `$HOME/bin:$PATH`
 unconditionally, in `/etc/profile.d/env.sh`), so `hash -r` is only there to
