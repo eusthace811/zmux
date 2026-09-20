@@ -25,7 +25,8 @@ Phases 0–6 complete. 137 tests passing, clippy clean.
 ./x release                    # build (see docs/DESIGN.md §7 for why ./x)
 ```
 
-Then from a **Git Bash window**:
+Then from a **Git Bash window** (installing to `~/bin` for everyday use is in
+[docs/GUIDE.md](docs/GUIDE.md), along with every key and setting):
 
 ```
 zmux                    attach to "default", creating it if needed
