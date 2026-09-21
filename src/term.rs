@@ -621,6 +621,52 @@ mod tests {
         assert_eq!(r.scan(b"\x1b[c", (0, 0)), b"\x1b[?6c".to_vec());
     }
 
+    /// The other two queries ConPTY and full-screen programs ask.
+    ///
+    /// Every one of these must be answered or the asking program waits for a
+    /// reply that never comes - which for ConPTY's startup `ESC[6n` means the
+    /// shell never finishes initialising and teardown deadlocks (DESIGN §2.5).
+    /// Only CPR and primary DA had tests, so two of the four arms this module
+    /// exists for were never exercised.
+    #[test]
+    fn answers_secondary_device_attributes_and_device_status() {
+        let mut r = QueryResponder::default();
+        // Secondary DA, both spellings `classify` accepts.
+        assert_eq!(r.scan(b"\x1b[>c", (0, 0)), b"\x1b[>0;0;0c".to_vec());
+        assert_eq!(r.scan(b"\x1b[>0c", (0, 0)), b"\x1b[>0;0;0c".to_vec());
+        // DSR: "are you there?" - answered with "OK".
+        assert_eq!(r.scan(b"\x1b[5n", (0, 0)), b"\x1b[0n".to_vec());
+    }
+
+    /// Several queries in one read are all answered, in order, and the text
+    /// around them is not mistaken for one.
+    ///
+    /// A program that asks twice and is answered once waits forever on the
+    /// second, which looks exactly like the hang an unanswered query causes.
+    #[test]
+    fn every_query_in_a_chunk_is_answered_in_order() {
+        let mut r = QueryResponder::default();
+        let out = r.scan(b"before\x1b[6nmiddle\x1b[c\x1b[5nafter", (2, 3));
+        assert_eq!(out, b"\x1b[3;4R\x1b[?6c\x1b[0n".to_vec());
+    }
+
+    /// A partial escape longer than the rolling tail is dropped, not answered
+    /// wrongly and not left to wedge the scanner.
+    ///
+    /// `MAX_TAIL` is 16 bytes, which is ample for every query above - the
+    /// longest is four. A sequence that straddles a read boundary with more
+    /// parameters than that loses its `ESC` when the tail is trimmed, so it
+    /// stops looking like a query at all. That is the safe direction: the
+    /// parser has already been fed the raw bytes separately, and answering a
+    /// sequence we only half saw would be worse than answering nothing.
+    #[test]
+    fn an_over_long_partial_escape_does_not_confuse_the_scanner() {
+        let mut r = QueryResponder::default();
+        assert!(r.scan(b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12", (0, 0)).is_empty());
+        // Whatever it kept, a REAL query in the next chunk still gets through.
+        assert_eq!(r.scan(b"m\x1b[6n", (0, 0)), b"\x1b[1;1R".to_vec());
+    }
+
     /// A history read sees back exactly as far as it was told to, and no
     /// further.
     ///

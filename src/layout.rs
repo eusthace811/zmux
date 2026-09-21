@@ -552,6 +552,110 @@ mod tests {
         assert_eq!(l.focus(), PaneId(2), "focus moves to the survivor");
     }
 
+    /// Build a tree, then lay it out at EVERY size down to nothing, and
+    /// insist the result is still a tiling.
+    ///
+    /// The single-size checks above only ever exercised 80x24. The sizes that
+    /// break geometry are the ones nobody picks on purpose: a tree built in a
+    /// large window and then computed in a small one, which is what happens
+    /// when a second client attaches at a smaller viewport and `apply_size`
+    /// reflows everything to the minimum. `split_rects` already carries two
+    /// `clamp` panics' worth of scar tissue from exactly this.
+    #[test]
+    fn a_layout_tiles_its_area_at_every_size() {
+        let big = Rect::new(0, 0, 200, 60);
+        let mut l = Layout::new(PaneId::alloc());
+        for dir in [Dir::Horizontal, Dir::Vertical, Dir::Horizontal, Dir::Vertical, Dir::Horizontal]
+        {
+            l.split(dir, big, PaneId::alloc());
+        }
+        assert_eq!(l.len(), 6, "the fixture needs every split to have been accepted");
+
+        // The REACHABLE range, and only that. `clamp_size` floors a session
+        // at MIN_USABLE_COLS x MIN_USABLE_ROWS and `pane_area_with` takes at
+        // most the status bar's row off it, so this is every area the daemon
+        // can actually hand `compute`. Below it the divider that `layout_node`
+        // always makes one cell wide has nowhere to go, and pinning what it
+        // does there would be asserting about an input the system cannot
+        // produce. That degenerate case has its own test, for the only
+        // property that matters about it: it must not panic.
+        for w in crate::protocol::MIN_USABLE_COLS..=160u16 {
+            for h in (crate::protocol::MIN_USABLE_ROWS - 1)..=50u16 {
+                let area = Rect::new(0, 0, w, h);
+                let (panes, dividers) = l.compute(area);
+                assert_eq!(panes.len(), 6, "a pane vanished from the tree at {w}x{h}");
+
+                // Nothing that DRAWS may sit outside the area it was given.
+                // A rect running past the edge is what `blit` silently clips,
+                // and the user sees a pane that is not where the divider says
+                // it is. An EMPTY rect is exempt: it paints nothing, so its
+                // origin is not observable - and when the area is too small to
+                // divide, squeezing panes to zero width is the documented
+                // outcome rather than a failure.
+                let inside = |r: &Rect| {
+                    r.w == 0
+                        || r.h == 0
+                        || (r.x as u32 + r.w as u32 <= w as u32
+                            && r.y as u32 + r.h as u32 <= h as u32)
+                };
+                for (id, r) in &panes {
+                    assert!(inside(r), "pane {} is {r:?}, outside {w}x{h}", id.0);
+                }
+                for d in &dividers {
+                    assert!(inside(&d.rect), "divider {:?} is outside {w}x{h}", d.rect);
+                }
+
+                // And nothing may overlap anything, panes or dividers. Two
+                // panes sharing a cell means one of them is drawing over the
+                // other, and which one wins is blit order.
+                let all: Vec<Rect> =
+                    panes.iter().map(|(_, r)| *r).chain(dividers.iter().map(|d| d.rect)).collect();
+                for (i, a) in all.iter().enumerate() {
+                    for b in all.iter().skip(i + 1) {
+                        let disjoint = a.w == 0
+                            || a.h == 0
+                            || b.w == 0
+                            || b.h == 0
+                            || a.x + a.w <= b.x
+                            || b.x + b.w <= a.x
+                            || a.y + a.h <= b.y
+                            || b.y + b.h <= a.y;
+                        assert!(disjoint, "{a:?} overlaps {b:?} at {w}x{h}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Below the smallest area the daemon can produce, the only promise is
+    /// that nothing panics.
+    ///
+    /// `compute` is public and takes any `Rect`, and the arithmetic in
+    /// `split_rects` has already produced two `clamp` panics in areas too
+    /// small to divide. The rects that come back are degenerate and nothing
+    /// depends on their shape - `blit` and `put` clip - but a panic here runs
+    /// on the daemon's pump thread and takes the session with it.
+    #[test]
+    fn an_area_too_small_to_divide_is_survivable() {
+        let big = Rect::new(0, 0, 200, 60);
+        let mut l = Layout::new(PaneId::alloc());
+        for dir in [Dir::Horizontal, Dir::Vertical, Dir::Horizontal] {
+            l.split(dir, big, PaneId::alloc());
+        }
+        for w in 0..=crate::protocol::MIN_USABLE_COLS {
+            for h in 0..=crate::protocol::MIN_USABLE_ROWS {
+                let area = Rect::new(0, 0, w, h);
+                let (panes, _) = l.compute(area);
+                assert_eq!(panes.len(), 4, "a pane vanished at {w}x{h}");
+                // The operations the daemon performs on a layout this size.
+                l.rect_of(l.focus(), area);
+                l.pane_at(area, 0, 0);
+                l.focus_dir(Nav::Right, area);
+                l.resize_focused(Nav::Right, area, 2);
+            }
+        }
+    }
+
     #[test]
     fn closing_a_pane_that_is_not_here_does_nothing() {
         let mut l = Layout::new(PaneId(1));
