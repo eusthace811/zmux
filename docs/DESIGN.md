@@ -1036,9 +1036,25 @@ A reported state becomes a lie the moment the process that reported it exits.
 The usual fix is a TTL, which is a guess with a number attached.
 
 OSC 133 already brackets the foreground command, and every report an agent
-makes necessarily arrives between the two. So `133;C` and `133;D` both clear
-everything the pane claimed. When `D` lands, the agent is gone, and so is its
-state, its name and its agent label. No timer, no guess.
+makes necessarily arrives between the two. So **`133;D` clears everything the
+pane claimed**. When `D` lands, the agent is gone, and so is its state, its
+name and its agent label. No timer, no guess.
+
+`133;C` used to clear as well, on the reasoning that a new command starting
+means the last one's claims are about a dead process. Two real agents broke
+that in the first minute: pi and ampere stamp `133;A` / `133;B` / `133;C`
+around **every assistant and user message**, as zone markers so a terminal can
+jump between them (`modes/interactive/components/assistant-message.ts`). Read
+as "a command started", that wiped the agent's own report of itself once per
+message — exactly when a caller is reading it.
+
+`D` alone was always sufficient, which is the part worth remembering. Every
+`C` from a shell follows the `D` of the command before it, so the claim is
+already gone; the only `C` with no `D` in front of it is the first command in
+the pane, when there is nothing to forget. The lesson generalises: **OSC 133
+is not only a shell's vocabulary.** A TUI may use the same markers to mean
+something about its own layout, so only the marker that carries an exit status
+can be read as "a process ended".
 
 A consequence worth stating: a **name lives exactly as long as the process
 that claimed it**. That is herdr's rule too, and for the same reason — a name
@@ -1091,6 +1107,18 @@ settle time elapses. herdr solves the same problem by requiring observed
 activity after a prompt.
 `without_a_settle_gate_a_wait_can_answer_about_the_wrong_moment` pins both
 halves: that the race reproduces, and that the gate closes it.
+
+Every signal the gate watches is compared **against the reading taken when
+the wait began**, never tested as a level. That distinction is the whole gate
+for an agent pane, and getting it wrong cost the feature its main use case:
+an agent is one long foreground command, so `133;C` set `busy` when it
+started and it stays set until it exits. A level test therefore opened the
+gate on the *first poll* of every agent wait — measured at 96µs — and handed
+back the state from before the prompt. `bells` had always been compared
+against `start`, which is why it was the one signal that behaved; `busy` and
+`working` now match it. `a_settle_gate_holds_for_a_pane_that_was_already_busy`
+pins it, and the shell-case test above pins that the original purpose still
+works.
 
 **The daemon caps the timeout, not the caller.** A wait holds a connection
 thread; a script that asks to wait forever and then dies leaks one until the
