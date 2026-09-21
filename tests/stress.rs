@@ -398,3 +398,74 @@ fn switching_windows_under_load_does_not_freeze_the_display() {
         "the pane stopped accepting input after the storm"
     );
 }
+
+/// A control caller must stay responsive while a pane is flat out.
+///
+/// This is the §12 workload: one agent polling `info` or sitting in a
+/// `wait` while the pane NEXT to it floods. Both sides want the same
+/// `Term` locks - the pump takes them to compose, `info` and `capture` take
+/// them to read - so if the lock discipline were wrong this is where it
+/// would show, as a control caller starved behind the frame loop.
+///
+/// Measured on the target machine, flat-out producer, microseconds:
+///
+/// |         | quiet p50/p90/max | flooding p50/p90/max |
+/// | ---     | ---               | ---                  |
+/// | info    | 26 / 34 / 114     | 33 / 44 / 97         |
+/// | capture | 51 / 63 / 81      | 92 / 102 / 589       |
+///
+/// So a flood costs a control caller about a third more on `info` and
+/// under double on `capture`, and the worst single call in the run was
+/// 589us. No convoy, no starvation: an agent can poll at 20Hz beside a pane
+/// producing as fast as Windows will carry it and never wait a millisecond.
+///
+/// The assertion is on p50 and deliberately loose - 300x the measured
+/// value. It is not trying to pin 33us, which would fail on a busy machine
+/// for no reason. It is trying to catch the SHAPE of a regression: a lock
+/// held across a pty write or a compose would put a control caller behind
+/// the 16ms frame interval, and 10ms cannot be reached by scheduler noise
+/// alone at this p50.
+#[test]
+fn a_control_caller_is_not_starved_by_a_flooding_pane() {
+    fn p50(mut v: Vec<u128>) -> u128 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+    fn sample(
+        c: &mut common::Control,
+        n: usize,
+        mut f: impl FnMut(&mut common::Control),
+    ) -> Vec<u128> {
+        (0..n)
+            .map(|_| {
+                let t = Instant::now();
+                f(c);
+                t.elapsed().as_micros()
+            })
+            .collect()
+    }
+
+    let d = Daemon::start("zmux-test-latency");
+    let mut ctl = common::Control::open(&d.session);
+
+    let mut viewer = d.attach_ready(120, 30);
+    viewer.input("for i in $(seq 1 200000); do echo NOISE_$i; done\r");
+    assert!(viewer.wait_for(25, |t| t.contains("NOISE_1")).is_some(), "the flood never started");
+
+    let info = p50(sample(&mut ctl, 200, |c| {
+        c.info();
+    }));
+    let capture = p50(sample(&mut ctl, 100, |c| {
+        c.capture(None);
+    }));
+
+    assert!(
+        info < 10_000,
+        "info took {info}us at p50 beside a flooding pane - a control caller is \
+         behind the frame loop, not beside it"
+    );
+    assert!(
+        capture < 10_000,
+        "capture took {capture}us at p50 beside a flooding pane"
+    );
+}

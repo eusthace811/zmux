@@ -1255,6 +1255,37 @@ through the `Serialize` impl, so a skipped field is skipped *on the wire*, and
 the decoder then reads the next field's bytes as this one. `SessionInfo::created`
 is a plain `Option` and shows as `null` in JSON for that reason.
 
+### Does the lock discipline survive a flooding pane?
+
+The §12 workload is one agent polling `info`, or sitting in a `wait`, while
+the pane beside it floods. Both sides want the same `Term` locks: the pump
+takes them to compose, `info` and `capture` take them to read. If the order
+in §2 were wrong, or a lock were held across a pty write, this is where it
+would show - as a control caller starved behind the frame loop.
+
+Measured on the target machine against a flat-out producer, microseconds:
+
+| | quiet p50/p90/max | flooding p50/p90/max |
+| --- | --- | --- |
+| `info` | 26 / 34 / 114 | 33 / 44 / 97 |
+| `capture` | 51 / 63 / 81 | 92 / 102 / 589 |
+
+A flood costs a control caller about a third more on `info` and under double
+on `capture`. The worst single call in the run was 589µs. **No convoy, no
+starvation**: an agent can poll at 20Hz next to a pane producing as fast as
+Windows will carry it and never wait a millisecond.
+
+Session start to first control reply is **56ms**, and teardown **51ms** —
+both dominated by spawning and tearing down the first ConPTY, and both far
+below anything a person notices.
+
+`a_control_caller_is_not_starved_by_a_flooding_pane` keeps this true. It
+asserts on p50 at 300x the measured value, because it is not trying to pin
+33µs - that would fail on a busy machine for no reason. It is trying to
+catch the SHAPE: a lock held across a compose or a write puts a control
+caller behind the 16ms frame interval. Verified by holding the pane map
+across the composite, which takes `info` to 20.9ms at p50 and fails it.
+
 ### A known gap: the backwards-delta race has no regression test
 
 `publish()` holds `last_published` across compose-derive-send because two
