@@ -521,13 +521,8 @@ impl Session {
     pub fn pane_status(&self, id: PaneId) -> Option<PaneStatus> {
         let panes = lock(&self.panes);
         let p = panes.get(&id)?;
-        let activity = lock(&p.term).activity();
-        Some(PaneStatus {
-            state: activity.state,
-            busy: activity.busy,
-            bells: activity.bells,
-            quiet_ms: p.pty.quiet_ms(),
-        })
+        let (state, busy, bells) = lock(&p.term).wait_signals();
+        Some(PaneStatus { state, busy, bells, quiet_ms: p.pty.quiet_ms() })
     }
 
     /// Why a pane that has just died could not start, if that is what

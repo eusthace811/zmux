@@ -121,9 +121,19 @@ pub enum ClientMsg {
     /// pane in a window that is not on screen, and can name one by an id that
     /// does not move when the layout does.
     ///
-    /// Supersedes `InputTo`. That one still answers - variants are
-    /// append-only - but it can only say "the Nth pane of whatever window is
-    /// current", which is the wrong handle for anything long-running.
+    /// Supersedes `InputTo`, which can only say "the Nth pane of whatever
+    /// window is current" - the wrong handle for anything long-running.
+    ///
+    /// `InputTo` is kept for ONE reason, and it is worth being exact about
+    /// which: bincode numbers enum variants by position, so removing it
+    /// would renumber every variant after it. It is NOT kept to serve older
+    /// clients - `serve` refuses any client whose `PROTOCOL_VERSION` differs
+    /// before `serve_control` ever sees a message, so nothing that speaks the
+    /// older dialect can reach its arm. Nothing in this repository sends it
+    /// either; the CLI has sent `InputAt` since the day it existed. Deleting
+    /// it would cost a wire bump and every running session, to save two
+    /// match arms and a four-line wrapper - so it stays, as ballast rather
+    /// than as compatibility.
     InputAt {
         target: Target,
         data: Vec<u8>,
