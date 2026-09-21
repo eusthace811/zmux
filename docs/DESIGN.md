@@ -1370,6 +1370,20 @@ trust boundary is where it was.
 
 ### Wire
 
+**v9**, and the bump is worth explaining because the rule it corrects was
+being applied wrongly here. `WaitOutcome` gained `Stalled` and `Replaced` -
+appended variants, which this section previously called free. They are not,
+and the direction is what decides.
+
+An appended variant the **client** sends costs nothing: an old client never
+sends it, so no old reader meets it. One the **server** sends is the
+opposite - every existing client is a reader of it, and an old binary
+claiming the same version passes the handshake and then fails to decode
+mid-stream. The note on v2 says exactly this about `ServerMsg::Delta`, and
+it was still read as "appending is free" when these two went in.
+`ClientMsg::Submit`, `Until::Reported` and `Source::History` genuinely are
+free, by the same rule pointing the other way.
+
 v8. `PaneInfo` gained `window`, `state`, `agent`, `name`, `quiet_ms`, `bells`
 and `title`; `SessionInfo` gained `focus_id` and `created`. Struct fields, so
 they cost a version exactly as `PaneInfo::command` did in v6 — bincode does

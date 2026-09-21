@@ -25,7 +25,20 @@ use serde::{Deserialize, Serialize};
 /// v8 is the agent-coordination surface (DESIGN.md §12). `PaneInfo` gained
 /// `window`, and `SessionInfo` gained `focus_id` - struct fields again, so
 /// again a version. `Target`, `InputAt` and `Query::CaptureAt` are appended.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9 added `WaitOutcome::Stalled` and `Replaced`, and that is the whole
+/// reason for the bump - which is worth spelling out, because "appended
+/// variants are free" was taken as a rule here and it is only half of one.
+///
+/// **The direction decides.** An appended variant the CLIENT sends costs
+/// nothing: an old client never sends it, so no old reader ever meets it.
+/// One the SERVER sends is a different thing entirely - every existing
+/// client is a reader of it, and an old binary claiming the same version
+/// would pass the handshake and then fail to decode mid-stream. That is
+/// exactly what the v2 note above says, about `ServerMsg::Delta`, and it
+/// was still read as "appending is free" when `Stalled` and `Replaced` went
+/// in. `ClientMsg::Submit`, `Until::Reported` and `Source::History` really
+/// are free, by the same rule and in the other direction.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
