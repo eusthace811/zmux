@@ -676,6 +676,89 @@ fn a_wait_for_settled_wakes_on_blocked_as_well_as_done() {
     );
 }
 
+/// `--until <one specific state>`, which `Settled` does not cover.
+///
+/// `settled` is the usual wait and is tested above, but the CLI also takes a
+/// state by name - `--until blocked` is how a caller watches for an agent
+/// that stops to ask something, as opposed to one that merely stops. Nothing
+/// exercised that arm of `Until`.
+#[test]
+fn a_wait_for_one_named_state_ignores_the_others() {
+    let d = Daemon::start("zmux-test-wait-state");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+    let report = |c: &mut Control, state| {
+        let r = Report { state: Some(state), ..Default::default() };
+        c.ask(&ClientMsg::Report { target: Target::Id(id), report: r });
+    };
+
+    // Settled, but not the state asked for: `done` must not answer for
+    // `blocked`, or a caller waiting for a question gets told about a finish.
+    report(&mut c, PaneState::Done);
+    assert_eq!(
+        waited(&mut c, Target::Id(id), Until::State(PaneState::Blocked), 700),
+        WaitOutcome::Timeout,
+        "`done` satisfied a wait for `blocked`"
+    );
+
+    report(&mut c, PaneState::Blocked);
+    assert_eq!(
+        waited(&mut c, Target::Id(id), Until::State(PaneState::Blocked), 2_000),
+        WaitOutcome::Met
+    );
+
+    // And a state nobody has reported is not reached by waiting.
+    assert_eq!(
+        waited(&mut c, Target::Id(id), Until::State(PaneState::Working), 700),
+        WaitOutcome::Timeout
+    );
+}
+
+/// `--until bell`, the attention signal that works for a program reporting
+/// nothing about itself.
+///
+/// It must mean "rings FROM HERE", not "has ever rung" - `wait_for` reads the
+/// count once before it starts for exactly that reason. A pane that rang an
+/// hour ago is not asking for anything now, and a wait satisfied by that
+/// history would return instantly forever after.
+#[test]
+fn a_wait_for_a_bell_means_the_next_one_not_the_last() {
+    let d = Daemon::start("zmux-test-wait-bell");
+    let mut c = Control::open(&d.session);
+    assert!(c.wait_at(20, Target::Focused, |t| t.contains('$')).is_some());
+    let id = c.info().panes[0].id;
+
+    // Ring it once, and let the daemon see it.
+    c.input_at(Target::Id(id), "printf '\\a'", true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && pane_of(&mut c, id).bells == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(pane_of(&mut c, id).bells > 0, "the pane's bell was never counted");
+
+    // That one is history. A wait starting now must not be satisfied by it.
+    assert_eq!(
+        waited(&mut c, Target::Id(id), Until::Bell, 700),
+        WaitOutcome::Timeout,
+        "a wait for a bell was answered by one that had already rung"
+    );
+
+    // A second connection, because `c` is about to block inside the wait.
+    let mut ringer = Control::open(&d.session);
+    let session = d.session.clone();
+    let ring = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = session;
+        ringer.input_at(Target::Id(id), "printf '\\a'", true);
+    });
+    assert_eq!(
+        waited(&mut c, Target::Id(id), Until::Bell, 20_000),
+        WaitOutcome::Met,
+        "a bell rung during the wait did not end it"
+    );
+    ring.join().expect("the ringer thread panicked");
+}
+
 /// Text already on screen matches at once. A caller that asks after the fact
 /// must not be left waiting for something that has already happened.
 #[test]
