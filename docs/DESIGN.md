@@ -1185,6 +1185,18 @@ out what was in a window meant switching to it, moving the user's screen.
 `position` stays within its window, so it still means what the status bar
 shows, and `focus_id` is the handle that needs no pairing with `window`.
 
+A name **two panes claim addresses neither**. Nothing can prevent the
+duplicate at the point it is made: `record` is per-pane, and a report arrives
+on the pty reader path already holding that pane's `Term` lock, so it cannot
+go looking at its neighbours without inverting the lock order. So the check
+lives in `resolve`, where the locks are taken in the right order anyway — and
+that is the better place regardless, because an ambiguous name is
+**temporary**: when one of the two claimants exits, `133;D` clears its claim
+and the name starts working again. Refusing beats picking the lower id, which
+is how a prompt ends up in the wrong agent's pane; the refusal says how many
+panes answer to the name, because "no pane named 'reviewer'" sends somebody
+looking for a pane that is right in front of them.
+
 `-p` takes a position (`3`), an id (`@3`), a name (`reviewer`) or `current`.
 Bare digits are positions and a name may not begin with one, so the four
 cannot collide; `current` is a reserved name.
@@ -1201,6 +1213,22 @@ in zmux closes a pane, kills a shell or writes a file because of a reported
 state. The worst a forged report can do is make a waiting caller stop waiting,
 or make a name resolve to the wrong pane — and a caller that cares holds an
 `@id`, which no report can influence.
+
+There is one place where a caller's *text* is not merely advisory, and it is
+worth naming because the defence had the bug. A prompt submitted with
+`--paste` is wrapped in `ESC[200~ … ESC[201~`, so text containing an end
+marker would close the paste early and the remainder would be typed as live
+keystrokes — the tail of somebody's prompt becoming commands in their shell.
+`paste::strip_end_marker` removes the marker for that reason.
+
+It removed it by **scanning the input**, which a payload could exploit to
+rebuild one out of the repair: `ESC[2` + `ESC[201~` + `01~` drops the middle
+marker and joins the surviving halves into a live one. The attack was handed
+its weapon by the defence. Checking the **output** after each byte fixes it
+and stays linear, because removing a suffix cannot expose a marker the same
+rule did not already remove. `no_payload_at_all_can_put_an_end_marker_in_the_body`
+pins the invariant rather than an example of it, assembling payloads out of
+marker fragments — uniform random bytes would never build one.
 
 The pipe's ACL is unchanged. `InputAt` reaches any pane in the session, but
 anyone who can open the pipe could already type into the focused one, so the

@@ -383,10 +383,10 @@ fn serve_control(
                 match session.resolve(&target) {
                     Some(id) => match session.write_to(id, &data, paste, enter) {
                         Ok(true) => ServerMsg::Info(session.info()),
-                        Ok(false) => ServerMsg::Refused { reason: gone(&target) },
+                        Ok(false) => ServerMsg::Refused { reason: gone(session, &target) },
                         Err(e) => ServerMsg::Refused { reason: e.to_string() },
                     },
-                    None => ServerMsg::Refused { reason: unknown(&target) },
+                    None => ServerMsg::Refused { reason: unknown(session, &target) },
                 }
             }
             // A pane saying what it is doing. Refused for a target that
@@ -397,7 +397,7 @@ fn serve_control(
                     session.report(id, &report);
                     ServerMsg::Info(session.info())
                 }
-                None => ServerMsg::Refused { reason: unknown(&target) },
+                None => ServerMsg::Refused { reason: unknown(session, &target) },
             },
             ClientMsg::Wait { target, until, timeout_ms, settle_ms } => {
                 match session.resolve(&target) {
@@ -405,7 +405,7 @@ fn serve_control(
                         let outcome = wait_for(session, id, &until, timeout_ms, settle_ms);
                         ServerMsg::Waited { outcome, info: session.info() }
                     }
-                    None => ServerMsg::Refused { reason: unknown(&target) },
+                    None => ServerMsg::Refused { reason: unknown(session, &target) },
                 }
             }
             ClientMsg::Query(Query::Info) => ServerMsg::Info(session.info()),
@@ -415,7 +415,7 @@ fn serve_control(
                     .and_then(|id| session.capture_from(id, lines, source))
                 {
                     Some(text) => ServerMsg::Capture { text },
-                    None => ServerMsg::Refused { reason: unknown(&target) },
+                    None => ServerMsg::Refused { reason: unknown(session, &target) },
                 }
             }
             ClientMsg::Query(Query::Capture { pane, lines }) => {
@@ -534,19 +534,28 @@ fn wait_for(
 /// Named back at the caller in their own words - `@7`, `reviewer`, `3` - so
 /// the message says which of their arguments was wrong, rather than making
 /// them guess which pane the daemon thought they meant.
-fn unknown(t: &Target) -> String {
+fn unknown(session: &Session, t: &Target) -> String {
     match t {
         Target::Focused => "no focused pane".into(),
         Target::Position(p) => format!("no pane at position {p} in the current window"),
         Target::Id(id) => format!("no pane with id @{id}"),
-        Target::Name(n) => format!("no pane named '{n}'"),
+        // A name resolves to nothing for two opposite reasons, and telling
+        // someone their name is unknown when in fact TWO panes answer to it
+        // sends them looking for a pane that is right in front of them.
+        Target::Name(n) => match session.named(n).len() {
+            0 => format!("no pane named '{n}'"),
+            k => format!(
+                "{k} panes are named '{n}', so the name addresses none of them; \
+                 use @id, which cannot be claimed twice"
+            ),
+        },
     }
 }
 
 /// The pane resolved and then exited before the write landed. A different
 /// answer from `unknown`: the caller's target was right, it is just too late.
-fn gone(t: &Target) -> String {
-    format!("{} - it exited before the write landed", unknown(t))
+fn gone(session: &Session, t: &Target) -> String {
+    format!("{} - it exited before the write landed", unknown(session, t))
 }
 
 fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) -> Result<()> {

@@ -443,14 +443,41 @@ impl Session {
                 let id = PaneId::from_raw(*id);
                 lock(&self.windows).panes().contains(&id).then_some(id)
             }
-            Target::Name(want) => {
-                let ids = lock(&self.windows).panes();
-                let panes = lock(&self.panes);
-                ids.into_iter().find(|id| {
-                    panes.get(id).is_some_and(|p| lock(&p.term).name().as_deref() == Some(want))
-                })
-            }
+            // A name that two panes claim addresses NEITHER. Taking the
+            // first match would put a prompt into whichever pane happened to
+            // sort earlier, which is the silent wrong answer every other
+            // kind of unresolvable target is refused to avoid.
+            //
+            // Nothing prevents the duplicate: `record` is per-pane, and a
+            // report arrives on the pty reader path holding that pane's
+            // `Term` lock - it cannot go looking at its neighbours without
+            // inverting the lock order. So the check belongs here, where the
+            // locks are already taken in the right order, and it is the
+            // right place anyway: an ambiguous name is TEMPORARY. When one
+            // of the two claimants exits, `133;D` clears its claim and the
+            // name starts working again.
+            Target::Name(want) => match self.named(want).as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            },
         }
+    }
+
+    /// Every live pane currently claiming `want`, in window-then-position
+    /// order.
+    ///
+    /// Public so the daemon can say how many there were: "no pane named
+    /// 'reviewer'" and "two panes are called 'reviewer'" are different
+    /// problems with different fixes, and a caller told the first when the
+    /// second is true goes looking for a pane that is right there.
+    pub fn named(&self, want: &str) -> Vec<PaneId> {
+        let ids = lock(&self.windows).panes();
+        let panes = lock(&self.panes);
+        ids.into_iter()
+            .filter(|id| {
+                panes.get(id).is_some_and(|p| lock(&p.term).name().as_deref() == Some(want))
+            })
+            .collect()
     }
 
     /// Write to a pane by id, leaving focus and the pane's scroll position

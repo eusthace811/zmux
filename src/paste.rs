@@ -42,30 +42,37 @@ pub fn wrap(data: &[u8], bracketed: bool, enter: bool) -> Vec<u8> {
 /// remainder is typed as live keystrokes. That is an injection: the tail of
 /// somebody's text becomes commands in their shell. Dropped rather than
 /// escaped, because there is no escape for it inside a paste.
+///
+/// Checked on the OUTPUT after every byte, not scanned over the input. The
+/// input scan let a payload rebuild the marker out of the repair: `ESC[2` +
+/// `ESC[201~` + `01~` drops the middle one and joins the surviving halves
+/// into a live end marker, which is the whole attack this exists to stop,
+/// handed back by the defence. Removing a suffix cannot expose a marker the
+/// same rule did not already remove - a prefix of a marker-free string is
+/// marker-free - so one pass over the bytes is enough, and it stays linear.
+/// A loop-until-clean would also be correct and is quadratic on input a
+/// caller chooses.
 fn strip_end_marker(data: &[u8]) -> Vec<u8> {
-    if !contains(data, END) {
-        return data.to_vec();
-    }
     let mut out = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i < data.len() {
-        if data[i..].starts_with(END) {
-            i += END.len();
-            continue;
+    for &b in data {
+        out.push(b);
+        if out.ends_with(END) {
+            out.truncate(out.len() - END.len());
         }
-        out.push(data[i]);
-        i += 1;
     }
     out
-}
-
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|w| w == needle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the tests ask this now: `strip_end_marker` checks the tail it
+    /// has just built rather than searching the whole payload, which is the
+    /// point of the rewrite.
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
 
     #[test]
     fn a_program_that_did_not_ask_gets_the_text_unchanged() {
@@ -98,6 +105,49 @@ mod tests {
         assert!(!contains(body, END), "the payload still closes the paste: {body:?}");
         assert_eq!(out.windows(END.len()).filter(|w| *w == END).count(), 1);
         assert!(contains(&out, b"rm -rf / do"), "the rest of the text was lost");
+    }
+
+    /// Stripping must not ASSEMBLE an end marker out of the pieces left
+    /// behind. `ESC[2` + `ESC[201~` + `01~` removes the middle marker and
+    /// joins the two halves into a brand new one - so the very payload this
+    /// function exists to defang builds its weapon out of the repair.
+    #[test]
+    fn stripping_cannot_reassemble_an_end_marker_from_what_it_left() {
+        let mut data = b"\x1b[2".to_vec();
+        data.extend_from_slice(END);
+        data.extend_from_slice(b"01~rm -rf /");
+        let out = wrap(&data, true, true);
+        let body = &out[START.len()..out.len() - END.len() - 1];
+        assert!(
+            !contains(body, END),
+            "the strip built a new end marker and let the tail out: {body:?}"
+        );
+    }
+
+    /// The invariant, not an example of it: whatever goes in, no end marker
+    /// comes out. Built from the fragments an attacker would actually use -
+    /// whole markers and the pieces they split into - because uniform random
+    /// bytes would never assemble one in a thousand years of trying.
+    #[test]
+    fn no_payload_at_all_can_put_an_end_marker_in_the_body() {
+        let parts: [&[u8]; 8] =
+            [END, b"\x1b", b"[", b"2", b"0", b"1", b"~", b"\x1b[2"];
+        // xorshift, so a failure is reproducible from the seed alone.
+        let mut x: u32 = 0x9e37_79b9;
+        let mut rand = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for _ in 0..20_000 {
+            let mut data = Vec::new();
+            for _ in 0..(rand() % 12) {
+                data.extend_from_slice(parts[rand() as usize % parts.len()]);
+            }
+            let body = strip_end_marker(&data);
+            assert!(!contains(&body, END), "{data:?} produced {body:?}");
+        }
     }
 
     #[test]
