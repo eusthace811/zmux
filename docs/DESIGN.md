@@ -1255,6 +1255,56 @@ through the `Serialize` impl, so a skipped field is skipped *on the wire*, and
 the decoder then reads the next field's bytes as this one. `SessionInfo::created`
 is a plain `Option` and shows as `null` in JSON for that reason.
 
+### What a frame costs, and what was not done about it
+
+Measured on the target machine, release build, dense screens, four panes —
+`examples/perf.rs` reproduces all of it:
+
+| | 80x24 | 160x44 | 240x60 |
+| --- | --- | --- | --- |
+| `frame_from_screen`, one pane | 30µs | 111µs | **228µs** |
+| `composite`, frames already built | 9.6µs | 9.6µs | 14µs |
+| `delta_from`, nothing moved | 1.6µs | 5.8µs | 12µs |
+| `delta_from`, full redraw | 1.4µs | 3.3µs | 6.2µs |
+
+Two things in that table are worth reading twice.
+
+**The composite is one function.** Building the per-pane frames is 94% of it;
+the blit and the layout arithmetic together are 14µs. Any work spent on
+compositing that is not spent on `frame_from_screen` is spent on the wrong
+thing.
+
+**A delta costs more when nothing moved than when everything did.** An
+unchanged row must be compared to the end before it can be called unchanged,
+while a changed one differs at the first cell and short-circuits — so the
+copy is cheaper than the proof. It is not a bug and it does not need fixing;
+it is worth knowing because it means the steady state is the expensive one,
+and it inverts the intuition that would otherwise guide an optimization here.
+
+`Cell` now derives `Copy`. It is fourteen bytes of plain data and always was,
+and the derive lets `to_vec` reach its memcpy specialisation and removes a
+per-cell `clone` from the blit: 8% off the settled delta, 18% off a full
+redraw, one word of source.
+
+**Per-pane frame caching was considered and rejected.** `snapshot()` rebuilds
+every pane's frame on every publish, so a session with one busy pane and
+three idle ones pays for all four. Keying a cache on the pty reader's
+`last_output` stamp would skip the idle ones — but the key would also have to
+carry the scroll offset and the size, because `set_scrollback` and a resize
+both change what `screen()` shows without a byte arriving. Miss one of those
+and a pane freezes on screen, which is the failure this file spends three
+paragraphs of `publish()` guarding against elsewhere. The whole path is
+230µs at 60fps — **1.4% of one core** — and `publish()` already returns
+immediately when no client is attached, which is the entire headless-agent
+case §12 exists for. A cache whose failure mode is a frozen pane is not worth
+1.4% of a core.
+
+Going below that would mean going around vt100: `contents()` validates UTF-8
+per cell and there is no slice accessor. The one optimisation its public API
+does allow — guarding on `has_contents()` — was measured earlier at 5% slower
+on dense screens and 6% faster on sparse ones, and rejected for depending on
+the content rather than the code.
+
 ### What this deliberately does not do
 
 - **No screen-pattern manifests**, per the argument above.

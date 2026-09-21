@@ -735,7 +735,7 @@ impl Frame {
 
 /// One cell of the composited screen. Mirrors what a ratatui `Cell` carries,
 /// which is what the renderer needs (DESIGN.md §0.4).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
     pub ch: char,
     pub fg: u32,

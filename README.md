@@ -112,6 +112,7 @@ Everything outside `src/`:
 | `tests/` | Integration tests. They drive a real daemon over the real pipe. |
 | `examples/dump.rs` | Prints a live session's screen as text. Needs no console, so it works from WSL. |
 | `examples/report-state.sh` | The reporting contract (DESIGN §12), and the few lines to add to an agent you own. |
+| `examples/perf.rs` | The per-frame costs in DESIGN §12, reproducible. `cargo run --release --example perf` — `./x` intercepts `run`. |
 | `probes/` | The Phase 0 go/no-go experiments, kept for **re-validation on the work laptop** (DESIGN §8.4): does a detached daemon survive its parent, does mintty give a real console. Separate crates, deliberately outside the build — `probes/RUNBOOK.md` says how to run them and has the table to fill in. |
 | `skills/zmux/SKILL.md` | What a coding agent needs to know about zmux. Bundled into the binary, so `zmux --skill` always prints the one that matches the build. |
 | `.claude-plugin/` | Manifests that let Claude Code install that skill as a plugin: `claude plugin marketplace add <this repo>`, then `claude plugin install zmux@zmux`. |

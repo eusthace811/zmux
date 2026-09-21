@@ -505,7 +505,7 @@ fn blit(dst: &mut Frame, src: &Frame, at: LRect) {
                 continue;
             }
             dst.cells[y as usize * dst.cols as usize + x as usize] =
-                src.cells[row as usize * src.cols as usize + col as usize].clone();
+                src.cells[row as usize * src.cols as usize + col as usize];
         }
     }
 }
