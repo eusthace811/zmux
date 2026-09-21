@@ -504,7 +504,10 @@ usage: zmux wait <session> [-p T] --until <what> [--timeout MS] [--settle MS]
           quiet-for MS the pane has produced no output for that long; the
                        honest wait for a program that reports nothing
           output TEXT  that text is in the pane's recent output (a literal
-                       substring, not a pattern; text already there matches)
+                       substring, not a pattern; text already there matches).
+                       Only the last 200 lines are searched, so wait for
+                       something the command prints at the END - a pane can
+                       out-produce that window between two polls
           bell         the pane rings the bell
 
   --timeout MS   default 120000. The daemon caps this; at the cap you are
@@ -1235,6 +1238,20 @@ mod tests {
         assert!(Target::parse("current", None).is_err());
         // Reserved, so `-p current` can never be ambiguous.
         assert!(!zmux::protocol::is_valid_name("current"));
+    }
+
+    /// The refusal is the only place a user learns the four spellings, so it
+    /// has to read as a sentence. It shipped with eighteen spaces wedged into
+    /// the middle of one, which is what a wrapped string literal does when
+    /// nobody looks at the output.
+    #[test]
+    fn the_refusal_for_a_bad_pane_reads_as_one_sentence() {
+        let Err(msg) = Target::parse("Reviewer", None) else {
+            panic!("a capitalised name is not a legal pane")
+        };
+        assert!(!msg.contains("  "), "the message has a run of spaces in it: {msg:?}");
+        assert!(!msg.contains('\n'), "the message is wrapped: {msg:?}");
+        assert!(msg.contains("or a name ("), "the words ran together: {msg:?}");
     }
 
     #[test]

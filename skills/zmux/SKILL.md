@@ -137,7 +137,9 @@ theirs rather than yours. When it matters, note the new pane's `id` from the
 reply and find it again by `id`, which does not move.
 
 ```bash
-NEW=$(zmux send work split-v | python -c 'import json,sys;print(json.load(sys.stdin)["focus"])')
+# focus_id, not focus: an id is what the rule above says to hold on to, and
+# `-p @$NEW` still reaches the pane after somebody closes another one.
+NEW=$(zmux send work split-v | python -c 'import json,sys;print(json.load(sys.stdin)["focus_id"])')
 ```
 
 `split-h` and `split-v` inherit the focused pane's directory and **take the
@@ -210,7 +212,7 @@ zmux wait <session> -p @7 --until settled --timeout 120000
 | `idle` `working` `blocked` `done` | one specific reported state |
 | `quiet` | no shell command running. Right for `cargo test`; **useless for an agent**, which is one long command |
 | `quiet-for MS` | no output for that long. The honest "probably finished" for a pane that reports nothing |
-| `output TEXT` | a literal substring of recent output. Text already there matches at once |
+| `output TEXT` | a literal substring of the last 200 lines. Text already there matches at once; a pane that prints more than that between polls can carry a match past unseen, so wait for something printed at the END |
 | `bell` | the pane rang the bell |
 
 Prints the session state the wait ended with, plus `outcome`: `met`, `timeout`
@@ -378,6 +380,14 @@ Report that list to the user; do not kill their sessions to unblock a build.
 - **"Access is denied" during a copy** — a `zmux` process is holding the
   `.exe`.
 - **"no such session"** — `zmux attach` never creates. That is deliberate.
+- **A pane vanishes, and a `-p @id` that worked a moment ago is refused** —
+  the machine may be out of consoles. Every pane is one and Git Bash refuses
+  to start past 128 SYSTEM-WIDE, counting every other terminal and `git.exe`
+  on the machine. The shell starts and dies at once, so zmux sees an
+  ordinary exit and closes the pane. Do not retry the split in a loop; tell
+  the user to close some windows. The daemon's stderr says
+  `pane N never started: ... too many consoles in use` when this is what
+  happened.
 
 ## Where state lives
 

@@ -18,15 +18,10 @@ use anyhow::{bail, Result};
 use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::windows::{Closed, Windows};
 use crate::protocol::{
-    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, ServerMsg, SessionInfo, Source, Target,
-    MAX_INPUT_BYTES, MAX_PANES,
+    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, PaneState, ServerMsg, SessionInfo, Source,
+    Target, MAX_INPUT_BYTES, MAX_PANES, RECENT_LINES_DEFAULT,
 };
 
-/// How much history a `Recent` read returns when the caller named no count.
-///
-/// Enough to hold an agent's last answer, small enough that omitting `-n` is
-/// not a way to ask for the entire scrollback by accident.
-const DEFAULT_RECENT_LINES: usize = 200;
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
 use crate::render::{composite, frame_from_screen, pane_area_with, status_spans, BarState, Span};
@@ -47,7 +42,7 @@ pub fn capped_wait(asked_ms: u32, max_ms: u64) -> u64 {
 /// One pane's answer to "what is happening in there", cheaply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneStatus {
-    pub state: crate::protocol::PaneState,
+    pub state: PaneState,
     pub busy: bool,
     pub bells: u32,
     pub quiet_ms: u64,
@@ -56,7 +51,13 @@ pub struct PaneStatus {
 /// A live session plus the channel its panes report on.
 pub type SessionHandle = (Arc<Session>, Receiver<(PaneId, PtyEvent)>);
 
-struct PaneState {
+/// A pane's live halves: what it has drawn, and what is drawing it.
+///
+/// Named for what it holds rather than `PaneState`, which it used to be -
+/// `protocol::PaneState` is the state a pane REPORTS, a completely different
+/// thing, and every mention of either in this file had to be written out in
+/// full to say which one was meant.
+struct LivePane {
     term: Arc<Mutex<Term>>,
     pty: Arc<Pane>,
 }
@@ -110,7 +111,7 @@ pub struct Session {
     pub name: String,
     /// EVERY pane in the session, whichever window shows it. Panes do not
     /// move between windows and are not suspended when a window is hidden.
-    panes: Mutex<HashMap<PaneId, PaneState>>,
+    panes: Mutex<HashMap<PaneId, LivePane>>,
     windows: Mutex<Windows>,
     clients: Mutex<Vec<Client>>,
     next_client: AtomicU64,
@@ -345,7 +346,7 @@ impl Session {
             t.responder.scan(chunk, cur)
         })?;
 
-        lock(&self.panes).insert(id, PaneState { term, pty: Arc::new(pty) });
+        lock(&self.panes).insert(id, LivePane { term, pty: Arc::new(pty) });
 
         // Tag this pane's events so the pump can tell them apart.
         let tx = self.events_tx.clone();
@@ -502,6 +503,38 @@ impl Session {
         })
     }
 
+    /// Why a pane that has just died could not start, if that is what
+    /// happened to it.
+    ///
+    /// A shell has one job before its first prompt, and when it cannot do it
+    /// the reason goes to the pane's screen and nowhere else - then the pane
+    /// is removed and the screen with it. The daemon was left saying only
+    /// that a pane had exited, which is the symptom; every other symptom a
+    /// caller sees (a target that stops resolving, a window that closed
+    /// itself, a focus that moved) is downstream of this one line.
+    ///
+    /// Bounded by AGE, not by the exit status alone. A pane still in its first
+    /// few seconds has not run anything, so its last line is its own startup
+    /// error - `console device allocation failure - too many consoles in use`
+    /// is the one that prompted this. An older pane's screen is the user's
+    /// work, and none of it belongs in a log.
+    fn starting_failure(&self, id: PaneId) -> Option<String> {
+        /// Long enough to cover a slow ConPTY under load, short enough that
+        /// nothing a person typed can be on screen yet.
+        const NEVER_STARTED_MS: u64 = 5_000;
+        let panes = lock(&self.panes);
+        let p = panes.get(&id)?;
+        if p.pty.age_ms() > NEVER_STARTED_MS {
+            return None;
+        }
+        let text = lock(&p.term).parser.screen().contents();
+        text.lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| l.chars().take(crate::protocol::MAX_COMMAND_CHARS).collect())
+    }
+
     /// Does this pane still exist in the layout?
     ///
     /// Asked of the PINNED id rather than the original target: a wait on
@@ -535,7 +568,7 @@ impl Session {
             // 0 means "as much as you have" for the screen; for history it
             // has to mean something bounded, or a caller that omitted the
             // count gets the whole million-row buffer.
-            let want = if lines == 0 { DEFAULT_RECENT_LINES } else { lines as usize };
+            let want = if lines == 0 { RECENT_LINES_DEFAULT } else { lines as usize };
             return Some(term.read_recent(want, source == Source::RecentUnwrapped));
         }
         let text = term.parser.screen().contents();
@@ -781,7 +814,13 @@ impl Session {
     ///
     /// A shell exiting in a background window closes that window without
     /// disturbing the one being looked at.
-    pub fn pane_exited(&self, id: PaneId) -> bool {
+    pub fn pane_exited(&self, id: PaneId, code: i32) -> bool {
+        // Before the pane goes, because its explanation goes with it.
+        if code != 0 {
+            if let Some(why) = self.starting_failure(id) {
+                eprintln!("[session] pane {} never started: {why}", id.0);
+            }
+        }
         self.remove_pane(id) == Closed::LastPane
     }
 
@@ -1096,7 +1135,13 @@ impl Session {
         let mut last = lock(&self.last_published);
         let frame = self.snapshot();
         let msg_delta = last.as_ref().and_then(|prev| frame.delta_from(prev)).map(ServerMsg::Delta);
-        let full = ServerMsg::Frame(frame.clone());
+        // Built ONLY if somebody actually needs one. The steady state is a
+        // settled client taking deltas, and a full frame is the whole grid -
+        // cols x rows x a 16-byte cell, so 230KB at 240x60 - copied once here
+        // and again into the client's slot. Composing it unconditionally
+        // meant paying for the larger of those on every tick of a session
+        // where nothing ever asked for it.
+        let mut full: Option<ServerMsg> = None;
 
         {
             let mut cs = self.lock_clients();
@@ -1113,7 +1158,7 @@ impl Session {
                     (Some(d), false) => d,
                     _ => {
                         c.needs_full = false;
-                        &full
+                        full.get_or_insert_with(|| ServerMsg::Frame(frame.clone()))
                     }
                 };
                 *slot = Some(msg.clone());

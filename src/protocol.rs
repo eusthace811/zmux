@@ -44,6 +44,14 @@ pub const MIN_USABLE_ROWS: u16 = 3;
 /// larger is a bug or an attack.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 
+/// How far back a history read goes when the caller named no line count.
+///
+/// This is not only `capture`'s default: it is the window `Until::Output`
+/// searches, so it is the observable bound on what a wait can notice. Enough
+/// to hold an agent's last answer, small enough that omitting `-n` is not a
+/// way to ask for a million rows by accident.
+pub const RECENT_LINES_DEFAULT: usize = 200;
+
 /// Most lines one `capture` will return, whatever it was asked for.
 ///
 /// A pane may hold a million rows of scrollback (`Config::scrollback`), and
@@ -291,6 +299,15 @@ pub enum Until {
     /// Matches text that is ALREADY there, as herdr's `wait-output` does - so
     /// a caller that asks after the fact is not left waiting for something
     /// that has happened.
+    ///
+    /// BOUNDED, and the bound is worth knowing: each poll searches the last
+    /// `RECENT_LINES_DEFAULT` lines, not the whole scrollback. A pane that
+    /// produces more than that between two polls can carry a match past
+    /// unseen. Reading further is linear and does not fix it - measured at
+    /// 80x24, 200 lines costs 68us a poll and 5000 costs 1.6ms, which moves
+    /// the threshold without closing it, and any burst can beat whatever it
+    /// is moved to. Wait for something a command prints at the END, which is
+    /// what "it finished" looks like anyway.
     Output(String),
     /// The pane rings the bell. Works for a program that reports nothing,
     /// because plenty of them ring it when they stop to ask.
@@ -343,7 +360,8 @@ impl Target {
         }
         if !is_valid_name(s) {
             return Err(format!(
-                "'{s}' is not a pane position (1), an id (@1) or a name                  (a-z, then a-z 0-9 _ -, up to {MAX_NAME_CHARS})"
+                "'{s}' is not a pane position (1), an id (@1) or a name \
+                 (a-z, then a-z 0-9 _ -, up to {MAX_NAME_CHARS})"
             ));
         }
         Ok(Target::Name(s.to_string()))

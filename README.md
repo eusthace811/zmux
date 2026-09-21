@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete, plus agent coordination (DESIGN §12). 226 tests
+Phases 0–6 complete, plus agent coordination (DESIGN §12). 229 tests
 passing, clippy clean.
 
 | | |
@@ -118,7 +118,7 @@ Everything outside `src/`:
 | `x` | Build, test and install, from WSL or Git Bash. |
 | `docs/` | `GUIDE.md` to use it, `DESIGN.md` for why it is built this way. |
 
-## Nine things that will bite you if you change them
+## Ten things that will bite you if you change them
 
 **1. Terminal query replies are mandatory.** ConPTY is created with
 `PSEUDOCONSOLE_INHERIT_CURSOR` and emits `ESC[6n` at startup. Unanswered, the
@@ -187,6 +187,26 @@ left a dead pane on screen and a session whose last shell had gone lingered
 until its idle timeout. Nothing typed `exit` in the suite, so it went unseen;
 two tests now do.
 
+**10. Consoles are a SYSTEM-WIDE resource, and MSYS gives up at 128.** Every
+pane is a console, and `MAX_PANES` is 64 — but the budget is not zmux's to
+spend. Git Bash counts every console on the machine, including the ones
+Windows Terminal, VS Code and anything spawning `git.exe` are holding, and
+once the total reaches 128 a new `bash.exe` prints
+
+```
+*** fatal error - console device allocation failure - too many consoles in use, max consoles is 128
+```
+
+to its pane and exits. The shell STARTS and then dies, so this is not a spawn
+failure `Pane::spawn_with` can return — the pane simply goes away, taking its
+screen and its explanation with it, and what a caller sees instead is a target
+that stopped resolving or a window that closed itself. `Session::pane_exited`
+therefore quotes a pane that died in its first five seconds: that early it has
+had no prompt, so its last line is its own startup error and nothing of
+anybody's. `./x test` reads that back and says so in a sentence. Measured on a
+machine already holding ~130 consoles: 6 test threads green 3/3 with no pane
+lost, 8 threads 0/3, 12 threads 0/3 with 40 lost.
+
 ## Tests
 
 ```bash
@@ -195,6 +215,11 @@ two tests now do.
 
 Integration tests drive a **real Git Bash through ConPTY** and assert on the
 rendered grid. They need no console, so they run from WSL too.
+
+Parallelism is bounded (`RUST_TEST_THREADS`, default 4) because every test
+starts a daemon and every pane is a console — see landmine 10. Setting it
+higher on a busy machine does not produce failing tests, it produces panes
+that vanish; `./x test` says which of the two happened.
 
 `cargo run --example dump -- <session>` prints a live session's screen as text,
 which is the quickest way to see what a running session actually looks like.
@@ -222,6 +247,10 @@ sustained output, attach/detach churn, many splits, and malformed input.
 - **Windows are positional**, so closing one renumbers those after it — and
   `C-b <digit>` renumbers with them. tmux leaves a gap instead. There are no
   window names, and only the first ten windows have a digit.
+- **`MAX_PANES` is 64, but the machine may not have room for 64.** Panes are
+  consoles and MSYS bash refuses to start past 128 of them system-wide,
+  counting every other program's. The limit zmux enforces is its own; the
+  one that actually binds is shared, and zmux can only report it.
 - **Queues are bounded by message count, not bytes.**
 - **A client that stops reading is contained, not dropped.** Frames coalesce,
   so it costs no memory, and its wedged writer thread takes nothing else with

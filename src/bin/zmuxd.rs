@@ -15,7 +15,8 @@ use interprocess::TryClone as _;
 use zmux::ipc;
 use zmux::layout::{Dir, Nav, PaneId};
 use zmux::protocol::{
-    Cmd, ClientMsg, Query, ServerMsg, Source, Target, Until, WaitOutcome, PROTOCOL_VERSION,
+    Cmd, ClientMsg, PaneState, Query, ServerMsg, Source, Target, Until, WaitOutcome,
+    PROTOCOL_VERSION,
 };
 use zmux::pty::PtyEvent;
 use zmux::session::{Outbound, Session};
@@ -143,9 +144,17 @@ fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEve
         match events.recv_timeout(FRAME_INTERVAL) {
             Ok((_, PtyEvent::Output(_))) => dirty = true,
             Ok((id, PtyEvent::Exited(code))) => {
+                // Say so. A pane going away is the one lifecycle event the
+                // daemon used to perform in silence, and it is the one that
+                // needs explaining: every symptom downstream - a refused
+                // target, a window that closed itself, a focus that moved -
+                // is this line's consequence, and without it the cause was
+                // unreachable. Spawn failures have always been logged; this
+                // is the other half.
+                eprintln!("[zmuxd] pane {} exited with status {code}", id.0);
                 // Only the LAST pane exiting ends the session; otherwise the
                 // pane is removed and the survivors reclaim its space.
-                if session.pane_exited(id) {
+                if session.pane_exited(id, code) {
                     session.broadcast(&ServerMsg::PaneExited { code });
                     session.shutdown();
                     return;
@@ -478,7 +487,7 @@ fn wait_for(
         // The pane has started doing something, so the condition is now
         // about THIS command rather than the state before it.
         active |= now.busy
-            || now.state == zmux::protocol::PaneState::Working
+            || now.state == PaneState::Working
             || now.bells > start.bells
             || std::time::Instant::now() >= gate;
         let met = active
@@ -488,11 +497,13 @@ fn wait_for(
                 Until::Settled => now.state.is_settled(),
                 Until::QuietFor(ms) => now.quiet_ms >= u64::from(*ms),
                 Until::Bell => now.bells > start.bells,
-                // Against the scrollback-backed read, so a match that
-                // scrolls past between two polls is still found. Text
-                // already on screen matches immediately, deliberately: a
-                // caller asking after the fact must not be left waiting for
-                // something that has happened.
+                // Against the scrollback-backed read, so a match that has
+                // left the VISIBLE screen is still found. Not one that has
+                // left the last `RECENT_LINES_DEFAULT` lines: a pane can
+                // out-produce that between two polls, and reading further
+                // costs linearly without closing the gap. Text already there
+                // matches immediately, deliberately - a caller asking after
+                // the fact must not wait for something that has happened.
                 Until::Output(text) => session
                     .capture_from(id, 0, Source::RecentUnwrapped)
                     .is_some_and(|s| s.contains(text.as_str())),
