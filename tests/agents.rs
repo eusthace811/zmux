@@ -687,6 +687,18 @@ fn a_wait_for_one_named_state_ignores_the_others() {
     let d = Daemon::start("zmux-test-wait-state");
     let mut c = Control::open(&d.session);
     let id = c.info().panes[0].id;
+
+    // Hold the foreground, the way a real agent does for its whole life.
+    //
+    // Without this the pane sits at a prompt, and the rcfile re-asserts
+    // `133;D` at EVERY prompt - deliberately, see `cwd.rs` - which clears
+    // whatever the pane claimed. A claim made over the pipe against an idle
+    // shell therefore dies at the next redraw, and the wait below correctly
+    // answers `Replaced` instead of timing out. Correct, but it would make
+    // this test a race against the prompt rather than a test of `Until`.
+    c.input_at(Target::Id(id), &agent_like("state=working"), true);
+    assert!(wait_for_state(&mut c, PaneState::Working, 20).is_some(), "the pane never started");
+
     let report = |c: &mut Control, state| {
         let r = Report { state: Some(state), ..Default::default() };
         c.ask(&ClientMsg::Report { target: Target::Id(id), report: r });
@@ -1042,5 +1054,250 @@ fn a_name_two_panes_claim_reaches_neither() {
     assert!(
         reason.contains("2") && reason.contains("reviewer"),
         "the refusal must say the name is claimed twice, not that it is unknown: {reason}"
+    );
+}
+
+/// `Submit` writes, waits, and answers with the state it settled on.
+///
+/// Named for what it checks. It does NOT prove the thing `Submit` exists
+/// for - that the reading it compares against is from before the write.
+/// Taking that reading immediately AFTER the write instead leaves this
+/// green, and has to: inside the daemon the two are microseconds apart and
+/// no pane can react in between. The window `Submit` closes is two CLIENT
+/// round trips wide, and nothing here can make a reaction land inside it on
+/// purpose. See DESIGN §12 for why the guarantee is structural rather than
+/// tested, and for what IS tested - the blocked refusal and `Stalled`,
+/// which are the two things `Submit` does that a caller cannot do itself.
+#[test]
+fn a_submit_writes_and_reports_the_state_it_settled_on() {
+    let d = Daemon::start("zmux-test-submit");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    // An agent that reacts and settles fast enough that a separate wait
+    // would miss the whole thing: it claims `working`, then `done`.
+    let keys = r"printf '\033]1341;zmux;state=working\033\\'; \
+                 printf '\033]1341;zmux;state=done\033\\'; read -r _";
+    let reply = c.ask(&ClientMsg::Submit {
+        target: Target::Id(id),
+        data: keys.as_bytes().to_vec(),
+        paste: false,
+        until: Until::Settled,
+        timeout_ms: 20_000,
+        react_ms: 10_000,
+    });
+    let ServerMsg::Waited { outcome, info } = reply else {
+        panic!("expected Waited, got {reply:?}");
+    };
+    assert_eq!(outcome, WaitOutcome::Met, "the submit did not see the pane settle");
+    let p = info.panes.iter().find(|p| p.id == id).expect("the pane vanished");
+    assert_eq!(p.state, PaneState::Done, "settled on the wrong state: {p:?}");
+}
+
+/// A prompt must not be typed at a pane that is waiting for an answer.
+///
+/// `blocked` means the agent has stopped to ask something. Text sent now
+/// answers ITS question, not the caller's, and there is no undo. herdr
+/// refuses the same case before writing a byte, and so does this.
+#[test]
+fn a_submit_refuses_a_pane_that_reported_blocked() {
+    let d = Daemon::start("zmux-test-submit-blocked");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    c.input_at(Target::Id(id), &agent_like("state=blocked"), true);
+    assert!(wait_for_state(&mut c, PaneState::Blocked, 20).is_some(), "never blocked");
+
+    let before = c.capture_at(Target::Id(id));
+    let reply = c.ask(&ClientMsg::Submit {
+        target: Target::Id(id),
+        data: b"THIS_MUST_NOT_ARRIVE".to_vec(),
+        paste: false,
+        until: Until::Settled,
+        timeout_ms: 2_000,
+        react_ms: 1_000,
+    });
+    let ServerMsg::Refused { reason } = reply else {
+        panic!("a prompt was typed at a blocked pane: {reply:?}");
+    };
+    assert!(reason.contains("blocked"), "the refusal does not say why: {reason}");
+    // And nothing was written - the refusal is before the byte, not after.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after = c.capture_at(Target::Id(id));
+    assert!(
+        !after.contains("THIS_MUST_NOT_ARRIVE"),
+        "the text was written anyway:\nbefore:\n{before}\nafter:\n{after}"
+    );
+}
+
+/// A pane that never reacts is `stalled`, not `timeout`.
+///
+/// They are different problems. `timeout` says it is still going; `stalled`
+/// says it never started, which usually means the text went somewhere that
+/// was not listening. Neither means nothing was written.
+#[test]
+fn a_submit_that_provokes_nothing_is_stalled_rather_than_timed_out() {
+    let d = Daemon::start("zmux-test-submit-stalled");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    // A pane holding the foreground and reporting NOTHING, ever: `read`
+    // consumes the line and says nothing about it.
+    c.input_at(Target::Id(id), "read -r _; read -r _", true);
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+
+    let reply = c.ask(&ClientMsg::Submit {
+        target: Target::Id(id),
+        data: b"no-one-is-listening".to_vec(),
+        paste: false,
+        until: Until::Settled,
+        timeout_ms: 20_000,
+        react_ms: 900,
+    });
+    let ServerMsg::Waited { outcome, .. } = reply else {
+        panic!("expected Waited, got {reply:?}");
+    };
+    assert_eq!(
+        outcome,
+        WaitOutcome::Stalled,
+        "a pane that reacted to nothing should stall, not run out the clock"
+    );
+}
+
+/// A wait tells you when the agent it was watching has GONE.
+///
+/// Not the pane - the pane is still there. The agent exited and its claim
+/// died with it, so whatever answers now is not what the caller was waiting
+/// for. Waiting out the full timeout would be the wrong answer to the wrong
+/// question.
+#[test]
+fn a_wait_says_when_the_agent_it_watched_has_been_replaced() {
+    let d = Daemon::start("zmux-test-replaced");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    c.input_at(Target::Id(id), &agent_like("state=working;agent=ampere"), true);
+    assert!(wait_for_state(&mut c, PaneState::Working, 20).is_some(), "never started");
+
+    // Wait for something it will never reach, and let it exit underneath.
+    let session = d.session.clone();
+    let handle = std::thread::spawn(move || {
+        let mut w = Control::open(&session);
+        waited(&mut w, Target::Id(id), Until::State(PaneState::Blocked), 30_000)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    // Finish the `read`, so the claim dies with the process that made it.
+    c.input_at(Target::Id(id), "", true);
+
+    assert_eq!(
+        handle.join().expect("the waiting thread panicked"),
+        WaitOutcome::Replaced,
+        "the wait kept watching a pane whose agent had gone"
+    );
+}
+
+/// `start` refuses a pane that is already running something.
+///
+/// The command line would be typed INTO the running program rather than
+/// into the shell - which for an agent means it becomes a prompt, and for
+/// an editor means whatever those keystrokes do. herdr refuses the same
+/// case by asking the OS for the foreground process; this asks the pane,
+/// which already said so through shell integration, and so costs no process
+/// lookup (§0.2's neighbour).
+#[test]
+fn starting_in_a_pane_that_is_busy_is_refused_rather_than_typed_into_it() {
+    let d = Daemon::start("zmux-test-start-busy");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    c.input_at(Target::Id(id), "read -r _", true);
+    let busy = |c: &mut Control| pane_of(c, id).busy;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !busy(&mut c) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(busy(&mut c), "the pane never became busy, so this would prove nothing");
+
+    let out = d.cli(&["start", &d.session, "-p", &format!("@{id}"), "echo", "NOPE"]);
+    assert!(!out.status.success(), "start ran into a busy pane");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("not at a prompt"),
+        "the refusal does not say why: {err}"
+    );
+}
+
+/// `start` comes back when the thing is UP, not when the text was written.
+#[test]
+fn starting_waits_until_the_thing_says_it_is_there() {
+    let d = Daemon::start("zmux-test-start-ready");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+    assert!(c.wait_at(20, Target::Id(id), |t| t.contains('$')).is_some(), "no prompt");
+
+    // Slow to come up, like a real agent: nothing for a beat, then a claim.
+    let cmd = r"sleep 1; printf '\033]1341;zmux;state=idle;agent=ampere\033\\'; read -r _";
+    let started = std::time::Instant::now();
+    let out = d.cli(&["start", &d.session, "-p", &format!("@{id}"), cmd]);
+    assert!(out.status.success(), "start failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(900),
+        "start returned before the thing could possibly be up: {:?}",
+        started.elapsed()
+    );
+    let p = pane_of(&mut c, id);
+    assert_eq!(p.agent.as_deref(), Some("ampere"), "start returned before the claim landed");
+}
+
+/// Splitting the Enter off a paste still submits the line.
+///
+/// What it proves is the SAFE half. `bash` is not a text box: it reads the
+/// line whichever way the bytes arrive, so putting them in one write leaves
+/// this green too. The half it cannot prove is the reason for the change -
+/// that a program which asked for bracketed paste swallows a `\r` arriving
+/// in the same read as part of the paste event, leaving the prompt sitting
+/// in the box unsent. That needs a real TUI agent, so the change rests on
+/// herdr's evidence rather than on this. See DESIGN §12.
+#[test]
+fn splitting_the_enter_off_a_paste_still_submits_the_line() {
+    let d = Daemon::start("zmux-test-submit-split");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    // Ask for bracketed paste, then read TWO lines: the marker proves the
+    // second arrived, which it only can if Enter was its own write - inside
+    // the paste it is text, and the markers are stripped from what `read`
+    // sees only because the program asked for them.
+    // Wait for a MARKER, not a duration. A fixed sleep here failed two runs
+    // in three under the suite's parallelism - the shell had not reached the
+    // `read` yet - and `READY` cannot print until the `?2004h` before it has
+    // been parsed, which is the state this test needs.
+    c.input_at(
+        Target::Id(id),
+        r"printf '\033[?2004h'; echo READY; read -r one; echo GOT:[$one]",
+        true,
+    );
+    // TWICE. The shell echoes the command line it was given, and that line
+    // contains the word too - so the first match is the caller's own text,
+    // not the command having run. `each_pane_gets_its_own_id` documents the
+    // same trap; this test was flaky for exactly it.
+    assert!(
+        c.wait_at(20, Target::Id(id), |t| t.matches("READY").count() >= 2).is_some(),
+        "the pane never reached the read"
+    );
+
+    c.ask(&ClientMsg::InputAt {
+        target: Target::Id(id),
+        data: b"hello there".to_vec(),
+        paste: true,
+        enter: true,
+    });
+    let screen = c
+        .wait_at(20, Target::Id(id), |t| t.contains("GOT:["))
+        .expect("the pasted line was never submitted");
+    assert!(
+        screen.contains("hello there"),
+        "the prompt did not arrive whole:\n{screen}"
     );
 }

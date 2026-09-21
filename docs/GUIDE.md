@@ -382,6 +382,27 @@ agent is for its whole life, does not count as having started. Pass
 `--settle 0` when the pane is already working on the thing you are
 waiting for.
 
+### Start it and prompt it
+
+```bash
+zmux start "$S" -p "@$NEW" "ampere"
+zmux run "$S" -p "@$NEW" --paste --wait "review the current diff"
+```
+
+`start` waits until the pane reports something, so it returns when the agent
+is up rather than when the text was typed. It refuses a pane that is already
+running something.
+
+`run --wait` writes and waits in one request, which two commands cannot do:
+a separate wait can only look at the pane after the write, so one that
+reacted and settled in between looks like one that never heard. It refuses a
+pane that reported `blocked`, because a prompt would answer that pane's own
+question.
+
+Outcomes beyond `met`/`timeout`/`gone`: `stalled` means the pane never
+reacted, and `replaced` means the agent exited while you were waiting. Both
+still wrote the text, so do not simply send it again.
+
 ### Read the answer
 
 ```bash

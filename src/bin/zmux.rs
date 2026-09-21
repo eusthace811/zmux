@@ -136,6 +136,9 @@ Driving a session without attaching (for scripts and agents):
   zmux report --check                    prove the report channel works
   zmux wait <session> [-p T] --until settled|quiet|output TEXT|...
                                            block until a pane does something
+  zmux run  <session> [-p T] --wait      write and wait in one request;
+                                           refuses a pane that is `blocked`
+  zmux start <session> [-p T] <command>  start it and wait until it is up
 
   -p chooses the pane: N its position in the current window, @N its id (which
      never moves), a name it reported, or `current` for the pane you are in.
@@ -441,14 +444,64 @@ fn main() -> Result<()> {
             // After `-p`, so `run -p 2 --paste ...` reads the way it is
             // written. A prompt for a TUI goes in as ONE block, or every
             // newline in it submits a fragment.
-            let (paste, rest) = match rest.first().map(String::as_str) {
-                Some("--paste") => (true, &rest[1..]),
-                _ => (false, rest),
-            };
+            // Flags, in any order, before the text. Anything else is text -
+            // a prompt is arbitrary and must not have its first word eaten
+            // because it happened to start with a dash.
+            let (mut paste, mut wait) = (false, false);
+            let (mut until, mut timeout_ms, mut react_ms) = (None, 120_000u32, 5_000u32);
+            let mut rest = rest;
+            while let Some((first, tail)) = rest.split_first() {
+                let flag = first.as_str();
+                let value = |what: &str| -> Result<String> {
+                    tail.first()
+                        .cloned()
+                        .with_context(|| format!("{what} needs a value\n{RUN_USAGE}"))
+                };
+                match flag {
+                    "--paste" => paste = true,
+                    "--wait" => wait = true,
+                    "--until" => {
+                        let name = value("--until")?;
+                        until = Some(parse_until_name(&name)?);
+                    }
+                    "--timeout" => {
+                        timeout_ms = value("--timeout")?.parse().context(RUN_USAGE)?;
+                    }
+                    "--react" => {
+                        react_ms = value("--react")?.parse().context(RUN_USAGE)?;
+                    }
+                    _ => break,
+                }
+                rest = if matches!(flag, "--paste" | "--wait") { tail } else { &tail[1..] };
+            }
+            if until.is_some() && !wait {
+                bail!("--until needs --wait\n{RUN_USAGE}");
+            }
             if rest.is_empty() {
-                bail!("usage: zmux {} <session> [-p T] [--paste] <text>", args[0]);
+                bail!("{RUN_USAGE}");
             }
             let data = unescape(&rest.join(" "));
+
+            // Writing and waiting as ONE request. Two cannot do it: the
+            // second could only read the pane after the first had already
+            // written, so a pane that reacted and settled in between looks
+            // like one that never heard.
+            if wait {
+                if !enter {
+                    bail!("--wait is for `run`; `keys` sends no Enter, so there is \
+                           nothing for the pane to react to\n{RUN_USAGE}");
+                }
+                let target = pane.unwrap_or(Target::Focused);
+                let msg = ClientMsg::Submit {
+                    target,
+                    data,
+                    paste,
+                    until: until.unwrap_or(Until::Settled),
+                    timeout_ms,
+                    react_ms,
+                };
+                return print_waited(request(&session, &msg)?);
+            }
             // No `-p` still means `Input`, not `InputAt { Focused }`. The two
             // differ: `Input` snaps the pane back to live output, because it
             // stands in for the user typing. A `-p` write is background work
@@ -468,6 +521,67 @@ fn main() -> Result<()> {
             };
             print_info(request(&session, &msg)?)?;
             return Ok(());
+        }
+        // Start something in a pane and wait until it says it is there.
+        //
+        // The two halves a caller gets wrong on its own: refusing a pane
+        // that is not at a prompt (the command would be typed INTO whatever
+        // is running), and waiting for the thing to come up rather than
+        // returning the instant the text was written.
+        Some("start") => {
+            let session = session_arg(&args, "start")?;
+            let (pane, rest) = take_pane(&args[2..])?;
+            let (mut timeout_ms, mut rest) = (30_000u32, rest);
+            while let Some(("--timeout", tail)) = rest.split_first().map(|(f, t)| (f.as_str(), t)) {
+                timeout_ms = tail
+                    .first()
+                    .with_context(|| format!("--timeout needs a value\n{START_USAGE}"))?
+                    .parse()
+                    .context(START_USAGE)?;
+                rest = &tail[1..];
+            }
+            if rest.is_empty() {
+                bail!("{START_USAGE}");
+            }
+            let target = pane.unwrap_or(Target::Focused);
+
+            // A pane running something is not a pane you can start something
+            // in: the command line would be typed into whatever has the
+            // foreground. herdr refuses the same case, by asking the OS what
+            // the foreground process is; this asks the pane, which said so
+            // itself through shell integration and costs no process lookup.
+            let info = match request(&session, &ClientMsg::Query(Query::Info))? {
+                ServerMsg::Info(i) => i,
+                other => bail!("unexpected reply: {other:?}"),
+            };
+            let id = match &target {
+                Target::Id(id) => *id,
+                _ => info.focus_id,
+            };
+            if let Some(p) = info.panes.iter().find(|p| p.id == id) {
+                if p.busy {
+                    bail!(
+                        "pane @{id} is running `{}` - it is not at a prompt, so the \
+                         command would be typed into that instead. Wait for it, or \
+                         make a pane with `send {session} split-v-bg`.",
+                        p.command.as_deref().unwrap_or("something")
+                    );
+                }
+            }
+
+            let msg = ClientMsg::Submit {
+                target,
+                data: unescape(&rest.join(" ")),
+                paste: false,
+                // Not a STATE: agents come up in different ones - `idle` for
+                // one, `working` for another that greets you - and an
+                // opinion about which would be a list to maintain. Having
+                // said anything at all is the thing they have in common.
+                until: Until::Reported,
+                timeout_ms,
+                react_ms: timeout_ms,
+            };
+            return print_waited(request(&session, &msg)?);
         }
         Some("capture") => {
             let session = session_arg(&args, "capture")?;
@@ -512,6 +626,9 @@ usage: zmux wait <session> [-p T] --until <what> [--timeout MS] [--settle MS]
                        something the command prints at the END - a pane can
                        out-produce that window between two polls
           bell         the pane rings the bell
+          reported     the pane reports ANYTHING - the wait for whether it
+                       heard you, which a state cannot express: an agent
+                       saying `working` twice changed no state but reacted
 
   --timeout MS   default 120000. The daemon caps this; at the cap you are
                  told `timeout` and can ask again.
@@ -570,6 +687,7 @@ fn wait(args: &[String]) -> Result<()> {
                     "settled" => (Until::Settled, 2),
                     "quiet" => (Until::Quiet, 2),
                     "bell" => (Until::Bell, 2),
+                    "reported" => (Until::Reported, 2),
                     "quiet-for" => (
                         Until::QuietFor(value(2)?.parse().context("quiet-for takes ms")?),
                         3,
@@ -595,7 +713,14 @@ fn wait(args: &[String]) -> Result<()> {
     let target = pane.unwrap_or(Target::Focused);
 
     let msg = ClientMsg::Wait { target, until, timeout_ms, settle_ms };
-    let reply = request(&session, &msg)?;
+    print_waited(request(&session, &msg)?)
+}
+
+/// Print a `Waited` reply and set the exit status from its outcome.
+///
+/// Shared by `wait` and `run --wait` so the two cannot drift into answering
+/// differently about the same thing.
+fn print_waited(reply: ServerMsg) -> Result<()> {
     let ServerMsg::Waited { outcome, info } = reply else {
         bail!("unexpected reply: {reply:?}");
     };
@@ -617,6 +742,64 @@ fn wait(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// One `--until` word, without the arguments the two compound forms take.
+///
+/// `run --wait --until` accepts only the bare conditions: `output TEXT` and
+/// `quiet-for MS` would need a second word, and a flag that sometimes eats
+/// the next argument and sometimes does not is how a prompt loses its first
+/// word. Those two stay on `wait`, which is parsing positionally anyway.
+fn parse_until_name(name: &str) -> Result<Until> {
+    Ok(match name {
+        "settled" => Until::Settled,
+        "quiet" => Until::Quiet,
+        "bell" => Until::Bell,
+        "reported" => Until::Reported,
+        _ => match PaneState::parse(name) {
+            Some(st) => Until::State(st),
+            None => bail!(
+                "'{name}' is not something `run --wait` can wait for - it takes \
+                 settled, quiet, bell, reported or a state. For `output TEXT` or \
+                 `quiet-for MS`, use `zmux wait`."
+            ),
+        },
+    })
+}
+
+const START_USAGE: &str = "\
+usage: zmux start <session> [-p T] [--timeout MS] <command...>
+
+Types the command into a pane and waits until that pane REPORTS something,
+so a caller knows the thing is up rather than merely launched. Default
+timeout 30000.
+
+Refused if the pane is already running something: the text would go into
+that instead of the shell. Make a pane first with `send <session> split-v-bg`.
+
+`reported` rather than a particular state, because agents come up in
+different ones and zmux has no opinion about which. An agent that reports
+nothing at all will time out here - for those, use `run` and `wait
+--until quiet-for MS`.";
+
+const RUN_USAGE: &str = "\
+usage: zmux run <session> [-p T] [--paste] [--wait [--until W] [--timeout MS]
+                                              [--react MS]] <text>
+       zmux keys <session> [-p T] [--paste] <text>
+
+  --paste   send it as ONE block, so a multi-line prompt is one submission
+            rather than one per line. Only if the program asked for pastes.
+  --wait    write and wait in ONE request, which two commands cannot do: a
+            separate wait can only read the pane AFTER the write, so a pane
+            that reacted and settled in between looks like one that never
+            heard. Defaults to --until settled.
+  --react   how long to give the pane to REACT before calling it stalled.
+            Default 5000. `stalled` is not `timeout`: it means nothing
+            happened at all, which is a different problem - though the text
+            WAS written either way, so do not just send it again.
+  --timeout how long to wait once it has reacted. Default 120000.
+
+A pane that reported `blocked` is refused before anything is written: it is
+waiting for an answer to its own question, and a prompt would answer that.";
 
 /// The escape a pane writes to say what it is doing.
 ///
@@ -1381,6 +1564,7 @@ mod tests {
                 Until::Bell => "bell",
                 Until::QuietFor(_) => "quiet-for",
                 Until::Output(_) => "output",
+                Until::Reported => "reported",
                 Until::State(_) => "idle",
             }
         }
@@ -1390,6 +1574,7 @@ mod tests {
             Until::Bell,
             Until::QuietFor(0),
             Until::Output(String::new()),
+            Until::Reported,
             Until::State(PaneState::Idle),
         ] {
             let w = until_word(&u);

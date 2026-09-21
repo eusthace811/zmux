@@ -239,6 +239,40 @@ what it looks like.
   Pass `--settle 0` only when the pane is already working on the thing you
   are waiting for.
 
+## Start something, and prompt it
+
+```bash
+zmux start <session> -p @7 "ampere"                    # waits until it is up
+zmux run <session> -p @7 --paste --wait "<prompt>"     # writes and waits
+```
+
+`start` refuses a pane that is already running something - the command would
+be typed into that instead of the shell - and returns only once the pane has
+**reported** something, so the thing is up rather than merely launched. An
+agent that reports nothing will time out; for those use `run` then
+`wait --until quiet-for MS`.
+
+`run --wait` writes and waits in ONE request. Do not do it as two: a separate
+wait can only read the pane after your write, so a pane that reacted and
+settled in between looks like one that never heard you. Defaults to
+`--until settled`; `--react MS` (default 5000) is how long the pane has to
+react before the answer is `stalled`.
+
+| outcome | what it means |
+| --- | --- |
+| `met` | the condition came true |
+| `timeout` | still going. Ask again |
+| `stalled` | it never reacted at all. **The text was still written** |
+| `replaced` | the agent you were watching exited. The pane is still there |
+| `gone` | the pane itself went away |
+
+`stalled` and `timeout` are different problems, and neither means nothing was
+written - do not blindly send the prompt again. Read the pane first.
+
+A pane that reported `blocked` is **refused before anything is written**: it
+is waiting for an answer to its own question, and a prompt would answer that
+instead. Read it, decide, then use `keys` deliberately.
+
 ## Read a pane's output
 
 ```bash

@@ -1149,6 +1149,80 @@ per-pane subscriber registry this section already declined. A caller waits
 for something printed at the END of a command, which is what "it finished"
 looks like anyway.
 
+### Driving another agent: the six things a caller cannot do itself
+
+§12 gave a caller the pieces. Reading herdr's `agent.*` surface against them
+showed six places where the pieces do not compose, and every one of them is a
+thing the DAEMON has to do because a caller physically cannot.
+
+**Write and wait as one request.** Between an `InputAt` and a `Wait` a caller
+has no way to say "compare against the reading from before my write" - it can
+only read the pane afterwards, and a pane that reacted and settled again in
+between is indistinguishable from one that never heard. `Submit` holds both
+halves. The guarantee is structural and **is not pinned by a test**: inside
+the daemon the before- and after-readings are microseconds apart and no pane
+can react between them, so moving the reading later leaves the suite green.
+The window it closes is two client round trips wide and nothing can make a
+reaction land inside it on purpose. What IS tested is the pair of things a
+caller genuinely cannot do for itself, below.
+
+**Refuse a pane that reported `blocked`.** `blocked` means the agent has
+stopped to ask something. A prompt sent now answers ITS question, and there
+is no undo. Refused before a byte is written, as herdr does.
+
+**Say `stalled` rather than `timeout`.** A prompt that provoked nothing is a
+different failure from one still being worked on, with a different fix.
+Neither means nothing was written - the text went out either way, so a blind
+retry sends it twice.
+
+**Say `replaced` when the agent has gone but the pane has not.** Counted from
+claims that DIED, not from `133;D`, and the difference is the whole point:
+the rcfile emits `D` from PROMPT_COMMAND on **every prompt** - deliberately,
+because being at a prompt is being idle - so an idle shell would look like it
+was losing a process at every keystroke. This is the same trap as reading
+`133;C` as "a command started", which used to wipe an agent's own report once
+per message. **OSC 133 says where the shell IS, not only what just happened
+to it.** Checked only AFTER the condition, so a wait for `quiet` or for
+`unknown` - both of which a command ending satisfies - still answers `Met`.
+
+**`Until::Reported`.** "Did it hear me", which no state can express: an agent
+that says `working` twice changes nothing and has plainly reacted. It is also
+how `start` knows an agent is up without holding an opinion about which state
+it comes up in - `idle` for one, `working` for another that greets you. An
+enum of those would be a list to maintain, which is the thing §12 exists to
+avoid.
+
+**`start` refuses a pane that is busy.** The command line would be typed into
+whatever holds the foreground. herdr asks the OS for the foreground process;
+this asks the pane, which already said so through shell integration - the
+same answer without the process lookup that §0.2's neighbour rules out.
+
+### Enter, and when it is its own write
+
+A pasted prompt's Enter now goes in a **separate write, 300ms later**. Plain
+text keeps it in the same write.
+
+The two cases differ. Into a shell, one write is atomic and right: the line is
+read whole and nothing can interleave. Into a program that asked for bracketed
+paste, the paste is an **event** - a text box collects it, places the cursor,
+usually redraws - and a `\r` arriving in the same read is consumed as part of
+that event, so the prompt lands in the box and is never sent.
+
+This reverses the earlier reasoning here, which was that a redraw between the
+two writes could LOSE the Enter. A redraw is what the beat is for. herdr
+reached the same split against twenty real agents - its agent prompt waits
+300ms, its `pane run` concatenates - and that is evidence of a kind this
+project cannot generate for itself, so it wins over the argument.
+
+**Not demonstrated by a test, and the test says so.** `bash` is not a text
+box: it reads the line whichever way the bytes arrive, so the one-write
+version passes too. Proving the benefit needs a real TUI agent.
+
+The Enter is a literal `\r` rather than a mode-dependent encoding, because
+vt100 0.16.2 does not track the kitty keyboard protocol and there is nothing
+better to know here. herdr can encode through the pane's own key mode because
+its engine reports it.
+
 ### Reading history without the screen jumping
 
 `capture` could only ever return the visible rows, and the skill said so as a

@@ -153,6 +153,21 @@ pub struct Signals {
     /// one - and lost one again after every command boundary, since
     /// `forget_reports` puts the counter back.
     pub report_seq: Option<u64>,
+    /// How many reports this pane has had ACCEPTED, ever.
+    ///
+    /// Only ever compared against a value read earlier, like `bells`. It is
+    /// what lets a wait ask "has this pane said anything since I started
+    /// watching" - which is a different question from "is it working now",
+    /// and the right one for a gate. A pane that reports `working` twice in
+    /// a row changes no state but has plainly reacted.
+    pub reports: u32,
+    /// How many times a CLAIM has died in this pane.
+    ///
+    /// Not how many commands have ended: `133;D` arrives on every prompt,
+    /// so that would count an idle shell. This counts the transitions that
+    /// actually took something away - the agent that was here having gone -
+    /// which is what a waiter needs to know it is watching a ghost.
+    pub generation: u32,
 }
 
 impl Signals {
@@ -169,6 +184,10 @@ impl Signals {
             }
             self.report_seq = Some(seq);
         }
+        // Counted whether or not anything CHANGED. "It said something" and
+        // "it said something new" are different questions, and the gate
+        // wants the first one.
+        self.reports = self.reports.saturating_add(1);
         let mut changed = false;
         if let Some(state) = r.state {
             changed |= self.state != state;
@@ -194,6 +213,25 @@ impl Signals {
     /// brackets the command, so every report an agent makes arrives strictly
     /// between the two, and when the second one lands the agent is gone.
     fn forget_reports(&mut self) {
+        // Counted only when there WAS something to forget.
+        //
+        // `133;D` is not "a process ended". The rcfile emits it from
+        // PROMPT_COMMAND on EVERY prompt - deliberately, and it says so:
+        // being at a prompt IS being idle, so it re-asserts that even when a
+        // `;C` was lost. Pressing Enter on an empty line sends one. Counting
+        // every call would make an idle shell look like it was losing a
+        // process at every keystroke.
+        //
+        // This is the same trap as reading `;C` as "a command started",
+        // which threw away an agent's own report once per message. The
+        // marker says where the shell IS, not only what just happened to it.
+        // What actually died is a CLAIM, so that is what gets counted.
+        if self.state != crate::protocol::PaneState::Unknown
+            || self.agent.is_some()
+            || self.name.is_some()
+        {
+            self.generation = self.generation.saturating_add(1);
+        }
         self.state = crate::protocol::PaneState::Unknown;
         self.agent = None;
         self.name = None;
@@ -201,6 +239,19 @@ impl Signals {
         // whichever number it starts from.
         self.report_seq = None;
     }
+}
+
+/// The five things a wait looks at, and nothing that allocates.
+///
+/// Every field is compared against a reading taken when the wait began -
+/// none is meaningful as a level. See `Session::pane_status`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WaitSignals {
+    pub state: crate::protocol::PaneState,
+    pub busy: bool,
+    pub bells: u32,
+    pub reports: u32,
+    pub generation: u32,
 }
 
 /// What a pane is doing. One lock, every fact the bar and `info` need.
@@ -476,11 +527,17 @@ impl Term {
     /// The saving is small in absolute terms and that is not the point: the
     /// whole reason `Session::pane_status` exists instead of `info()` is to
     /// be the cheap question, and it was not being one.
-    pub fn wait_signals(&self) -> (crate::protocol::PaneState, bool, u32) {
+    pub fn wait_signals(&self) -> WaitSignals {
         match self.signals.lock() {
-            Ok(s) => (s.state, s.busy, s.bells),
+            Ok(s) => WaitSignals {
+                state: s.state,
+                busy: s.busy,
+                bells: s.bells,
+                reports: s.reports,
+                generation: s.generation,
+            },
             // Same answer `activity()` gives a poisoned lock: nothing known.
-            Err(_) => (crate::protocol::PaneState::Unknown, false, 0),
+            Err(_) => WaitSignals::default(),
         }
     }
 
@@ -746,7 +803,8 @@ mod tests {
         ] {
             t.parser.process(feed);
             let a = t.activity();
-            assert_eq!(t.wait_signals(), (a.state, a.busy, a.bells), "after {feed:?}");
+            let w = t.wait_signals();
+            assert_eq!((w.state, w.busy, w.bells), (a.state, a.busy, a.bells), "after {feed:?}");
         }
     }
 }

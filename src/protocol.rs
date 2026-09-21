@@ -134,6 +134,27 @@ pub enum ClientMsg {
     /// it would cost a wire bump and every running session, to save two
     /// match arms and a four-line wrapper - so it stays, as ballast rather
     /// than as compatibility.
+    /// Write to a pane and wait for it to react, as ONE request.
+    ///
+    /// Two requests cannot do this. Between an `InputAt` and a `Wait` the
+    /// caller has no way to say "the reading I am comparing against is the
+    /// one from before the write" - it can only take a fresh reading, by
+    /// which time the pane may already have reacted and gone quiet again.
+    /// The daemon holds both halves, so the before-reading is exact.
+    ///
+    /// It also refuses a pane that reported `blocked`, because a prompt sent
+    /// to something waiting at an approval dialog answers the wrong
+    /// question - and does so irreversibly.
+    Submit {
+        target: Target,
+        data: Vec<u8>,
+        paste: bool,
+        until: Until,
+        timeout_ms: u32,
+        /// How long to allow for the pane to REACT before giving up on it
+        /// having heard. `Stalled` if nothing happens in this long.
+        react_ms: u32,
+    },
     InputAt {
         target: Target,
         data: Vec<u8>,
@@ -322,6 +343,14 @@ pub enum Until {
     /// The pane rings the bell. Works for a program that reports nothing,
     /// because plenty of them ring it when they stop to ask.
     Bell,
+    /// The pane has had a report ACCEPTED since the wait began.
+    ///
+    /// Not a state: a pane that says `working` twice running changes no
+    /// state but has plainly reacted, and that is what a caller wanting to
+    /// know "did my prompt land" is asking. It is also how `start` knows an
+    /// agent has come up, without an opinion about which state it comes up
+    /// in - `idle` for one agent, `working` for another that greets you.
+    Reported,
 }
 
 /// How a wait ended.
@@ -336,6 +365,26 @@ pub enum WaitOutcome {
     Timeout,
     /// The pane went away while we were waiting on it.
     Gone,
+    // --- appended. Append-only. ---
+    /// The text was written and the pane never reacted to it.
+    ///
+    /// Distinct from `Timeout` on purpose. A timeout says "it is still
+    /// going"; this says "it never started", which is a different problem
+    /// with a different fix - a prompt typed into something that was not
+    /// listening, or an agent that had already gone. herdr calls the same
+    /// outcome `agent_prompt_stalled` and reached it the same way.
+    ///
+    /// It does NOT mean nothing was written. The text went out; retrying
+    /// blind sends it twice.
+    Stalled,
+    /// The process that was in the pane when the wait began has ended.
+    ///
+    /// The PANE is still there - this is not `Gone`, which is the pane
+    /// itself going away. An agent exited and its claim died with it, so
+    /// whatever answers now is not what the caller was waiting for. Checked
+    /// only AFTER the condition, so a wait for `quiet` or for `unknown` -
+    /// both of which the command ending satisfies - still reports `Met`.
+    Replaced,
 }
 
 /// Longest text `Until::Output` will look for.

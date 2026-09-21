@@ -29,6 +29,14 @@ use crate::term::Term;
 
 use crate::config::Config;
 
+/// The beat between a pasted prompt and the Enter that submits it.
+///
+/// herdr's number, and for herdr's reason: a program that asked for
+/// bracketed paste treats the paste as an event, and an Enter arriving in
+/// the same read is consumed as part of it. Only applied behind a real
+/// paste - see `write_to`.
+const SUBMIT_DELAY_MS: u64 = 300;
+
 /// How long a `Wait` may actually block.
 ///
 /// A wait holds one of the daemon's connection threads, so the CALLER does
@@ -45,6 +53,11 @@ pub struct PaneStatus {
     pub state: PaneState,
     pub busy: bool,
     pub bells: u32,
+    /// Accepted reports, ever. See `term::WaitSignals`.
+    pub reports: u32,
+    /// Foreground commands ENDED, ever. A change means the process that was
+    /// here when the wait started has gone.
+    pub generation: u32,
     pub quiet_ms: u64,
 }
 
@@ -502,13 +515,39 @@ impl Session {
                 None => return Ok(false),
             }
         };
-        let payload = crate::paste::wrap(data, paste && bracketed, enter);
+        let bracketed = paste && bracketed;
+        let payload = crate::paste::wrap(data, bracketed, enter && !bracketed);
         if payload.len() > MAX_INPUT_BYTES {
             bail!("input of {} bytes exceeds MAX_INPUT_BYTES once wrapped", payload.len());
         }
         // Lock released before writing: a blocked write must not stall the
         // whole session.
         pty.write_input(&payload)?;
+
+        // Enter goes SEPARATELY, after a beat, but only behind a real paste.
+        //
+        // The two cases genuinely differ. Into a shell, text and newline in
+        // one write is atomic and right: the line is read whole, and a split
+        // would let something else interleave between them. Into a program
+        // that asked for bracketed paste, the paste is an EVENT - a text box
+        // collects it, decides where the cursor goes, and often redraws -
+        // and a `\r` arriving in the same read is swallowed as part of that
+        // event, so the prompt lands in the box and is never submitted.
+        //
+        // herdr splits for exactly this case and no other: its agent prompt
+        // waits 300ms between the two, while `pane run` concatenates them
+        // into one buffer. Same conclusion, reached against twenty real
+        // agents rather than from first principles, which is why the earlier
+        // reasoning here - that a redraw in between could LOSE the Enter -
+        // is not the one that wins. A redraw is what the beat is for.
+        if bracketed && enter {
+            std::thread::sleep(std::time::Duration::from_millis(SUBMIT_DELAY_MS));
+            // `\r`, not a mode-dependent encoding. vt100 0.16.2 does not
+            // track the kitty keyboard protocol, so there is nothing better
+            // to know here; herdr can do better because its engine reports
+            // the mode. Said plainly rather than guessed at.
+            pty.write_input(b"\r")?;
+        }
         Ok(true)
     }
 
@@ -521,8 +560,15 @@ impl Session {
     pub fn pane_status(&self, id: PaneId) -> Option<PaneStatus> {
         let panes = lock(&self.panes);
         let p = panes.get(&id)?;
-        let (state, busy, bells) = lock(&p.term).wait_signals();
-        Some(PaneStatus { state, busy, bells, quiet_ms: p.pty.quiet_ms() })
+        let w = lock(&p.term).wait_signals();
+        Some(PaneStatus {
+            state: w.state,
+            busy: w.busy,
+            bells: w.bells,
+            reports: w.reports,
+            generation: w.generation,
+            quiet_ms: p.pty.quiet_ms(),
+        })
     }
 
     /// Why a pane that has just died could not start, if that is what

@@ -399,6 +399,36 @@ fn serve_control(
                 }
                 None => ServerMsg::Refused { reason: unknown(session, &target) },
             },
+            // Write and wait, as one request. See `ClientMsg::Submit`.
+            ClientMsg::Submit { target, data, paste, until, timeout_ms, react_ms } => {
+                match session.resolve(&target) {
+                    None => ServerMsg::Refused { reason: unknown(session, &target) },
+                    Some(id) => match session.pane_status(id) {
+                        None => ServerMsg::Refused { reason: gone(session, &target) },
+                        // A pane at an approval dialog is not idle, it is
+                        // ASKING. Typing a prompt at it answers whatever
+                        // question is on screen, which is not the question
+                        // the caller meant and is not undoable. herdr
+                        // refuses the same case before writing a byte.
+                        Some(b) if b.state == PaneState::Blocked => ServerMsg::Refused {
+                            reason: "pane reported `blocked` - it is waiting for an answer to \
+                                     its own question, so a prompt would answer that instead. \
+                                     Read it, then use `keys` deliberately."
+                                .into(),
+                        },
+                        Some(before) => match session.write_to(id, &data, paste, true) {
+                            Ok(true) => {
+                                let outcome = wait_from(
+                                    session, id, &until, timeout_ms, react_ms, before, true,
+                                );
+                                ServerMsg::Waited { outcome, info: session.info() }
+                            }
+                            Ok(false) => ServerMsg::Refused { reason: gone(session, &target) },
+                            Err(e) => ServerMsg::Refused { reason: e.to_string() },
+                        },
+                    },
+                }
+            }
             ClientMsg::Wait { target, until, timeout_ms, settle_ms } => {
                 match session.resolve(&target) {
                     Some(id) => {
@@ -467,16 +497,40 @@ fn wait_for(
     timeout_ms: u32,
     settle_ms: u32,
 ) -> WaitOutcome {
+    // Read once up front, so every signal can be compared against "when the
+    // wait began" rather than tested as a level.
+    let Some(start) = session.pane_status(id) else { return WaitOutcome::Gone };
+    wait_from(session, id, until, timeout_ms, settle_ms, start, false)
+}
+
+/// The loop, with the before-reading supplied.
+///
+/// `Submit` passes the reading it took BEFORE it wrote, which is the whole
+/// reason writing and waiting are one request: a caller doing them as two
+/// can only read the pane AFTER its own write, by which time the pane may
+/// already have reacted and gone quiet again, and the reaction is invisible.
+///
+/// `stall` turns "the gate elapsed and the pane never reacted" from an open
+/// gate into `Stalled`. A plain `Wait` does not want that - nobody wrote
+/// anything, so there is nothing for the pane to react TO - but a `Submit`
+/// does, because a prompt that provoked nothing is a different failure from
+/// one still being worked on.
+fn wait_from(
+    session: &Arc<Session>,
+    id: PaneId,
+    until: &Until,
+    timeout_ms: u32,
+    settle_ms: u32,
+    start: zmux::session::PaneStatus,
+    stall: bool,
+) -> WaitOutcome {
     let capped = zmux::session::capped_wait(timeout_ms, session.cfg.wait_timeout_max_ms);
     let deadline = std::time::Instant::now() + Duration::from_millis(capped);
     // The gate never outlives the wait itself, or asking to settle for longer
     // than the timeout would test the condition exactly never.
-    let gate = std::time::Instant::now()
-        + Duration::from_millis(u64::from(settle_ms).min(capped));
+    let gate =
+        std::time::Instant::now() + Duration::from_millis(u64::from(settle_ms).min(capped));
     let mut active = settle_ms == 0;
-    // Read once up front, so `Until::Bell` means "rings from here on" rather
-    // than "has ever rung".
-    let Some(start) = session.pane_status(id) else { return WaitOutcome::Gone };
     loop {
         let Some(now) = session.pane_status(id) else { return WaitOutcome::Gone };
         // A pane whose shell has exited stops changing, so the layout is the
@@ -484,23 +538,26 @@ fn wait_for(
         if !session.pane_lives(id) {
             return WaitOutcome::Gone;
         }
-        // The pane has started doing something, so the condition is now
-        // about THIS command rather than the state before it.
+        // The pane has done something SINCE THE START. Every signal is a
+        // comparison, never a level: an agent is one long foreground
+        // command, so `busy` is set before most waits even begin, and read
+        // as a level it opened the gate on the first poll of every agent
+        // wait - measured at 96us - handing back the state from before the
+        // prompt.
         //
-        // Every signal is measured AGAINST `start`, never as a level. An
-        // agent is one long foreground command, so `133;C` set `busy` when
-        // it started and it stays set for the agent's whole life: read as a
-        // level, `busy` opened the gate on the first poll for precisely the
-        // pane this gate exists to protect, and the wait was answered by the
-        // state from before the prompt. Having been busy since before the
-        // wait began is not something that has happened since.
-        //
-        // `bells` was already compared this way, which is why it was the one
-        // signal that behaved. The other two now match it.
-        active |= (now.busy && !start.busy)
+        // `reports` is the exact one, and the reason it is a count rather
+        // than a state: a pane that says `working` twice running changes no
+        // state but has plainly heard you.
+        active |= now.reports > start.reports
+            || (now.busy && !start.busy)
             || (now.state == PaneState::Working && start.state != PaneState::Working)
-            || now.bells > start.bells
-            || std::time::Instant::now() >= gate;
+            || now.bells > start.bells;
+        if !active && std::time::Instant::now() >= gate {
+            if stall {
+                return WaitOutcome::Stalled;
+            }
+            active = true;
+        }
         let met = active
             && match until {
                 Until::Quiet => !now.busy,
@@ -508,6 +565,7 @@ fn wait_for(
                 Until::Settled => now.state.is_settled(),
                 Until::QuietFor(ms) => now.quiet_ms >= u64::from(*ms),
                 Until::Bell => now.bells > start.bells,
+                Until::Reported => now.reports > start.reports,
                 // Against the scrollback-backed read, so a match that has
                 // left the VISIBLE screen is still found. Not one that has
                 // left the last `RECENT_LINES_DEFAULT` lines: a pane can
@@ -521,6 +579,13 @@ fn wait_for(
             };
         if met {
             return WaitOutcome::Met;
+        }
+        // AFTER the condition, never before. A foreground command ending is
+        // what bumps `generation`, and it is also what satisfies `quiet` and
+        // `unknown` - so a caller waiting for either of those must get `Met`
+        // for the very event that would otherwise read as a replacement.
+        if now.generation != start.generation {
+            return WaitOutcome::Replaced;
         }
         if std::time::Instant::now() >= deadline {
             return WaitOutcome::Timeout;
@@ -741,6 +806,7 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     | ClientMsg::Query(_)
                     | ClientMsg::InputTo { .. }
                     | ClientMsg::InputAt { .. }
+                    | ClientMsg::Submit { .. }
                     | ClientMsg::Report { .. }
                     | ClientMsg::Wait { .. } => {}
                 }

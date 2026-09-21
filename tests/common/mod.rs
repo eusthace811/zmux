@@ -95,6 +95,20 @@ impl Daemon {
     /// `info().panes` spans every window, so this filters. A test that means
     /// "the visible layout" must say so, or creating a window silently
     /// changes what it is asserting.
+    /// Run the real `zmux` binary against this session and collect it.
+    ///
+    /// The control messages the other helpers send are the wire; this is the
+    /// COMMAND LINE, which is a separate thing a caller can get wrong - flag
+    /// parsing, exit status, what goes to stderr. `start` in particular is
+    /// almost entirely CLI: its refusal and its readiness wait live there.
+    pub fn cli(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_zmux"))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run zmux")
+    }
+
     pub fn panes(&self) -> usize {
         panes_in_current(&Control::open(&self.session).info())
     }
