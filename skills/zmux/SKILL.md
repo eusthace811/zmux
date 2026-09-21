@@ -226,7 +226,11 @@ what it looks like.
 - `--settle` defaults to 1.5s and exists for a race you will otherwise hit on
   your first try: run a command and wait for `quiet` immediately, and the
   shell has not read the line yet, so you get the quiet **before** your
-  command. Pass `--settle 0` only when the pane is already working.
+  command. The gate measures what has changed **since the wait began**, so
+  it works for an agent too: an agent holds the foreground for its whole
+  life, and a pane that was already busy does not count as having started.
+  Pass `--settle 0` only when the pane is already working on the thing you
+  are waiting for.
 
 ## Read a pane's output
 
