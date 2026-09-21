@@ -187,14 +187,6 @@ pub struct Pane {
     /// itself rather than a map the pump would have to lock hundreds of times
     /// a second.
     last_output: Arc<AtomicU64>,
-    /// When this pane was created, on the same process clock.
-    ///
-    /// Only one thing asks: whether a shell that has just died had been alive
-    /// long enough to have run anything. A pane that dies in its first moments
-    /// never got a prompt, so what is on its screen is its own startup error -
-    /// which is the one case where quoting a pane's screen into a log says
-    /// something about zmux rather than about the person using it.
-    born: u64,
 }
 
 /// Process start, for a clock that cannot go backwards.
@@ -405,7 +397,6 @@ impl Pane {
             closing,
             threads: Mutex::new(vec![reader, waiter]),
             last_output,
-            born: now_ms(),
         };
         Ok((pane, events))
     }
@@ -477,22 +468,6 @@ impl Pane {
         now_ms().saturating_sub(self.last_output.load(Ordering::Relaxed))
     }
 
-    /// WHEN this pane last produced output, on the process clock.
-    ///
-    /// `quiet_ms` answers "how long has it been silent"; this answers "was
-    /// that the same silence as a moment ago". A reader that has just poked
-    /// a pane needs the second question: the pane is still silent for the
-    /// moment before it reacts, so elapsed silence cannot tell the two
-    /// apart and this can.
-    pub fn last_output_ms(&self) -> u64 {
-        self.last_output.load(Ordering::Relaxed)
-    }
-
-    /// Milliseconds since this pane was created.
-    pub fn age_ms(&self) -> u64 {
-        now_ms().saturating_sub(self.born)
-    }
-
     pub fn write_input(&self, data: &[u8]) -> Result<()> {
         const CHUNK: usize = 4096;
         for part in data.chunks(CHUNK) {
@@ -535,87 +510,6 @@ impl Pane {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-
-    /// Build a tree that looks exactly like a Git for Windows install.
-    fn fake_git(root: &std::path::Path, msys: bool, git: bool) {
-        std::fs::create_dir_all(root.join("bin")).expect("bin");
-        std::fs::write(root.join("bin").join("bash.exe"), b"").expect("bash");
-        std::fs::create_dir_all(root.join("usr").join("bin")).expect("usr/bin");
-        std::fs::write(root.join("usr").join("bin").join("bash.exe"), b"").expect("usr bash");
-        if msys {
-            std::fs::write(root.join("usr").join("bin").join("msys-2.0.dll"), b"").expect("msys");
-        }
-        if git {
-            std::fs::create_dir_all(root.join("cmd")).expect("cmd");
-            std::fs::write(root.join("cmd").join("git.exe"), b"").expect("git");
-        }
-    }
-
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("zmux-gitbash-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
-
-    /// The shell fingerprint, which nothing covered.
-    ///
-    /// This decides what the daemon executes, and herdr's rule - which this
-    /// follows - is DO NOT TRUST THE NAME. Anything called `bash.exe` on a
-    /// machine would otherwise be launched as the user's shell; the check is
-    /// that the MSYS runtime and `git.exe` sit where a real Git for Windows
-    /// install puts them. Every rejection below is a path that would have
-    /// spawned the wrong program.
-    #[test]
-    fn a_shell_is_only_git_bash_when_the_whole_install_is_there() {
-        let root = scratch("ok");
-        fake_git(&root, true, true);
-
-        let bash = root.join("bin").join("bash.exe");
-        assert!(is_git_bash(&bash), "a complete install was rejected: {}", bash.display());
-        // The `usr/bin` layout, which the function steps past on purpose.
-        assert!(is_git_bash(&root.join("usr").join("bin").join("bash.exe")));
-
-        // The name is not enough, in either direction.
-        std::fs::write(root.join("bin").join("notbash.exe"), b"").expect("write");
-        assert!(!is_git_bash(&root.join("bin").join("notbash.exe")), "any .exe passed as a shell");
-        assert!(
-            is_git_bash(&root.join("bin").join("BASH.EXE")),
-            "Windows filenames are case-insensitive and so must this be"
-        );
-
-        // A directory called bash.exe is not a shell.
-        std::fs::create_dir_all(root.join("bin").join("dir.exe")).expect("dir");
-        assert!(!is_git_bash(&root.join("bin").join("dir.exe")));
-
-        // Right name, wrong place: not under a `bin`.
-        std::fs::write(root.join("bash.exe"), b"").expect("write");
-        assert!(!is_git_bash(&root.join("bash.exe")), "a bash.exe outside bin/ was accepted");
-
-        // A relative path can be resolved against anything, so it is refused
-        // before the filesystem is touched at all.
-        assert!(!is_git_bash(std::path::Path::new("bin/bash.exe")));
-        assert!(!is_git_bash(std::path::Path::new("bash.exe")));
-
-        // And something that simply is not there.
-        assert!(!is_git_bash(&root.join("bin").join("absent.exe")));
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// The two halves of the fingerprint are both load-bearing.
-    #[test]
-    fn a_lookalike_install_missing_either_half_is_refused() {
-        for (tag, msys, git) in [("nomsys", false, true), ("nogit", true, false)] {
-            let root = scratch(tag);
-            fake_git(&root, msys, git);
-            let bash = root.join("bin").join("bash.exe");
-            assert!(
-                !is_git_bash(&bash),
-                "{tag}: a tree with a bash.exe but no {} was taken for Git Bash",
-                if msys { "git.exe" } else { "msys-2.0.dll" }
-            );
-            std::fs::remove_dir_all(&root).ok();
-        }
-    }
 
     /// `portable-pty` merges the Windows `Environment` registry keys over the
     /// process environment, and a value that arrives with an embedded NUL

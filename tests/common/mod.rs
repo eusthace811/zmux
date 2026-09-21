@@ -62,17 +62,11 @@ impl Daemon {
         // Null ALL of the daemon's stdio. Inheriting the harness's pipes means
         // the daemon - and every bash it spawns - holds them open, so cargo
         // waits forever for output that never ends.
-        //
-        // Except stderr, when ZMUX_TEST_LOG names a directory: the daemon
-        // explains every pane it could not spawn or had to drop, and with
-        // stderr nulled that explanation was unreachable - a suite that went
-        // red under parallel load could only be guessed at. A FILE, never an
-        // inherited pipe, so the "cargo waits forever" rule still holds.
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_zmuxd"))
             .arg(session)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(daemon_log(session))
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn zmuxd");
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -95,20 +89,6 @@ impl Daemon {
     /// `info().panes` spans every window, so this filters. A test that means
     /// "the visible layout" must say so, or creating a window silently
     /// changes what it is asserting.
-    /// Run the real `zmux` binary against this session and collect it.
-    ///
-    /// The control messages the other helpers send are the wire; this is the
-    /// COMMAND LINE, which is a separate thing a caller can get wrong - flag
-    /// parsing, exit status, what goes to stderr. `start` in particular is
-    /// almost entirely CLI: its refusal and its readiness wait live there.
-    pub fn cli(&self, args: &[&str]) -> std::process::Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_zmux"))
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("run zmux")
-    }
-
     pub fn panes(&self) -> usize {
         panes_in_current(&Control::open(&self.session).info())
     }
@@ -159,29 +139,6 @@ impl Daemon {
         let mut c = self.attach(cols, rows);
         assert!(c.wait_for(20, |t| t.contains('$')).is_some(), "no shell prompt appeared");
         c
-    }
-}
-
-/// Where the daemon's stderr goes: nowhere, unless `ZMUX_TEST_LOG` names a
-/// directory to collect it in.
-fn daemon_log(session: &str) -> std::process::Stdio {
-    let Ok(dir) = std::env::var("ZMUX_TEST_LOG") else {
-        return std::process::Stdio::null();
-    };
-    let dir = std::path::PathBuf::from(dir);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return std::process::Stdio::null();
-    }
-    // APPENDED, not truncated. The restart tests start a second daemon under
-    // the same session name on purpose, and the interesting half is usually
-    // what the FIRST one said on its way out.
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(format!("{session}.log")))
-    {
-        Ok(f) => std::process::Stdio::from(f),
-        Err(_) => std::process::Stdio::null(),
     }
 }
 
@@ -429,20 +386,6 @@ impl Control {
             lines: 0,
             source: zmux::protocol::Source::Screen,
         };
-        match self.ask(&ClientMsg::Query(q)) {
-            ServerMsg::Capture { text } => text,
-            other => panic!("expected Capture, got {other:?}"),
-        }
-    }
-
-    /// `capture_at` with a source and a line count.
-    pub fn capture_source(
-        &mut self,
-        target: zmux::protocol::Target,
-        lines: u16,
-        source: zmux::protocol::Source,
-    ) -> String {
-        let q = zmux::protocol::Query::CaptureAt { target, lines, source };
         match self.ask(&ClientMsg::Query(q)) {
             ServerMsg::Capture { text } => text,
             other => panic!("expected Capture, got {other:?}"),

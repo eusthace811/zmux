@@ -18,24 +18,21 @@ use anyhow::{bail, Result};
 use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::windows::{Closed, Windows};
 use crate::protocol::{
-    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, PaneState, ServerMsg, SessionInfo, Source,
-    Target, MAX_INPUT_BYTES, MAX_PANES, RECENT_LINES_DEFAULT,
+    clamp_size, Frame, MouseIn, MouseKind, PaneInfo, ServerMsg, SessionInfo, Source, Target,
+    MAX_INPUT_BYTES, MAX_PANES,
 };
 
+/// How much history a `Recent` read returns when the caller named no count.
+///
+/// Enough to hold an agent's last answer, small enough that omitting `-n` is
+/// not a way to ask for the entire scrollback by accident.
+const DEFAULT_RECENT_LINES: usize = 200;
 use crate::pty::{Pane, PtyEvent};
 use crate::persist::{self, SessionSnapshot};
 use crate::render::{composite, frame_from_screen, pane_area_with, status_spans, BarState, Span};
 use crate::term::Term;
 
 use crate::config::Config;
-
-/// The beat between a pasted prompt and the Enter that submits it.
-///
-/// herdr's number, and for herdr's reason: a program that asked for
-/// bracketed paste treats the paste as an event, and an Enter arriving in
-/// the same read is consumed as part of it. Only applied behind a real
-/// paste - see `write_to`.
-const SUBMIT_DELAY_MS: u64 = 300;
 
 /// How long a `Wait` may actually block.
 ///
@@ -50,27 +47,16 @@ pub fn capped_wait(asked_ms: u32, max_ms: u64) -> u64 {
 /// One pane's answer to "what is happening in there", cheaply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneStatus {
-    pub state: PaneState,
+    pub state: crate::protocol::PaneState,
     pub busy: bool,
     pub bells: u32,
-    /// Accepted reports, ever. See `term::WaitSignals`.
-    pub reports: u32,
-    /// Foreground commands ENDED, ever. A change means the process that was
-    /// here when the wait started has gone.
-    pub generation: u32,
     pub quiet_ms: u64,
 }
 
 /// A live session plus the channel its panes report on.
 pub type SessionHandle = (Arc<Session>, Receiver<(PaneId, PtyEvent)>);
 
-/// A pane's live halves: what it has drawn, and what is drawing it.
-///
-/// Named for what it holds rather than `PaneState`, which it used to be -
-/// `protocol::PaneState` is the state a pane REPORTS, a completely different
-/// thing, and every mention of either in this file had to be written out in
-/// full to say which one was meant.
-struct LivePane {
+struct PaneState {
     term: Arc<Mutex<Term>>,
     pty: Arc<Pane>,
 }
@@ -124,7 +110,7 @@ pub struct Session {
     pub name: String,
     /// EVERY pane in the session, whichever window shows it. Panes do not
     /// move between windows and are not suspended when a window is hidden.
-    panes: Mutex<HashMap<PaneId, LivePane>>,
+    panes: Mutex<HashMap<PaneId, PaneState>>,
     windows: Mutex<Windows>,
     clients: Mutex<Vec<Client>>,
     next_client: AtomicU64,
@@ -144,8 +130,6 @@ pub struct Session {
     /// leaving the older layout on disk. The lock is taken before the capture,
     /// not just around the write.
     save: Mutex<()>,
-    /// Held for the length of one history harvest. See `read_history`.
-    harvesting: Mutex<()>,
     /// Serialises every geometry mutation.
     ///
     /// apply_size previously read the client list, released the lock, then
@@ -156,85 +140,6 @@ pub struct Session {
     /// Pane lifecycle events, tagged with which pane they came from.
     events_tx: SyncSender<(PaneId, PtyEvent)>,
     pub cfg: Config,
-}
-
-/// One live pane, as the harvester sees it.
-///
-/// `cols`/`rows` are the shape the harvest started with. A pane that changes
-/// size mid-harvest stops being the thing that was being read - every row
-/// collected was wrapped to the old width - so it reports itself unreadable
-/// rather than carrying on.
-struct PaneScreen<'a> {
-    session: &'a Session,
-    id: PaneId,
-    cols: u16,
-    rows: u16,
-}
-
-impl crate::harvest::Screen for PaneScreen<'_> {
-    fn rows(&self) -> Option<Vec<String>> {
-        let panes = lock(&self.session.panes);
-        let p = panes.get(&self.id)?;
-        let t = lock(&p.term);
-        let screen = t.parser.screen();
-        // Only the alternate screen. A normal-screen pane HAS scrollback,
-        // so scrolling it would be an elaborate way to read what
-        // `read_recent` already returns without touching anything.
-        if !screen.alternate_screen() {
-            return None;
-        }
-        let (r, c) = screen.size();
-        if (c, r) != (self.cols, self.rows) {
-            return None;
-        }
-        Some(screen.rows(0, c).collect())
-    }
-
-    fn wheel(&self, up: bool, n: usize) -> bool {
-        let kind = if up { MouseKind::WheelUp } else { MouseKind::WheelDown };
-        // The middle of the pane. A program with a scrollable region and
-        // something else beside it decides by where the pointer is, and the
-        // middle is the likeliest part of it to be the transcript.
-        let (x, y) = (self.cols / 2, self.rows / 2);
-        let out = {
-            let panes = lock(&self.session.panes);
-            let Some(p) = panes.get(&self.id) else { return false };
-            let pty = Arc::clone(&p.pty);
-            let t = lock(&p.term);
-            let screen = t.parser.screen();
-            // No mouse reporting means the program never asked, so nothing
-            // we send can scroll it. This is the guard that keeps a harvest
-            // off a program that would receive the bytes as TEXT.
-            crate::mouse::encode(
-                screen.mouse_protocol_mode(),
-                screen.mouse_protocol_encoding(),
-                MouseIn { x, y, kind, mods: 0 },
-                x,
-                y,
-            )
-            .map(|bytes| (pty, bytes))
-        };
-        let Some((pty, bytes)) = out else { return false };
-        let mut all = Vec::with_capacity(bytes.len() * n);
-        for _ in 0..n {
-            all.extend_from_slice(&bytes);
-        }
-        pty.write_input(&all).is_ok()
-    }
-
-    fn quiet_ms(&self) -> u64 {
-        let panes = lock(&self.session.panes);
-        panes.get(&self.id).map_or(u64::MAX, |p| p.pty.quiet_ms())
-    }
-
-    fn output_mark(&self) -> u64 {
-        let panes = lock(&self.session.panes);
-        panes.get(&self.id).map_or(0, |p| p.pty.last_output_ms())
-    }
-
-    fn pause(&self) {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
 }
 
 /// Restore the pane arrangement from disk, if there is a usable one.
@@ -280,7 +185,6 @@ impl Session {
             running: Arc::new(AtomicBool::new(true)),
             revision: Arc::new(AtomicU64::new(0)),
             size: Mutex::new((cols, rows)),
-            harvesting: Mutex::new(()),
             last_published: Mutex::new(None),
             size_dirty: std::sync::atomic::AtomicBool::new(false),
             save: Mutex::new(()),
@@ -441,7 +345,7 @@ impl Session {
             t.responder.scan(chunk, cur)
         })?;
 
-        lock(&self.panes).insert(id, LivePane { term, pty: Arc::new(pty) });
+        lock(&self.panes).insert(id, PaneState { term, pty: Arc::new(pty) });
 
         // Tag this pane's events so the pump can tell them apart.
         let tx = self.events_tx.clone();
@@ -538,41 +442,14 @@ impl Session {
                 let id = PaneId::from_raw(*id);
                 lock(&self.windows).panes().contains(&id).then_some(id)
             }
-            // A name that two panes claim addresses NEITHER. Taking the
-            // first match would put a prompt into whichever pane happened to
-            // sort earlier, which is the silent wrong answer every other
-            // kind of unresolvable target is refused to avoid.
-            //
-            // Nothing prevents the duplicate: `record` is per-pane, and a
-            // report arrives on the pty reader path holding that pane's
-            // `Term` lock - it cannot go looking at its neighbours without
-            // inverting the lock order. So the check belongs here, where the
-            // locks are already taken in the right order, and it is the
-            // right place anyway: an ambiguous name is TEMPORARY. When one
-            // of the two claimants exits, `133;D` clears its claim and the
-            // name starts working again.
-            Target::Name(want) => match self.named(want).as_slice() {
-                [only] => Some(*only),
-                _ => None,
-            },
+            Target::Name(want) => {
+                let ids = lock(&self.windows).panes();
+                let panes = lock(&self.panes);
+                ids.into_iter().find(|id| {
+                    panes.get(id).is_some_and(|p| lock(&p.term).name().as_deref() == Some(want))
+                })
+            }
         }
-    }
-
-    /// Every live pane currently claiming `want`, in window-then-position
-    /// order.
-    ///
-    /// Public so the daemon can say how many there were: "no pane named
-    /// 'reviewer'" and "two panes are called 'reviewer'" are different
-    /// problems with different fixes, and a caller told the first when the
-    /// second is true goes looking for a pane that is right there.
-    pub fn named(&self, want: &str) -> Vec<PaneId> {
-        let ids = lock(&self.windows).panes();
-        let panes = lock(&self.panes);
-        ids.into_iter()
-            .filter(|id| {
-                panes.get(id).is_some_and(|p| lock(&p.term).name().as_deref() == Some(want))
-            })
-            .collect()
     }
 
     /// Write to a pane by id, leaving focus and the pane's scroll position
@@ -597,86 +474,14 @@ impl Session {
                 None => return Ok(false),
             }
         };
-        let bracketed = paste && bracketed;
-        let payload = crate::paste::wrap(data, bracketed, enter && !bracketed);
+        let payload = crate::paste::wrap(data, paste && bracketed, enter);
         if payload.len() > MAX_INPUT_BYTES {
             bail!("input of {} bytes exceeds MAX_INPUT_BYTES once wrapped", payload.len());
         }
         // Lock released before writing: a blocked write must not stall the
         // whole session.
         pty.write_input(&payload)?;
-
-        // Enter goes SEPARATELY, after a beat, but only behind a real paste.
-        //
-        // The two cases genuinely differ. Into a shell, text and newline in
-        // one write is atomic and right: the line is read whole, and a split
-        // would let something else interleave between them. Into a program
-        // that asked for bracketed paste, the paste is an EVENT - a text box
-        // collects it, decides where the cursor goes, and often redraws -
-        // and a `\r` arriving in the same read is swallowed as part of that
-        // event, so the prompt lands in the box and is never submitted.
-        //
-        // herdr splits for exactly this case and no other: its agent prompt
-        // waits 300ms between the two, while `pane run` concatenates them
-        // into one buffer. Same conclusion, reached against twenty real
-        // agents rather than from first principles, which is why the earlier
-        // reasoning here - that a redraw in between could LOSE the Enter -
-        // is not the one that wins. A redraw is what the beat is for.
-        if bracketed && enter {
-            std::thread::sleep(std::time::Duration::from_millis(SUBMIT_DELAY_MS));
-            // `\r`, not a mode-dependent encoding. vt100 0.16.2 does not
-            // track the kitty keyboard protocol, so there is nothing better
-            // to know here; herdr can do better because its engine reports
-            // the mode. Said plainly rather than guessed at.
-            pty.write_input(b"\r")?;
-        }
         Ok(true)
-    }
-
-    /// Read a pane's OWN history, by scrolling the application.
-    ///
-    /// Falls back to the ordinary scrollback read for every pane this cannot
-    /// safely be done to, which is most of them: one that is not on the
-    /// alternate screen has real scrollback and needs none of this, and one
-    /// that will not take the wheel, or that somebody is reading scrolled
-    /// back, must not be poked at.
-    ///
-    /// Takes NO lock for the duration. It cannot: the pane has to process
-    /// the wheel events, which happens on the reader thread, which needs the
-    /// same `Term`. Each step takes the lock, looks, and lets go.
-    pub fn read_history(&self, id: PaneId, lines: u16) -> Option<String> {
-        let plain = || self.capture_from(id, lines, Source::RecentUnwrapped);
-        // One at a time. Two harvests scrolling the same pane would each
-        // read the other's movements as the application's own and align on
-        // nonsense; two on different panes is merely pointless contention.
-        // A harvest is rare and bounded, so a caller that arrives during one
-        // gets the ordinary read rather than a queue.
-        let Ok(_busy) = self.harvesting.try_lock() else { return plain() };
-        let (cols, rows) = {
-            let panes = lock(&self.panes);
-            let p = panes.get(&id)?;
-            let t = lock(&p.term);
-            let (r, c) = t.parser.screen().size();
-            (c, r)
-        };
-        let screen = PaneScreen { session: self, id, cols, rows };
-        let want = if lines == 0 { RECENT_LINES_DEFAULT } else { lines as usize };
-        let limits = crate::harvest::Limits { lines: want, ..Default::default() };
-        match crate::harvest::harvest(&screen, limits) {
-            Some(h) => {
-                if !h.restored {
-                    // Worth saying out loud: somebody is now looking at a
-                    // screen they did not choose, and the only thing that
-                    // can explain it is this.
-                    eprintln!(
-                        "[session] pane {} could not be scrolled back to where it was",
-                        id.0
-                    );
-                }
-                Some(h.rows.join("\n"))
-            }
-            None => plain(),
-        }
     }
 
     /// Everything a wait condition needs from one pane, in one lock.
@@ -688,47 +493,13 @@ impl Session {
     pub fn pane_status(&self, id: PaneId) -> Option<PaneStatus> {
         let panes = lock(&self.panes);
         let p = panes.get(&id)?;
-        let w = lock(&p.term).wait_signals();
+        let activity = lock(&p.term).activity();
         Some(PaneStatus {
-            state: w.state,
-            busy: w.busy,
-            bells: w.bells,
-            reports: w.reports,
-            generation: w.generation,
+            state: activity.state,
+            busy: activity.busy,
+            bells: activity.bells,
             quiet_ms: p.pty.quiet_ms(),
         })
-    }
-
-    /// Why a pane that has just died could not start, if that is what
-    /// happened to it.
-    ///
-    /// A shell has one job before its first prompt, and when it cannot do it
-    /// the reason goes to the pane's screen and nowhere else - then the pane
-    /// is removed and the screen with it. The daemon was left saying only
-    /// that a pane had exited, which is the symptom; every other symptom a
-    /// caller sees (a target that stops resolving, a window that closed
-    /// itself, a focus that moved) is downstream of this one line.
-    ///
-    /// Bounded by AGE, not by the exit status alone. A pane still in its first
-    /// few seconds has not run anything, so its last line is its own startup
-    /// error - `console device allocation failure - too many consoles in use`
-    /// is the one that prompted this. An older pane's screen is the user's
-    /// work, and none of it belongs in a log.
-    fn starting_failure(&self, id: PaneId) -> Option<String> {
-        /// Long enough to cover a slow ConPTY under load, short enough that
-        /// nothing a person typed can be on screen yet.
-        const NEVER_STARTED_MS: u64 = 5_000;
-        let panes = lock(&self.panes);
-        let p = panes.get(&id)?;
-        if p.pty.age_ms() > NEVER_STARTED_MS {
-            return None;
-        }
-        let text = lock(&p.term).parser.screen().contents();
-        text.lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .map(|l| l.chars().take(crate::protocol::MAX_COMMAND_CHARS).collect())
     }
 
     /// Does this pane still exist in the layout?
@@ -760,19 +531,11 @@ impl Session {
     pub fn capture_from(&self, id: PaneId, lines: u16, source: Source) -> Option<String> {
         let panes = lock(&self.panes);
         let mut term = lock(&panes.get(&id)?.term);
-        // The application's own history is not a read at all - it is a
-        // conversation with the program - so it cannot happen under these
-        // locks. Handled before either is taken.
-        if source == Source::History {
-            drop(term);
-            drop(panes);
-            return self.read_history(id, lines);
-        }
         if source != Source::Screen {
             // 0 means "as much as you have" for the screen; for history it
             // has to mean something bounded, or a caller that omitted the
             // count gets the whole million-row buffer.
-            let want = if lines == 0 { RECENT_LINES_DEFAULT } else { lines as usize };
+            let want = if lines == 0 { DEFAULT_RECENT_LINES } else { lines as usize };
             return Some(term.read_recent(want, source == Source::RecentUnwrapped));
         }
         let text = term.parser.screen().contents();
@@ -1018,13 +781,7 @@ impl Session {
     ///
     /// A shell exiting in a background window closes that window without
     /// disturbing the one being looked at.
-    pub fn pane_exited(&self, id: PaneId, code: i32) -> bool {
-        // Before the pane goes, because its explanation goes with it.
-        if code != 0 {
-            if let Some(why) = self.starting_failure(id) {
-                eprintln!("[session] pane {} never started: {why}", id.0);
-            }
-        }
+    pub fn pane_exited(&self, id: PaneId) -> bool {
         self.remove_pane(id) == Closed::LastPane
     }
 
@@ -1339,13 +1096,7 @@ impl Session {
         let mut last = lock(&self.last_published);
         let frame = self.snapshot();
         let msg_delta = last.as_ref().and_then(|prev| frame.delta_from(prev)).map(ServerMsg::Delta);
-        // Built ONLY if somebody actually needs one. The steady state is a
-        // settled client taking deltas, and a full frame is the whole grid -
-        // cols x rows x a 16-byte cell, so 230KB at 240x60 - copied once here
-        // and again into the client's slot. Composing it unconditionally
-        // meant paying for the larger of those on every tick of a session
-        // where nothing ever asked for it.
-        let mut full: Option<ServerMsg> = None;
+        let full = ServerMsg::Frame(frame.clone());
 
         {
             let mut cs = self.lock_clients();
@@ -1362,7 +1113,7 @@ impl Session {
                     (Some(d), false) => d,
                     _ => {
                         c.needs_full = false;
-                        full.get_or_insert_with(|| ServerMsg::Frame(frame.clone()))
+                        &full
                     }
                 };
                 *slot = Some(msg.clone());

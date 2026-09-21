@@ -137,9 +137,7 @@ theirs rather than yours. When it matters, note the new pane's `id` from the
 reply and find it again by `id`, which does not move.
 
 ```bash
-# focus_id, not focus: an id is what the rule above says to hold on to, and
-# `-p @$NEW` still reaches the pane after somebody closes another one.
-NEW=$(zmux send work split-v | python -c 'import json,sys;print(json.load(sys.stdin)["focus_id"])')
+NEW=$(zmux send work split-v | python -c 'import json,sys;print(json.load(sys.stdin)["focus"])')
 ```
 
 `split-h` and `split-v` inherit the focused pane's directory and **take the
@@ -174,17 +172,10 @@ pane. It takes four things:
 | --- | --- |
 | `3` | position in the current window |
 | `@3` | pane id — the stable one, and the only one that reaches a background window |
-| `reviewer` | a name the pane claimed for itself — see below |
+| `reviewer` | a name the pane claimed for itself |
 | `current` | the pane you are running in (`$ZMUX_PANE`) |
 
 Use `@id` for anything that outlives a single command.
-
-A name is only as good as its uniqueness. Nothing stops two panes
-claiming the same one — starting the same agent script twice is enough —
-and a name two panes answer to addresses **neither**: the command is
-refused, and the refusal tells you how many claimed it. That is
-deliberate; picking one would put your prompt in the wrong agent's pane.
-It clears itself when one of them exits. `@id` cannot be claimed twice.
 
 **`--paste` for a prompt.** Anything with a text box — an agent, an editor —
 treats every newline as a submit, so a three-line prompt without `--paste`
@@ -219,7 +210,7 @@ zmux wait <session> -p @7 --until settled --timeout 120000
 | `idle` `working` `blocked` `done` | one specific reported state |
 | `quiet` | no shell command running. Right for `cargo test`; **useless for an agent**, which is one long command |
 | `quiet-for MS` | no output for that long. The honest "probably finished" for a pane that reports nothing |
-| `output TEXT` | a literal substring of the last 200 lines. Text already there matches at once; a pane that prints more than that between polls can carry a match past unseen, so wait for something printed at the END |
+| `output TEXT` | a literal substring of recent output. Text already there matches at once |
 | `bell` | the pane rang the bell |
 
 Prints the session state the wait ended with, plus `outcome`: `met`, `timeout`
@@ -233,45 +224,7 @@ what it looks like.
 - `--settle` defaults to 1.5s and exists for a race you will otherwise hit on
   your first try: run a command and wait for `quiet` immediately, and the
   shell has not read the line yet, so you get the quiet **before** your
-  command. The gate measures what has changed **since the wait began**, so
-  it works for an agent too: an agent holds the foreground for its whole
-  life, and a pane that was already busy does not count as having started.
-  Pass `--settle 0` only when the pane is already working on the thing you
-  are waiting for.
-
-## Start something, and prompt it
-
-```bash
-zmux start <session> -p @7 "ampere"                    # waits until it is up
-zmux run <session> -p @7 --paste --wait "<prompt>"     # writes and waits
-```
-
-`start` refuses a pane that is already running something - the command would
-be typed into that instead of the shell - and returns only once the pane has
-**reported** something, so the thing is up rather than merely launched. An
-agent that reports nothing will time out; for those use `run` then
-`wait --until quiet-for MS`.
-
-`run --wait` writes and waits in ONE request. Do not do it as two: a separate
-wait can only read the pane after your write, so a pane that reacted and
-settled in between looks like one that never heard you. Defaults to
-`--until settled`; `--react MS` (default 5000) is how long the pane has to
-react before the answer is `stalled`.
-
-| outcome | what it means |
-| --- | --- |
-| `met` | the condition came true |
-| `timeout` | still going. Ask again |
-| `stalled` | it never reacted at all. **The text was still written** |
-| `replaced` | the agent you were watching exited. The pane is still there |
-| `gone` | the pane itself went away |
-
-`stalled` and `timeout` are different problems, and neither means nothing was
-written - do not blindly send the prompt again. Read the pane first.
-
-A pane that reported `blocked` is **refused before anything is written**: it
-is waiting for an answer to its own question, and a prompt would answer that
-instead. Read it, decide, then use `keys` deliberately.
+  command. Pass `--settle 0` only when the pane is already working.
 
 ## Read a pane's output
 
@@ -286,7 +239,6 @@ zmux capture <session> -p @7 --source unwrapped -n 200    # a transcript
 | `screen` | the rows on screen (the default) |
 | `recent` | recent output, reaching back into scrollback |
 | `unwrapped` | the same, with lines joined where the pane was too narrow to hold them |
-| `history` | the **application's own** history, read by scrolling it |
 
 **Use `unwrapped` to read an answer.** A pane is only as wide as its share of
 the window, so long lines come back broken at that width, and those breaks are
@@ -295,24 +247,10 @@ the layout rather than the text.
 Nothing about `capture` changes what the user sees, including the scrollback
 sources: the pane's scroll position is put back before anyone can observe it.
 
-**To read a full-screen agent's answer, use `history`.** An agent draws on
-the alternate screen, which has no scrollback, so `recent` and `unwrapped`
-cannot see past what is on screen right now - measured on a real one, 100
-lines printed and 19 readable. `history` scrolls the agent itself, collects
-what it reveals, and puts its view back:
-
-```bash
-zmux capture <session> -p @7 --source history -n 200
-```
-
-It costs a second or two and it **moves that pane's view and returns it**, so
-use it to read an answer, not to poll. It quietly falls back to `unwrapped`
-when it cannot be done safely: a pane that is not a full-screen program, one
-that does not take the mouse, or one somebody is already scrolled back in.
-
-If even that does not show the whole answer, ask the agent to write it to a
-file and reply with the path, then read that file. Use this as a fallback,
-not in the first prompt.
+If a larger read still does not show the whole answer — an alternate-screen
+TUI keeps its own history that no terminal can recover — ask the agent to
+write the answer to a file and reply with the path, then read that file
+directly. Use this as a fallback, not in the first prompt.
 
 ## Agent state
 
@@ -440,14 +378,6 @@ Report that list to the user; do not kill their sessions to unblock a build.
 - **"Access is denied" during a copy** — a `zmux` process is holding the
   `.exe`.
 - **"no such session"** — `zmux attach` never creates. That is deliberate.
-- **A pane vanishes, and a `-p @id` that worked a moment ago is refused** —
-  the machine may be out of consoles. Every pane is one and Git Bash refuses
-  to start past 128 SYSTEM-WIDE, counting every other terminal and `git.exe`
-  on the machine. The shell starts and dies at once, so zmux sees an
-  ordinary exit and closes the pane. Do not retry the split in a loop; tell
-  the user to close some windows. The daemon's stderr says
-  `pane N never started: ... too many consoles in use` when this is what
-  happened.
 
 ## Where state lives
 

@@ -19,11 +19,6 @@
 #                 with LNK1561, entry point must be defined.
 #
 #   ./x test | build | release | clippy | fmt | run   (anything else -> cargo)
-#   ./x test               bounded parallelism (RUST_TEST_THREADS, default 4),
-#                          because every pane is a console and MSYS bash stops
-#                          starting at 128 of them system-wide. It says so when
-#                          that is what went wrong, instead of leaving you with
-#                          a scatter of unrelated assertion failures.
 #   ./x install [dir]      build --release and copy both binaries to dir
 #                          (default ~/bin, which Git Bash already has on PATH)
 set -euo pipefail
@@ -48,7 +43,7 @@ if [ "$HOST" = wsl ]; then
   MANIFEST="$(wslpath -w "$HERE/Cargo.toml")"
   export CARGO_TARGET_DIR="${WINHOME_W}\\.zmux-target"
   export CARGO_INCREMENTAL=0
-  export WSLENV=CARGO_TARGET_DIR:CARGO_INCREMENTAL:RUST_TEST_THREADS:ZMUX_TEST_LOG
+  export WSLENV=CARGO_TARGET_DIR:CARGO_INCREMENTAL
   RELEASE_DIR="$WINHOME_U/.zmux-target/release"
   BIN_DEFAULT="$WINHOME_U/bin"
   TASKLIST=/mnt/c/Windows/System32/tasklist.exe
@@ -131,62 +126,6 @@ case "${1:-test}" in
            else
              echo "  $RELEASE_DIR/zmux.exe"
            fi ;;
-
-  # Every integration test starts a daemon, and every pane it opens is a
-  # console. MSYS bash refuses to start once the SYSTEM has 128 of them -
-  # "console device allocation failure - too many consoles in use" - and the
-  # symptom is not an error but a pane that quietly vanishes, which surfaces
-  # as a handful of unrelated assertion failures in whichever tests were
-  # unlucky. Measured on a machine already holding ~130 consoles: 6 threads
-  # green 3/3 with no pane lost, 8 threads 0/3 with 6 lost, 12 threads 0/3
-  # with 40 lost. The suite is process-bound, not CPU-bound, so a low count
-  # costs little; set RUST_TEST_THREADS yourself to override.
-  test)    # `./x` on its own means `./x test`, so there may be nothing to
-           # shift off - and a failing `shift` under `set -e` would end the
-           # script before it ran a thing.
-           if [ "$#" -gt 0 ]; then shift; fi
-           export RUST_TEST_THREADS="${RUST_TEST_THREADS:-4}"
-           # Collect each daemon's stderr, which is the only place a lost pane
-           # explains itself. Without this the cause is unreachable.
-           # A directory the daemons can write to, and a unix path to read it
-           # back through. When the caller supplied one, keep it - but keep
-           # READING it too: an earlier version dropped the diagnosis
-           # entirely in that case, which is exactly when someone is already
-           # trying to work out what went wrong.
-           if [ -z "${ZMUX_TEST_LOG:-}" ]; then
-             logs="$(mktemp -d)"
-             trap 'rm -rf "$logs"' EXIT
-           elif [ "$HOST" = wsl ]; then
-             logs="$(wslpath -u "$ZMUX_TEST_LOG")"
-           else
-             logs="$(cygpath -u "$ZMUX_TEST_LOG")"
-           fi
-           mkdir -p "$logs"
-           if [ "$HOST" = wsl ]; then
-             export ZMUX_TEST_LOG="$(wslpath -w "$logs")"
-           else
-             export ZMUX_TEST_LOG="$(cygpath -w "$logs")"
-           fi
-           status=0
-           run_cargo test "$@" || status=$?
-           # Say WHY, not just that. A run that failed because the machine ran
-           # out of consoles is not a failing test suite, and reading it as
-           # one costs an afternoon.
-           if [ "$status" -ne 0 ]; then
-             if grep -qs 'too many consoles' "$logs"/*.log; then
-               echo "" >&2
-               echo "x: the shells in these tests could not start - Windows is out of consoles." >&2
-               echo "   MSYS bash gives up at 128 SYSTEM-WIDE, and this machine is already near it:" >&2
-               echo "     conhost.exe running now: $("$TASKLIST" 2>/dev/null | grep -ci '^conhost' || echo '?')" >&2
-               echo "   This is not a failing test. Close some terminals, or lower RUST_TEST_THREADS" >&2
-               echo "   (currently $RUST_TEST_THREADS), and run again." >&2
-             elif grep -qs 'exited with status' "$logs"/*.log; then
-               echo "" >&2
-               echo "x: panes went away during the run; their daemons said:" >&2
-               grep -hs 'exited with status' "$logs"/*.log | sort | uniq -c | sed 's/^/     /' >&2
-             fi
-           fi
-           exit "$status" ;;
 
   *)       sub="$1"; shift; run_cargo "$sub" "$@" ;;
 esac

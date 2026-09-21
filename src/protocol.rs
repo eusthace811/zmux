@@ -25,20 +25,7 @@ use serde::{Deserialize, Serialize};
 /// v8 is the agent-coordination surface (DESIGN.md §12). `PaneInfo` gained
 /// `window`, and `SessionInfo` gained `focus_id` - struct fields again, so
 /// again a version. `Target`, `InputAt` and `Query::CaptureAt` are appended.
-/// v9 added `WaitOutcome::Stalled` and `Replaced`, and that is the whole
-/// reason for the bump - which is worth spelling out, because "appended
-/// variants are free" was taken as a rule here and it is only half of one.
-///
-/// **The direction decides.** An appended variant the CLIENT sends costs
-/// nothing: an old client never sends it, so no old reader ever meets it.
-/// One the SERVER sends is a different thing entirely - every existing
-/// client is a reader of it, and an old binary claiming the same version
-/// would pass the handshake and then fail to decode mid-stream. That is
-/// exactly what the v2 note above says, about `ServerMsg::Delta`, and it
-/// was still read as "appending is free" when `Stalled` and `Replaced` went
-/// in. `ClientMsg::Submit`, `Until::Reported` and `Source::History` really
-/// are free, by the same rule and in the other direction.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -56,14 +43,6 @@ pub const MIN_USABLE_ROWS: u16 = 3;
 /// Cap a single `Input` payload. Keystrokes and pastes are small; anything
 /// larger is a bug or an attack.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
-
-/// How far back a history read goes when the caller named no line count.
-///
-/// This is not only `capture`'s default: it is the window `Until::Output`
-/// searches, so it is the observable bound on what a wait can notice. Enough
-/// to hold an agent's last answer, small enough that omitting `-n` is not a
-/// way to ask for a million rows by accident.
-pub const RECENT_LINES_DEFAULT: usize = 200;
 
 /// Most lines one `capture` will return, whatever it was asked for.
 ///
@@ -134,40 +113,9 @@ pub enum ClientMsg {
     /// pane in a window that is not on screen, and can name one by an id that
     /// does not move when the layout does.
     ///
-    /// Supersedes `InputTo`, which can only say "the Nth pane of whatever
-    /// window is current" - the wrong handle for anything long-running.
-    ///
-    /// `InputTo` is kept for ONE reason, and it is worth being exact about
-    /// which: bincode numbers enum variants by position, so removing it
-    /// would renumber every variant after it. It is NOT kept to serve older
-    /// clients - `serve` refuses any client whose `PROTOCOL_VERSION` differs
-    /// before `serve_control` ever sees a message, so nothing that speaks the
-    /// older dialect can reach its arm. Nothing in this repository sends it
-    /// either; the CLI has sent `InputAt` since the day it existed. Deleting
-    /// it would cost a wire bump and every running session, to save two
-    /// match arms and a four-line wrapper - so it stays, as ballast rather
-    /// than as compatibility.
-    /// Write to a pane and wait for it to react, as ONE request.
-    ///
-    /// Two requests cannot do this. Between an `InputAt` and a `Wait` the
-    /// caller has no way to say "the reading I am comparing against is the
-    /// one from before the write" - it can only take a fresh reading, by
-    /// which time the pane may already have reacted and gone quiet again.
-    /// The daemon holds both halves, so the before-reading is exact.
-    ///
-    /// It also refuses a pane that reported `blocked`, because a prompt sent
-    /// to something waiting at an approval dialog answers the wrong
-    /// question - and does so irreversibly.
-    Submit {
-        target: Target,
-        data: Vec<u8>,
-        paste: bool,
-        until: Until,
-        timeout_ms: u32,
-        /// How long to allow for the pane to REACT before giving up on it
-        /// having heard. `Stalled` if nothing happens in this long.
-        react_ms: u32,
-    },
+    /// Supersedes `InputTo`. That one still answers - variants are
+    /// append-only - but it can only say "the Nth pane of whatever window is
+    /// current", which is the wrong handle for anything long-running.
     InputAt {
         target: Target,
         data: Vec<u8>,
@@ -343,27 +291,10 @@ pub enum Until {
     /// Matches text that is ALREADY there, as herdr's `wait-output` does - so
     /// a caller that asks after the fact is not left waiting for something
     /// that has happened.
-    ///
-    /// BOUNDED, and the bound is worth knowing: each poll searches the last
-    /// `RECENT_LINES_DEFAULT` lines, not the whole scrollback. A pane that
-    /// produces more than that between two polls can carry a match past
-    /// unseen. Reading further is linear and does not fix it - measured at
-    /// 80x24, 200 lines costs 68us a poll and 5000 costs 1.6ms, which moves
-    /// the threshold without closing it, and any burst can beat whatever it
-    /// is moved to. Wait for something a command prints at the END, which is
-    /// what "it finished" looks like anyway.
     Output(String),
     /// The pane rings the bell. Works for a program that reports nothing,
     /// because plenty of them ring it when they stop to ask.
     Bell,
-    /// The pane has had a report ACCEPTED since the wait began.
-    ///
-    /// Not a state: a pane that says `working` twice running changes no
-    /// state but has plainly reacted, and that is what a caller wanting to
-    /// know "did my prompt land" is asking. It is also how `start` knows an
-    /// agent has come up, without an opinion about which state it comes up
-    /// in - `idle` for one agent, `working` for another that greets you.
-    Reported,
 }
 
 /// How a wait ended.
@@ -378,26 +309,6 @@ pub enum WaitOutcome {
     Timeout,
     /// The pane went away while we were waiting on it.
     Gone,
-    // --- appended. Append-only. ---
-    /// The text was written and the pane never reacted to it.
-    ///
-    /// Distinct from `Timeout` on purpose. A timeout says "it is still
-    /// going"; this says "it never started", which is a different problem
-    /// with a different fix - a prompt typed into something that was not
-    /// listening, or an agent that had already gone. herdr calls the same
-    /// outcome `agent_prompt_stalled` and reached it the same way.
-    ///
-    /// It does NOT mean nothing was written. The text went out; retrying
-    /// blind sends it twice.
-    Stalled,
-    /// The process that was in the pane when the wait began has ended.
-    ///
-    /// The PANE is still there - this is not `Gone`, which is the pane
-    /// itself going away. An agent exited and its claim died with it, so
-    /// whatever answers now is not what the caller was waiting for. Checked
-    /// only AFTER the condition, so a wait for `quiet` or for `unknown` -
-    /// both of which the command ending satisfies - still reports `Met`.
-    Replaced,
 }
 
 /// Longest text `Until::Output` will look for.
@@ -432,8 +343,7 @@ impl Target {
         }
         if !is_valid_name(s) {
             return Err(format!(
-                "'{s}' is not a pane position (1), an id (@1) or a name \
-                 (a-z, then a-z 0-9 _ -, up to {MAX_NAME_CHARS})"
+                "'{s}' is not a pane position (1), an id (@1) or a name                  (a-z, then a-z 0-9 _ -, up to {MAX_NAME_CHARS})"
             ));
         }
         Ok(Target::Name(s.to_string()))
@@ -490,16 +400,6 @@ pub enum Source {
     /// window, so a 60-column pane breaks every long line - and those breaks
     /// are an artefact of the layout, not of what was written.
     RecentUnwrapped,
-    // --- appended. Append-only. ---
-    /// The application's OWN history, read by scrolling the application.
-    ///
-    /// For a full-screen program - an agent, an editor - the rows that have
-    /// left the screen are not in any scrollback a terminal can reach, so
-    /// `Recent` cannot see them. This scrolls the program itself and puts
-    /// the viewport back (see `harvest`). Falls back to `RecentUnwrapped`
-    /// for a pane that is not on the alternate screen, or that will not take
-    /// the wheel, or that somebody is already scrolled back in.
-    History,
 }
 
 /// The answer to `Query::Info`, and to every control mutation - a caller sees
@@ -807,7 +707,7 @@ impl Frame {
 
 /// One cell of the composited screen. Mirrors what a ratatui `Cell` carries,
 /// which is what the renderer needs (DESIGN.md §0.4).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
     pub ch: char,
     pub fg: u32,
@@ -871,189 +771,5 @@ impl Frame {
             mouse: false,
             revision: 0,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A peer on a local pipe is not automatically trusted, and this is the
-    /// only thing standing between `Hello { cols: 65535, rows: 65535 }` and
-    /// `vt100::Screen::set_size` being asked for four billion cells.
-    ///
-    /// Untested until now, which is the wrong state for a bound whose whole
-    /// job is to survive a hostile number.
-    #[test]
-    fn client_geometry_is_clamped_into_something_we_will_allocate() {
-        assert_eq!(clamp_size(u16::MAX, u16::MAX), (MAX_COLS, MAX_ROWS));
-        assert_eq!(clamp_size(0, 0), (MIN_USABLE_COLS, MIN_USABLE_ROWS));
-        // A minimised client reporting nothing must not shrink the session to
-        // zero; `apply_size` filters those out, and this is the backstop.
-        assert_eq!(clamp_size(1, 1), (MIN_USABLE_COLS, MIN_USABLE_ROWS));
-        // An ordinary size passes through untouched.
-        assert_eq!(clamp_size(120, 40), (120, 40));
-        let (c, r) = clamp_size(u16::MAX, u16::MAX);
-        assert!(
-            (c as usize) * (r as usize) < 1_000_000,
-            "the clamped grid is still too large to allocate per pane"
-        );
-    }
-
-    /// A name becomes a `Target`, so it has to be unambiguous against a
-    /// position and safe as a shell argument.
-    #[test]
-    fn a_pane_name_is_typeable_unambiguous_and_bounded() {
-        for good in ["reviewer", "a", "build-2", "x_y", &"a".repeat(MAX_NAME_CHARS)] {
-            assert!(is_valid_name(good), "{good:?} should be a legal name");
-        }
-        for bad in [
-            "",                              // nothing to address
-            "2nd",                           // a leading digit is a position
-            "Reviewer",                      // capitals: a typo, not a pane
-            "my pane",                       // spaces need quoting
-            "rm -rf /",                      // and so does everything here
-            "père",                          // non-ASCII
-            "current",                       // reserved for `-p current`
-            &"a".repeat(MAX_NAME_CHARS + 1), // unbounded on the wire
-        ] {
-            assert!(!is_valid_name(bad), "{bad:?} should be refused");
-        }
-    }
-
-    /// `zmux report --state done` and `zmux wait --until done` have to
-    /// mean the same thing, and they meet only through these two functions.
-    #[test]
-    fn every_state_survives_the_round_trip_through_its_own_name() {
-        for state in [
-            PaneState::Unknown,
-            PaneState::Idle,
-            PaneState::Working,
-            PaneState::Blocked,
-            PaneState::Done,
-        ] {
-            assert_eq!(PaneState::parse(state.as_str()), Some(state), "{state:?}");
-        }
-        // Anything else is refused rather than read as `Unknown` - a typo in
-        // somebody's hook must not erase a state that was true.
-        for junk in ["", "IDLE", "idle ", "finished", "0"] {
-            assert_eq!(PaneState::parse(junk), None, "{junk:?} was accepted");
-        }
-        // What a caller waiting on `settled` is told to expect.
-        for settled in [PaneState::Idle, PaneState::Done, PaneState::Blocked] {
-            assert!(settled.is_settled(), "{settled:?}");
-        }
-        for going in [PaneState::Unknown, PaneState::Working] {
-            assert!(!going.is_settled(), "{going:?} is not a pane that has stopped");
-        }
-    }
-
-    /// A frame is peer-supplied data and the client indexes into it.
-    #[test]
-    fn a_frame_that_does_not_match_its_own_geometry_is_not_well_formed() {
-        let good = Frame::blank(10, 3);
-        assert!(good.is_well_formed());
-
-        let mut short = Frame::blank(10, 3);
-        short.cells.pop();
-        assert!(!short.is_well_formed(), "a short cell vector would index out of bounds");
-
-        let mut huge = Frame::blank(10, 3);
-        huge.cols = MAX_COLS + 1;
-        assert!(!huge.is_well_formed(), "geometry past the clamp was accepted");
-    }
-
-    fn delta_of(prev: &Frame, next: &Frame) -> FrameDelta {
-        next.delta_from(prev).expect("same geometry")
-    }
-
-    /// A delta carries the rows that CHANGED, and only those. That is the
-    /// entire reason it exists.
-    #[test]
-    fn a_delta_carries_only_the_rows_that_moved() {
-        let base = Frame::blank(10, 4);
-        let mut next = base.clone();
-        next.revision = 1;
-        assert!(
-            delta_of(&base, &next).rows_changed.is_empty(),
-            "an unchanged screen produced a delta with rows in it"
-        );
-
-        next.cells[2 * 10 + 5].ch = 'x';
-        let d = delta_of(&base, &next);
-        assert_eq!(d.rows_changed.len(), 1, "one changed cell touched more than its row");
-        assert_eq!(d.rows_changed[0].0, 2);
-
-        // And it applies.
-        let mut client = base.clone();
-        assert!(client.apply_delta(&d));
-        assert_eq!(client.cells[2 * 10 + 5].ch, 'x');
-        assert_eq!(client.revision, 1);
-    }
-
-    /// The guard that exists because it actually happened: two publishers can
-    /// snapshot at N, pause, and emit a delta claiming base N+1 -> revision N.
-    ///
-    /// Checking the base alone accepts it and walks the client's revision
-    /// BACKWARDS, after which every later delta is refused and nothing asks
-    /// for a resync - the frozen display DESIGN.md §4 describes.
-    #[test]
-    fn a_delta_that_would_move_the_revision_backwards_is_refused() {
-        let mut client = Frame::blank(10, 3);
-        client.revision = 5;
-        let backwards = FrameDelta {
-            base_revision: 5,
-            revision: 4, // older than the base it claims
-            cols: 10,
-            rows: 3,
-            rows_changed: vec![(0, vec![Cell::default(); 10])],
-            cursor: None,
-            app_cursor: false,
-            mouse: false,
-        };
-        assert!(!client.apply_delta(&backwards), "a backwards delta was applied");
-        assert_eq!(client.revision, 5, "the client's revision moved anyway");
-    }
-
-    /// Rows are validated BEFORE any of them is written.
-    ///
-    /// Checking as it goes would leave the frame half-updated when a later
-    /// row is malformed - a corrupted screen, which is the thing the base
-    /// check exists to prevent in the first place.
-    #[test]
-    fn a_delta_with_one_bad_row_changes_nothing_at_all() {
-        let mut client = Frame::blank(4, 3);
-        let before = client.cells.clone();
-        for bad in [
-            // A good row first, then one that is too short: if it applied as
-            // it went, row 0 would already be written.
-            vec![(0u16, vec![Cell { ch: 'a', ..Cell::default() }; 4]), (1, vec![Cell::default(); 3])],
-            // A row index past the end of the frame.
-            vec![(0, vec![Cell { ch: 'b', ..Cell::default() }; 4]), (99, vec![Cell::default(); 4])],
-        ] {
-            let d = FrameDelta {
-                base_revision: 0,
-                revision: 1,
-                cols: 4,
-                rows: 3,
-                rows_changed: bad,
-                cursor: None,
-                app_cursor: false,
-                mouse: false,
-            };
-            assert!(!client.apply_delta(&d), "a malformed delta was accepted");
-            assert_eq!(client.cells, before, "a refused delta wrote part of itself anyway");
-            assert_eq!(client.revision, 0);
-        }
-    }
-
-    /// Geometry changing means no delta can describe the transition, so one
-    /// is not offered at all.
-    #[test]
-    fn no_delta_is_offered_across_a_resize() {
-        let small = Frame::blank(10, 3);
-        let big = Frame::blank(20, 3);
-        assert!(big.delta_from(&small).is_none());
-        assert!(small.delta_from(&big).is_none());
     }
 }

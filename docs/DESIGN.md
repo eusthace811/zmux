@@ -1036,25 +1036,9 @@ A reported state becomes a lie the moment the process that reported it exits.
 The usual fix is a TTL, which is a guess with a number attached.
 
 OSC 133 already brackets the foreground command, and every report an agent
-makes necessarily arrives between the two. So **`133;D` clears everything the
-pane claimed**. When `D` lands, the agent is gone, and so is its state, its
-name and its agent label. No timer, no guess.
-
-`133;C` used to clear as well, on the reasoning that a new command starting
-means the last one's claims are about a dead process. Two real agents broke
-that in the first minute: pi and ampere stamp `133;A` / `133;B` / `133;C`
-around **every assistant and user message**, as zone markers so a terminal can
-jump between them (`modes/interactive/components/assistant-message.ts`). Read
-as "a command started", that wiped the agent's own report of itself once per
-message — exactly when a caller is reading it.
-
-`D` alone was always sufficient, which is the part worth remembering. Every
-`C` from a shell follows the `D` of the command before it, so the claim is
-already gone; the only `C` with no `D` in front of it is the first command in
-the pane, when there is nothing to forget. The lesson generalises: **OSC 133
-is not only a shell's vocabulary.** A TUI may use the same markers to mean
-something about its own layout, so only the marker that carries an exit status
-can be read as "a process ended".
+makes necessarily arrives between the two. So `133;C` and `133;D` both clear
+everything the pane claimed. When `D` lands, the agent is gone, and so is its
+state, its name and its agent label. No timer, no guess.
 
 A consequence worth stating: a **name lives exactly as long as the process
 that claimed it**. That is herdr's rule too, and for the same reason — a name
@@ -1108,18 +1092,6 @@ activity after a prompt.
 `without_a_settle_gate_a_wait_can_answer_about_the_wrong_moment` pins both
 halves: that the race reproduces, and that the gate closes it.
 
-Every signal the gate watches is compared **against the reading taken when
-the wait began**, never tested as a level. That distinction is the whole gate
-for an agent pane, and getting it wrong cost the feature its main use case:
-an agent is one long foreground command, so `133;C` set `busy` when it
-started and it stays set until it exits. A level test therefore opened the
-gate on the *first poll* of every agent wait — measured at 96µs — and handed
-back the state from before the prompt. `bells` had always been compared
-against `start`, which is why it was the one signal that behaved; `busy` and
-`working` now match it. `a_settle_gate_holds_for_a_pane_that_was_already_busy`
-pins it, and the shell-case test above pins that the original purpose still
-works.
-
 **The daemon caps the timeout, not the caller.** A wait holds a connection
 thread; a script that asks to wait forever and then dies leaks one until the
 daemon exits. At the ceiling the caller is told `timeout` — which it has to
@@ -1138,144 +1110,6 @@ waits out its entire timeout on the one case that actually needed a person.
 `Until::Output` takes a literal substring. A regex engine would be the tenth
 direct dependency (§6.1) on a binary this project has reasons to keep small,
 and `capture | grep` already covers what a substring cannot express.
-
-It searches the last `RECENT_LINES_DEFAULT` lines, not the whole scrollback,
-and that bound is documented rather than raised. Reading further is linear -
-measured at 80x24: 200 lines cost 68us per poll, 1000 cost 314us, 5000 cost
-1.6ms - so a larger window moves the threshold at a cost in Term-lock time
-twenty times a second, and any fast enough burst still beats it. Closing it
-properly would mean matching incrementally as output arrives, which is the
-per-pane subscriber registry this section already declined. A caller waits
-for something printed at the END of a command, which is what "it finished"
-looks like anyway.
-
-### Driving another agent: the six things a caller cannot do itself
-
-§12 gave a caller the pieces. Reading herdr's `agent.*` surface against them
-showed six places where the pieces do not compose, and every one of them is a
-thing the DAEMON has to do because a caller physically cannot.
-
-**Write and wait as one request.** Between an `InputAt` and a `Wait` a caller
-has no way to say "compare against the reading from before my write" - it can
-only read the pane afterwards, and a pane that reacted and settled again in
-between is indistinguishable from one that never heard. `Submit` holds both
-halves. The guarantee is structural and **is not pinned by a test**: inside
-the daemon the before- and after-readings are microseconds apart and no pane
-can react between them, so moving the reading later leaves the suite green.
-The window it closes is two client round trips wide and nothing can make a
-reaction land inside it on purpose. What IS tested is the pair of things a
-caller genuinely cannot do for itself, below.
-
-**Refuse a pane that reported `blocked`.** `blocked` means the agent has
-stopped to ask something. A prompt sent now answers ITS question, and there
-is no undo. Refused before a byte is written, as herdr does.
-
-**Say `stalled` rather than `timeout`.** A prompt that provoked nothing is a
-different failure from one still being worked on, with a different fix.
-Neither means nothing was written - the text went out either way, so a blind
-retry sends it twice.
-
-**Say `replaced` when the agent has gone but the pane has not.** Counted from
-claims that DIED, not from `133;D`, and the difference is the whole point:
-the rcfile emits `D` from PROMPT_COMMAND on **every prompt** - deliberately,
-because being at a prompt is being idle - so an idle shell would look like it
-was losing a process at every keystroke. This is the same trap as reading
-`133;C` as "a command started", which used to wipe an agent's own report once
-per message. **OSC 133 says where the shell IS, not only what just happened
-to it.** Checked only AFTER the condition, so a wait for `quiet` or for
-`unknown` - both of which a command ending satisfies - still answers `Met`.
-
-**`Until::Reported`.** "Did it hear me", which no state can express: an agent
-that says `working` twice changes nothing and has plainly reacted. It is also
-how `start` knows an agent is up without holding an opinion about which state
-it comes up in - `idle` for one, `working` for another that greets you. An
-enum of those would be a list to maintain, which is the thing §12 exists to
-avoid.
-
-**`start` refuses a pane that is busy.** The command line would be typed into
-whatever holds the foreground. herdr asks the OS for the foreground process;
-this asks the pane, which already said so through shell integration - the
-same answer without the process lookup that §0.2's neighbour rules out.
-
-### Enter, and when it is its own write
-
-A pasted prompt's Enter now goes in a **separate write, 300ms later**. Plain
-text keeps it in the same write.
-
-The two cases differ. Into a shell, one write is atomic and right: the line is
-read whole and nothing can interleave. Into a program that asked for bracketed
-paste, the paste is an **event** - a text box collects it, places the cursor,
-usually redraws - and a `\r` arriving in the same read is consumed as part of
-that event, so the prompt lands in the box and is never sent.
-
-This reverses the earlier reasoning here, which was that a redraw between the
-two writes could LOSE the Enter. A redraw is what the beat is for. herdr
-reached the same split against twenty real agents - its agent prompt waits
-300ms, its `pane run` concatenates - and that is evidence of a kind this
-project cannot generate for itself, so it wins over the argument.
-
-**Not demonstrated by a test, and the test says so.** `bash` is not a text
-box: it reads the line whichever way the bytes arrive, so the one-write
-version passes too. Proving the benefit needs a real TUI agent.
-
-The Enter is a literal `\r` rather than a mode-dependent encoding, because
-vt100 0.16.2 does not track the kitty keyboard protocol and there is nothing
-better to know here. herdr can encode through the pane's own key mode because
-its engine reports it.
-
-### Reading a full-screen program's own history
-
-The thing §12 could not do, and the reason the rest of it fell short of
-being usable: an agent draws on the **alternate screen**, which has no
-scrollback. Everything it has scrolled past is gone as far as the terminal
-is concerned. Measured on a real agent: 100 lines printed, **19 reachable**.
-`capture --source recent` cannot see an answer that is more than a screen
-long, which is most answers.
-
-The application still HAS those rows - it redraws them when scrolled. So the
-only way to read them is to be a user: send the wheel, photograph each
-screen, put the viewport back. `--source history` does that. herdr's version
-is `src/server/alt_screen_read.rs`, 996 lines, which is the honest measure of
-the care it takes.
-
-**This writes into somebody's live pane**, and everything in `harvest.rs` is
-shaped by that. It refuses rather than guesses; it bails to the ordinary read
-on anything it does not recognise; it spends its last budget putting the
-viewport back. The worst outcome it permits is a plain screen read. The
-outcome it must never produce is a pane left scrolled somewhere its owner did
-not put it - and when it cannot restore, it says so on the daemon's stderr,
-because nothing else could explain what happened to that screen.
-
-It declines, falling back to the ordinary read, for: a pane not on the
-alternate screen (it has real scrollback and needs none of this), one that
-never asked for the mouse (nothing sent can scroll it, and the bytes would
-arrive as TEXT), one **somebody is already scrolled back in** - probed for by
-scrolling DOWN first and checking nothing moved - and one already being
-harvested.
-
-**The step size is measured, not assumed.** How far one wheel event scrolls
-is the application's decision: three lines is common, one is usual, five
-exists. The first step sends ONE event, `merge_up` measures what it was
-worth, and the rest are sized to stay just inside a screen so consecutive
-screens always overlap. Without the overlap there is nothing to align on and
-no way to know what was skipped. An application that moves more than a whole
-screen on a single event cannot be read this way at all, and says so rather
-than inventing the gap.
-
-**Two bugs found building it, both the same bug.**
-
-`settle` waited for the pane to be QUIET after a wheel event. A pane that has
-been idle is still idle a millisecond after you poke it, so it returned
-immediately and photographed the screen from before its own event - every
-step read `Unchanged` and the harvest concluded it was already at the top.
-Quiet is not evidence of having reacted. It now waits for the redraw to
-**start** (a change in `Pane::last_output_ms`) and then to finish. This is
-the same mistake as the wait gate reading `busy` as a level, in the same
-session, in different code.
-
-And `-n` kept the wrong end. Collection runs backwards from the bottom and
-overshoots, so trimming the front threw away the newest output - the part
-somebody reading an answer came for.
 
 ### Reading history without the screen jumping
 
@@ -1313,18 +1147,6 @@ out what was in a window meant switching to it, moving the user's screen.
 `position` stays within its window, so it still means what the status bar
 shows, and `focus_id` is the handle that needs no pairing with `window`.
 
-A name **two panes claim addresses neither**. Nothing can prevent the
-duplicate at the point it is made: `record` is per-pane, and a report arrives
-on the pty reader path already holding that pane's `Term` lock, so it cannot
-go looking at its neighbours without inverting the lock order. So the check
-lives in `resolve`, where the locks are taken in the right order anyway — and
-that is the better place regardless, because an ambiguous name is
-**temporary**: when one of the two claimants exits, `133;D` clears its claim
-and the name starts working again. Refusing beats picking the lower id, which
-is how a prompt ends up in the wrong agent's pane; the refusal says how many
-panes answer to the name, because "no pane named 'reviewer'" sends somebody
-looking for a pane that is right in front of them.
-
 `-p` takes a position (`3`), an id (`@3`), a name (`reviewer`) or `current`.
 Bare digits are positions and a name may not begin with one, so the four
 cannot collide; `current` is a reserved name.
@@ -1342,47 +1164,11 @@ state. The worst a forged report can do is make a waiting caller stop waiting,
 or make a name resolve to the wrong pane — and a caller that cares holds an
 `@id`, which no report can influence.
 
-There is one place where a caller's *text* is not merely advisory, and it is
-worth naming because the defence had the bug. A prompt submitted with
-`--paste` is wrapped in `ESC[200~ … ESC[201~`, so text containing an end
-marker would close the paste early and the remainder would be typed as live
-keystrokes — the tail of somebody's prompt becoming commands in their shell.
-`paste::strip_end_marker` removes the marker for that reason.
-
-It removed it by **scanning the input**, which a payload could exploit to
-rebuild one out of the repair: `ESC[2` + `ESC[201~` + `01~` drops the middle
-marker and joins the surviving halves into a live one. The attack was handed
-its weapon by the defence. Checking the **output** after each byte fixes it
-and stays linear, because removing a suffix cannot expose a marker the same
-rule did not already remove. `no_payload_at_all_can_put_an_end_marker_in_the_body`
-pins the invariant rather than an example of it, assembling payloads out of
-marker fragments — uniform random bytes would never build one.
-
-Text with no marker in it is still handled by a plain scan, because
-reassembly needs a removal and there is nothing to remove. That is worth
-keeping rather than tidying away: at 64KB, which a prompt can be, the
-byte-wise walk costs 238µs against the scan's 22µs, and the marker-free
-case is almost always the case.
-
 The pipe's ACL is unchanged. `InputAt` reaches any pane in the session, but
 anyone who can open the pipe could already type into the focused one, so the
 trust boundary is where it was.
 
 ### Wire
-
-**v9**, and the bump is worth explaining because the rule it corrects was
-being applied wrongly here. `WaitOutcome` gained `Stalled` and `Replaced` -
-appended variants, which this section previously called free. They are not,
-and the direction is what decides.
-
-An appended variant the **client** sends costs nothing: an old client never
-sends it, so no old reader meets it. One the **server** sends is the
-opposite - every existing client is a reader of it, and an old binary
-claiming the same version passes the handshake and then fails to decode
-mid-stream. The note on v2 says exactly this about `ServerMsg::Delta`, and
-it was still read as "appending is free" when these two went in.
-`ClientMsg::Submit`, `Until::Reported` and `Source::History` genuinely are
-free, by the same rule pointing the other way.
 
 v8. `PaneInfo` gained `window`, `state`, `agent`, `name`, `quiet_ms`, `bells`
 and `title`; `SessionInfo` gained `focus_id` and `created`. Struct fields, so
@@ -1396,117 +1182,6 @@ One trap worth recording, because it fails silently: **do not put
 through the `Serialize` impl, so a skipped field is skipped *on the wire*, and
 the decoder then reads the next field's bytes as this one. `SessionInfo::created`
 is a plain `Option` and shows as `null` in JSON for that reason.
-
-### Does the lock discipline survive a flooding pane?
-
-The §12 workload is one agent polling `info`, or sitting in a `wait`, while
-the pane beside it floods. Both sides want the same `Term` locks: the pump
-takes them to compose, `info` and `capture` take them to read. If the order
-in §2 were wrong, or a lock were held across a pty write, this is where it
-would show - as a control caller starved behind the frame loop.
-
-Measured on the target machine against a flat-out producer, microseconds:
-
-| | quiet p50/p90/max | flooding p50/p90/max |
-| --- | --- | --- |
-| `info` | 26 / 34 / 114 | 33 / 44 / 97 |
-| `capture` | 51 / 63 / 81 | 92 / 102 / 589 |
-
-A flood costs a control caller about a third more on `info` and under double
-on `capture`. The worst single call in the run was 589µs. **No convoy, no
-starvation**: an agent can poll at 20Hz next to a pane producing as fast as
-Windows will carry it and never wait a millisecond.
-
-Session start to first control reply is **56ms**, and teardown **51ms** —
-both dominated by spawning and tearing down the first ConPTY, and both far
-below anything a person notices.
-
-`a_control_caller_is_not_starved_by_a_flooding_pane` keeps this true. It
-asserts on p50 at 300x the measured value, because it is not trying to pin
-33µs - that would fail on a busy machine for no reason. It is trying to
-catch the SHAPE: a lock held across a compose or a write puts a control
-caller behind the 16ms frame interval. Verified by holding the pane map
-across the composite, which takes `info` to 20.9ms at p50 and fails it.
-
-### A known gap: the backwards-delta race has no regression test
-
-`publish()` holds `last_published` across compose-derive-send because two
-publishers composing concurrently could commit in the opposite order: the
-loser derives a delta from a base the winner has already moved past, the
-client refuses it, nothing repairs the base, and the screen freezes on the
-last frame that applied. It was found live, by switching windows while a
-pane was producing output.
-
-**Nothing in the suite would catch it coming back.** That is worth writing
-down rather than leaving for someone to discover by assuming otherwise.
-Moving the compose back outside the lock leaves every test green, including
-`switching_windows_under_load_does_not_freeze_the_display`, which is named
-for what it does check rather than for this.
-
-Three shapes were tried. A **flood masks it**: the client's slot stays
-occupied, so `coalescing` forces a full frame, and a full frame repairs the
-very chain the race breaks — the bug needs a client that is keeping up and
-genuinely taking deltas. **Paced output** is the right shape, but `sleep` on
-MSYS is a process at ~7ms a call, so a loop long enough to race across runs
-for minutes, and a short one never hit the window. The window is the few tens
-of microseconds between `snapshot()` returning and the lock being taken, and
-no arrangement of shell commands can aim at it.
-
-Closing it properly would mean a seam in `publish()` that a test can block
-on — injecting a pause between compose and commit — which is production code
-existing for a test. Worth doing if this area is ever touched again; not
-worth doing speculatively. Until then the guard is the comment, and the
-comment is why it is three paragraphs long.
-
-### What a frame costs, and what was not done about it
-
-Measured on the target machine, release build, dense screens, four panes —
-`examples/perf.rs` reproduces all of it:
-
-| | 80x24 | 160x44 | 240x60 |
-| --- | --- | --- | --- |
-| `frame_from_screen`, one pane | 30µs | 111µs | **228µs** |
-| `composite`, frames already built | 9.6µs | 9.6µs | 14µs |
-| `delta_from`, nothing moved | 1.6µs | 5.8µs | 12µs |
-| `delta_from`, full redraw | 1.4µs | 3.3µs | 6.2µs |
-
-Two things in that table are worth reading twice.
-
-**The composite is one function.** Building the per-pane frames is 94% of it;
-the blit and the layout arithmetic together are 14µs. Any work spent on
-compositing that is not spent on `frame_from_screen` is spent on the wrong
-thing.
-
-**A delta costs more when nothing moved than when everything did.** An
-unchanged row must be compared to the end before it can be called unchanged,
-while a changed one differs at the first cell and short-circuits — so the
-copy is cheaper than the proof. It is not a bug and it does not need fixing;
-it is worth knowing because it means the steady state is the expensive one,
-and it inverts the intuition that would otherwise guide an optimization here.
-
-`Cell` now derives `Copy`. It is fourteen bytes of plain data and always was,
-and the derive lets `to_vec` reach its memcpy specialisation and removes a
-per-cell `clone` from the blit: 8% off the settled delta, 18% off a full
-redraw, one word of source.
-
-**Per-pane frame caching was considered and rejected.** `snapshot()` rebuilds
-every pane's frame on every publish, so a session with one busy pane and
-three idle ones pays for all four. Keying a cache on the pty reader's
-`last_output` stamp would skip the idle ones — but the key would also have to
-carry the scroll offset and the size, because `set_scrollback` and a resize
-both change what `screen()` shows without a byte arriving. Miss one of those
-and a pane freezes on screen, which is the failure this file spends three
-paragraphs of `publish()` guarding against elsewhere. The whole path is
-230µs at 60fps — **1.4% of one core** — and `publish()` already returns
-immediately when no client is attached, which is the entire headless-agent
-case §12 exists for. A cache whose failure mode is a frozen pane is not worth
-1.4% of a core.
-
-Going below that would mean going around vt100: `contents()` validates UTF-8
-per cell and there is no slice accessor. The one optimisation its public API
-does allow — guarding on `has_contents()` — was measured earlier at 5% slower
-on dense screens and 6% faster on sparse ones, and rejected for depending on
-the content rather than the code.
 
 ### What this deliberately does not do
 

@@ -15,8 +15,7 @@ use interprocess::TryClone as _;
 use zmux::ipc;
 use zmux::layout::{Dir, Nav, PaneId};
 use zmux::protocol::{
-    Cmd, ClientMsg, PaneState, Query, ServerMsg, Source, Target, Until, WaitOutcome,
-    PROTOCOL_VERSION,
+    Cmd, ClientMsg, Query, ServerMsg, Source, Target, Until, WaitOutcome, PROTOCOL_VERSION,
 };
 use zmux::pty::PtyEvent;
 use zmux::session::{Outbound, Session};
@@ -144,17 +143,9 @@ fn pump(session: Arc<Session>, events: std::sync::mpsc::Receiver<(PaneId, PtyEve
         match events.recv_timeout(FRAME_INTERVAL) {
             Ok((_, PtyEvent::Output(_))) => dirty = true,
             Ok((id, PtyEvent::Exited(code))) => {
-                // Say so. A pane going away is the one lifecycle event the
-                // daemon used to perform in silence, and it is the one that
-                // needs explaining: every symptom downstream - a refused
-                // target, a window that closed itself, a focus that moved -
-                // is this line's consequence, and without it the cause was
-                // unreachable. Spawn failures have always been logged; this
-                // is the other half.
-                eprintln!("[zmuxd] pane {} exited with status {code}", id.0);
                 // Only the LAST pane exiting ends the session; otherwise the
                 // pane is removed and the survivors reclaim its space.
-                if session.pane_exited(id, code) {
+                if session.pane_exited(id) {
                     session.broadcast(&ServerMsg::PaneExited { code });
                     session.shutdown();
                     return;
@@ -383,10 +374,10 @@ fn serve_control(
                 match session.resolve(&target) {
                     Some(id) => match session.write_to(id, &data, paste, enter) {
                         Ok(true) => ServerMsg::Info(session.info()),
-                        Ok(false) => ServerMsg::Refused { reason: gone(session, &target) },
+                        Ok(false) => ServerMsg::Refused { reason: gone(&target) },
                         Err(e) => ServerMsg::Refused { reason: e.to_string() },
                     },
-                    None => ServerMsg::Refused { reason: unknown(session, &target) },
+                    None => ServerMsg::Refused { reason: unknown(&target) },
                 }
             }
             // A pane saying what it is doing. Refused for a target that
@@ -397,45 +388,15 @@ fn serve_control(
                     session.report(id, &report);
                     ServerMsg::Info(session.info())
                 }
-                None => ServerMsg::Refused { reason: unknown(session, &target) },
+                None => ServerMsg::Refused { reason: unknown(&target) },
             },
-            // Write and wait, as one request. See `ClientMsg::Submit`.
-            ClientMsg::Submit { target, data, paste, until, timeout_ms, react_ms } => {
-                match session.resolve(&target) {
-                    None => ServerMsg::Refused { reason: unknown(session, &target) },
-                    Some(id) => match session.pane_status(id) {
-                        None => ServerMsg::Refused { reason: gone(session, &target) },
-                        // A pane at an approval dialog is not idle, it is
-                        // ASKING. Typing a prompt at it answers whatever
-                        // question is on screen, which is not the question
-                        // the caller meant and is not undoable. herdr
-                        // refuses the same case before writing a byte.
-                        Some(b) if b.state == PaneState::Blocked => ServerMsg::Refused {
-                            reason: "pane reported `blocked` - it is waiting for an answer to \
-                                     its own question, so a prompt would answer that instead. \
-                                     Read it, then use `keys` deliberately."
-                                .into(),
-                        },
-                        Some(before) => match session.write_to(id, &data, paste, true) {
-                            Ok(true) => {
-                                let outcome = wait_from(
-                                    session, id, &until, timeout_ms, react_ms, before, true,
-                                );
-                                ServerMsg::Waited { outcome, info: session.info() }
-                            }
-                            Ok(false) => ServerMsg::Refused { reason: gone(session, &target) },
-                            Err(e) => ServerMsg::Refused { reason: e.to_string() },
-                        },
-                    },
-                }
-            }
             ClientMsg::Wait { target, until, timeout_ms, settle_ms } => {
                 match session.resolve(&target) {
                     Some(id) => {
                         let outcome = wait_for(session, id, &until, timeout_ms, settle_ms);
                         ServerMsg::Waited { outcome, info: session.info() }
                     }
-                    None => ServerMsg::Refused { reason: unknown(session, &target) },
+                    None => ServerMsg::Refused { reason: unknown(&target) },
                 }
             }
             ClientMsg::Query(Query::Info) => ServerMsg::Info(session.info()),
@@ -445,7 +406,7 @@ fn serve_control(
                     .and_then(|id| session.capture_from(id, lines, source))
                 {
                     Some(text) => ServerMsg::Capture { text },
-                    None => ServerMsg::Refused { reason: unknown(session, &target) },
+                    None => ServerMsg::Refused { reason: unknown(&target) },
                 }
             }
             ClientMsg::Query(Query::Capture { pane, lines }) => {
@@ -497,40 +458,16 @@ fn wait_for(
     timeout_ms: u32,
     settle_ms: u32,
 ) -> WaitOutcome {
-    // Read once up front, so every signal can be compared against "when the
-    // wait began" rather than tested as a level.
-    let Some(start) = session.pane_status(id) else { return WaitOutcome::Gone };
-    wait_from(session, id, until, timeout_ms, settle_ms, start, false)
-}
-
-/// The loop, with the before-reading supplied.
-///
-/// `Submit` passes the reading it took BEFORE it wrote, which is the whole
-/// reason writing and waiting are one request: a caller doing them as two
-/// can only read the pane AFTER its own write, by which time the pane may
-/// already have reacted and gone quiet again, and the reaction is invisible.
-///
-/// `stall` turns "the gate elapsed and the pane never reacted" from an open
-/// gate into `Stalled`. A plain `Wait` does not want that - nobody wrote
-/// anything, so there is nothing for the pane to react TO - but a `Submit`
-/// does, because a prompt that provoked nothing is a different failure from
-/// one still being worked on.
-fn wait_from(
-    session: &Arc<Session>,
-    id: PaneId,
-    until: &Until,
-    timeout_ms: u32,
-    settle_ms: u32,
-    start: zmux::session::PaneStatus,
-    stall: bool,
-) -> WaitOutcome {
     let capped = zmux::session::capped_wait(timeout_ms, session.cfg.wait_timeout_max_ms);
     let deadline = std::time::Instant::now() + Duration::from_millis(capped);
     // The gate never outlives the wait itself, or asking to settle for longer
     // than the timeout would test the condition exactly never.
-    let gate =
-        std::time::Instant::now() + Duration::from_millis(u64::from(settle_ms).min(capped));
+    let gate = std::time::Instant::now()
+        + Duration::from_millis(u64::from(settle_ms).min(capped));
     let mut active = settle_ms == 0;
+    // Read once up front, so `Until::Bell` means "rings from here on" rather
+    // than "has ever rung".
+    let Some(start) = session.pane_status(id) else { return WaitOutcome::Gone };
     loop {
         let Some(now) = session.pane_status(id) else { return WaitOutcome::Gone };
         // A pane whose shell has exited stops changing, so the layout is the
@@ -538,26 +475,12 @@ fn wait_from(
         if !session.pane_lives(id) {
             return WaitOutcome::Gone;
         }
-        // The pane has done something SINCE THE START. Every signal is a
-        // comparison, never a level: an agent is one long foreground
-        // command, so `busy` is set before most waits even begin, and read
-        // as a level it opened the gate on the first poll of every agent
-        // wait - measured at 96us - handing back the state from before the
-        // prompt.
-        //
-        // `reports` is the exact one, and the reason it is a count rather
-        // than a state: a pane that says `working` twice running changes no
-        // state but has plainly heard you.
-        active |= now.reports > start.reports
-            || (now.busy && !start.busy)
-            || (now.state == PaneState::Working && start.state != PaneState::Working)
-            || now.bells > start.bells;
-        if !active && std::time::Instant::now() >= gate {
-            if stall {
-                return WaitOutcome::Stalled;
-            }
-            active = true;
-        }
+        // The pane has started doing something, so the condition is now
+        // about THIS command rather than the state before it.
+        active |= now.busy
+            || now.state == zmux::protocol::PaneState::Working
+            || now.bells > start.bells
+            || std::time::Instant::now() >= gate;
         let met = active
             && match until {
                 Until::Quiet => !now.busy,
@@ -565,27 +488,17 @@ fn wait_from(
                 Until::Settled => now.state.is_settled(),
                 Until::QuietFor(ms) => now.quiet_ms >= u64::from(*ms),
                 Until::Bell => now.bells > start.bells,
-                Until::Reported => now.reports > start.reports,
-                // Against the scrollback-backed read, so a match that has
-                // left the VISIBLE screen is still found. Not one that has
-                // left the last `RECENT_LINES_DEFAULT` lines: a pane can
-                // out-produce that between two polls, and reading further
-                // costs linearly without closing the gap. Text already there
-                // matches immediately, deliberately - a caller asking after
-                // the fact must not wait for something that has happened.
+                // Against the scrollback-backed read, so a match that
+                // scrolls past between two polls is still found. Text
+                // already on screen matches immediately, deliberately: a
+                // caller asking after the fact must not be left waiting for
+                // something that has happened.
                 Until::Output(text) => session
                     .capture_from(id, 0, Source::RecentUnwrapped)
                     .is_some_and(|s| s.contains(text.as_str())),
             };
         if met {
             return WaitOutcome::Met;
-        }
-        // AFTER the condition, never before. A foreground command ending is
-        // what bumps `generation`, and it is also what satisfies `quiet` and
-        // `unknown` - so a caller waiting for either of those must get `Met`
-        // for the very event that would otherwise read as a replacement.
-        if now.generation != start.generation {
-            return WaitOutcome::Replaced;
         }
         if std::time::Instant::now() >= deadline {
             return WaitOutcome::Timeout;
@@ -599,28 +512,19 @@ fn wait_from(
 /// Named back at the caller in their own words - `@7`, `reviewer`, `3` - so
 /// the message says which of their arguments was wrong, rather than making
 /// them guess which pane the daemon thought they meant.
-fn unknown(session: &Session, t: &Target) -> String {
+fn unknown(t: &Target) -> String {
     match t {
         Target::Focused => "no focused pane".into(),
         Target::Position(p) => format!("no pane at position {p} in the current window"),
         Target::Id(id) => format!("no pane with id @{id}"),
-        // A name resolves to nothing for two opposite reasons, and telling
-        // someone their name is unknown when in fact TWO panes answer to it
-        // sends them looking for a pane that is right in front of them.
-        Target::Name(n) => match session.named(n).len() {
-            0 => format!("no pane named '{n}'"),
-            k => format!(
-                "{k} panes are named '{n}', so the name addresses none of them; \
-                 use @id, which cannot be claimed twice"
-            ),
-        },
+        Target::Name(n) => format!("no pane named '{n}'"),
     }
 }
 
 /// The pane resolved and then exited before the write landed. A different
 /// answer from `unknown`: the caller's target was right, it is just too late.
-fn gone(session: &Session, t: &Target) -> String {
-    format!("{} - it exited before the write landed", unknown(session, t))
+fn gone(t: &Target) -> String {
+    format!("{} - it exited before the write landed", unknown(t))
 }
 
 fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) -> Result<()> {
@@ -806,7 +710,6 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                     | ClientMsg::Query(_)
                     | ClientMsg::InputTo { .. }
                     | ClientMsg::InputAt { .. }
-                    | ClientMsg::Submit { .. }
                     | ClientMsg::Report { .. }
                     | ClientMsg::Wait { .. } => {}
                 }

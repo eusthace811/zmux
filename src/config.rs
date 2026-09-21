@@ -130,18 +130,6 @@ impl Config {
         if self.idle_timeout_hours == 0 {
             self.idle_timeout_hours = d.idle_timeout_hours;
         }
-        // Zero here reads like "no cap" and means the opposite: the deadline
-        // is already past when the wait starts, so every `zmux wait`
-        // returns `timeout` immediately and the feature is off with nothing
-        // said. Somebody writing 0 meant "do not limit me", so give them the
-        // limit rather than the silence.
-        if self.wait_timeout_max_ms == 0 {
-            eprintln!(
-                "[zmux] wait_timeout_max_ms = 0 would time out every wait at once; using {}",
-                d.wait_timeout_max_ms
-            );
-            self.wait_timeout_max_ms = d.wait_timeout_max_ms;
-        }
         self
     }
 
@@ -280,20 +268,6 @@ mod tests {
         let c = c.sanitised();
         assert!(c.scrollback <= 1_000_000, "unbounded scrollback is a memory leak");
         assert!(c.idle_timeout_hours > 0);
-    }
-
-    /// `wait_timeout_max_ms = 0` reads like "no cap" and means the exact
-    /// opposite: every wait is already past its deadline on the first poll,
-    /// so `zmux wait` returns `timeout` instantly, forever, and nothing
-    /// anywhere says why. It is the same trap as `idle_timeout_hours`, which
-    /// is guarded two lines above it.
-    #[test]
-    fn a_zero_wait_cap_does_not_silently_disable_every_wait() {
-        let c = Config { wait_timeout_max_ms: 0, ..Default::default() }.sanitised();
-        assert!(
-            c.wait_timeout_max_ms > 0,
-            "a zero cap makes every wait time out at once"
-        );
     }
 
     #[test]

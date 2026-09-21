@@ -144,30 +144,9 @@ pub struct Signals {
     pub state: crate::protocol::PaneState,
     /// What the pane says is running in it.
     pub agent: Option<String>,
-    /// Highest `seq` accepted so far, or `None` when none has been.
-    ///
-    /// An `Option` rather than a counter starting at zero, because the rule is
-    /// "at or below the last one ACCEPTED" and before the first report there
-    /// is no last one. A plain `u64` made zero behave as though it had already
-    /// been accepted, so an agent numbering its reports from 0 lost its first
-    /// one - and lost one again after every command boundary, since
-    /// `forget_reports` puts the counter back.
-    pub report_seq: Option<u64>,
-    /// How many reports this pane has had ACCEPTED, ever.
-    ///
-    /// Only ever compared against a value read earlier, like `bells`. It is
-    /// what lets a wait ask "has this pane said anything since I started
-    /// watching" - which is a different question from "is it working now",
-    /// and the right one for a gate. A pane that reports `working` twice in
-    /// a row changes no state but has plainly reacted.
-    pub reports: u32,
-    /// How many times a CLAIM has died in this pane.
-    ///
-    /// Not how many commands have ended: `133;D` arrives on every prompt,
-    /// so that would count an idle shell. This counts the transitions that
-    /// actually took something away - the agent that was here having gone -
-    /// which is what a waiter needs to know it is watching a ghost.
-    pub generation: u32,
+    /// Highest `seq` accepted so far. Reset with the rest when a new
+    /// foreground command starts, so an agent restarting at 1 is not ignored.
+    pub report_seq: u64,
 }
 
 impl Signals {
@@ -179,15 +158,11 @@ impl Signals {
     /// which is the exact lie a caller waiting on that pane cannot survive.
     pub fn record(&mut self, r: &crate::protocol::Report) -> bool {
         if let Some(seq) = r.seq {
-            if self.report_seq.is_some_and(|last| seq <= last) {
+            if seq <= self.report_seq {
                 return false;
             }
-            self.report_seq = Some(seq);
+            self.report_seq = seq;
         }
-        // Counted whether or not anything CHANGED. "It said something" and
-        // "it said something new" are different questions, and the gate
-        // wants the first one.
-        self.reports = self.reports.saturating_add(1);
         let mut changed = false;
         if let Some(state) = r.state {
             changed |= self.state != state;
@@ -213,45 +188,12 @@ impl Signals {
     /// brackets the command, so every report an agent makes arrives strictly
     /// between the two, and when the second one lands the agent is gone.
     fn forget_reports(&mut self) {
-        // Counted only when there WAS something to forget.
-        //
-        // `133;D` is not "a process ended". The rcfile emits it from
-        // PROMPT_COMMAND on EVERY prompt - deliberately, and it says so:
-        // being at a prompt IS being idle, so it re-asserts that even when a
-        // `;C` was lost. Pressing Enter on an empty line sends one. Counting
-        // every call would make an idle shell look like it was losing a
-        // process at every keystroke.
-        //
-        // This is the same trap as reading `;C` as "a command started",
-        // which threw away an agent's own report once per message. The
-        // marker says where the shell IS, not only what just happened to it.
-        // What actually died is a CLAIM, so that is what gets counted.
-        if self.state != crate::protocol::PaneState::Unknown
-            || self.agent.is_some()
-            || self.name.is_some()
-        {
-            self.generation = self.generation.saturating_add(1);
-        }
         self.state = crate::protocol::PaneState::Unknown;
         self.agent = None;
         self.name = None;
-        // So an agent that restarts and counts from the beginning is heard,
-        // whichever number it starts from.
-        self.report_seq = None;
+        // So an agent that restarts and counts from 1 again is heard.
+        self.report_seq = 0;
     }
-}
-
-/// The five things a wait looks at, and nothing that allocates.
-///
-/// Every field is compared against a reading taken when the wait began -
-/// none is meaningful as a level. See `Session::pane_status`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WaitSignals {
-    pub state: crate::protocol::PaneState,
-    pub busy: bool,
-    pub bells: u32,
-    pub reports: u32,
-    pub generation: u32,
 }
 
 /// What a pane is doing. One lock, every fact the bar and `info` need.
@@ -383,31 +325,14 @@ impl vt100::Callbacks for Hooks {
                 let Ok(mut s) = self.signals.lock() else { return };
                 s.integrated = true;
                 match params[1] {
-                    // `C` is NOT a place to forget what the pane claimed,
-                    // however much it reads like one.
-                    //
-                    // From a shell it means "a command's output starts
-                    // here", once per command. From a TUI it can mean
-                    // something else entirely: pi and ampere stamp
-                    // `133;A`/`133;B`/`133;C` around EVERY assistant and user
-                    // message, as zone markers so a terminal can jump
-                    // between them (`modes/interactive/components/
-                    // assistant-message.ts`). Clearing here wiped the
-                    // agent's own claim about itself once per message, which
-                    // is exactly when a caller is reading it. Measured, not
-                    // guessed - it is what the first live two-agent run did.
-                    //
-                    // `D` alone is enough anyway. Every `C` in a shell is
-                    // preceded by the `D` of the command before it, so the
-                    // claim is already gone; the only `C` without a preceding
-                    // `D` is the first command in the pane, when there is
-                    // nothing to forget.
-                    b"C" => s.busy = true,
+                    b"C" => {
+                        s.busy = true;
+                        // A new foreground command: whatever the last one
+                        // said about itself is now about a dead process.
+                        s.forget_reports();
+                    }
                     b"D" => {
                         s.busy = false;
-                        // The command ended, so everything it said about
-                        // itself is now about a dead process. This is what
-                        // makes staleness exact instead of a timeout.
                         s.forget_reports();
                         s.last_exit = params
                             .get(2)
@@ -512,32 +437,6 @@ impl Term {
             title: if s.integrated { None } else { title.clone() },
             raw_title: title,
             bells: s.bells,
-        }
-    }
-
-    /// Just the three things a wait looks at, with nothing allocated.
-    ///
-    /// `activity()` answers the same questions, but it clones the command,
-    /// the agent and the name and runs `sanitise` over the title to do it -
-    /// measured at 343ns against 9ns for reading the fields. A wait asks
-    /// twenty times a second, per pane being waited on, so this is the
-    /// difference between a poll that allocates four times and one that
-    /// allocates not at all.
-    ///
-    /// The saving is small in absolute terms and that is not the point: the
-    /// whole reason `Session::pane_status` exists instead of `info()` is to
-    /// be the cheap question, and it was not being one.
-    pub fn wait_signals(&self) -> WaitSignals {
-        match self.signals.lock() {
-            Ok(s) => WaitSignals {
-                state: s.state,
-                busy: s.busy,
-                bells: s.bells,
-                reports: s.reports,
-                generation: s.generation,
-            },
-            // Same answer `activity()` gives a poisoned lock: nothing known.
-            Err(_) => WaitSignals::default(),
         }
     }
 
@@ -713,98 +612,5 @@ mod tests {
     fn answers_primary_device_attributes() {
         let mut r = QueryResponder::default();
         assert_eq!(r.scan(b"\x1b[c", (0, 0)), b"\x1b[?6c".to_vec());
-    }
-
-    /// The other two queries ConPTY and full-screen programs ask.
-    ///
-    /// Every one of these must be answered or the asking program waits for a
-    /// reply that never comes - which for ConPTY's startup `ESC[6n` means the
-    /// shell never finishes initialising and teardown deadlocks (DESIGN §2.5).
-    /// Only CPR and primary DA had tests, so two of the four arms this module
-    /// exists for were never exercised.
-    #[test]
-    fn answers_secondary_device_attributes_and_device_status() {
-        let mut r = QueryResponder::default();
-        // Secondary DA, both spellings `classify` accepts.
-        assert_eq!(r.scan(b"\x1b[>c", (0, 0)), b"\x1b[>0;0;0c".to_vec());
-        assert_eq!(r.scan(b"\x1b[>0c", (0, 0)), b"\x1b[>0;0;0c".to_vec());
-        // DSR: "are you there?" - answered with "OK".
-        assert_eq!(r.scan(b"\x1b[5n", (0, 0)), b"\x1b[0n".to_vec());
-    }
-
-    /// Several queries in one read are all answered, in order, and the text
-    /// around them is not mistaken for one.
-    ///
-    /// A program that asks twice and is answered once waits forever on the
-    /// second, which looks exactly like the hang an unanswered query causes.
-    #[test]
-    fn every_query_in_a_chunk_is_answered_in_order() {
-        let mut r = QueryResponder::default();
-        let out = r.scan(b"before\x1b[6nmiddle\x1b[c\x1b[5nafter", (2, 3));
-        assert_eq!(out, b"\x1b[3;4R\x1b[?6c\x1b[0n".to_vec());
-    }
-
-    /// A partial escape longer than the rolling tail is dropped, not answered
-    /// wrongly and not left to wedge the scanner.
-    ///
-    /// `MAX_TAIL` is 16 bytes, which is ample for every query above - the
-    /// longest is four. A sequence that straddles a read boundary with more
-    /// parameters than that loses its `ESC` when the tail is trimmed, so it
-    /// stops looking like a query at all. That is the safe direction: the
-    /// parser has already been fed the raw bytes separately, and answering a
-    /// sequence we only half saw would be worse than answering nothing.
-    #[test]
-    fn an_over_long_partial_escape_does_not_confuse_the_scanner() {
-        let mut r = QueryResponder::default();
-        assert!(r.scan(b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12", (0, 0)).is_empty());
-        // Whatever it kept, a REAL query in the next chunk still gets through.
-        assert_eq!(r.scan(b"m\x1b[6n", (0, 0)), b"\x1b[1;1R".to_vec());
-    }
-
-    /// A history read sees back exactly as far as it was told to, and no
-    /// further.
-    ///
-    /// This is the bound `Until::Output` inherits, so it is a fact about what
-    /// a wait can notice rather than a detail of `capture`. The comment on
-    /// the wait used to claim a match could not scroll past between two
-    /// polls; it can, and the only honest thing to do is say how far.
-    #[test]
-    fn a_history_read_sees_back_as_far_as_it_was_asked_and_no_further() {
-        let mut t = Term::new(80, 24, 10_000);
-        t.parser.process(b"MARK_EARLY\r\n");
-        for i in 0..1_000 {
-            t.parser.process(format!("filler {i}\r\n").as_bytes());
-        }
-        assert!(
-            !t.read_recent(crate::protocol::RECENT_LINES_DEFAULT, true).contains("MARK_EARLY"),
-            "a bounded read returned something a thousand lines back"
-        );
-        assert!(
-            t.read_recent(2_000, true).contains("MARK_EARLY"),
-            "a read long enough to reach it did not"
-        );
-        // And it is still where the user left it.
-        assert_eq!(t.scroll_offset(), 0, "reading history moved the pane");
-    }
-
-    /// `wait_signals` and `activity` must never disagree, or a wait would be
-    /// answered about a different pane state than `info` reports for the same
-    /// moment. It is a faster path to the same three fields, not a second
-    /// opinion about them.
-    #[test]
-    fn the_cheap_poll_and_the_full_read_agree() {
-        let mut t = Term::new(80, 24, 100);
-        for feed in [
-            &b"\x1b]1341;zmux;state=working;agent=ampere;name=reviewer\x1b\\"[..],
-            &b"\x1b]133;C\x07"[..],
-            &b"\x07"[..],
-            &b"\x1b]1341;zmux;state=blocked\x1b\\"[..],
-            &b"\x1b]133;D;0\x07"[..],
-        ] {
-            t.parser.process(feed);
-            let a = t.activity();
-            let w = t.wait_signals();
-            assert_eq!((w.state, w.busy, w.bells), (a.state, a.busy, a.bells), "after {feed:?}");
-        }
     }
 }

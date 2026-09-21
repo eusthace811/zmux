@@ -365,7 +365,7 @@ zmux wait "$S" -p "@$NEW" --until settled --timeout 120000
 | `idle` `working` `blocked` `done` | one specific reported state |
 | `quiet` | no shell command running. Right for `cargo test`; useless for an agent, which *is* one long command |
 | `quiet-for MS` | the pane has produced no output for that long |
-| `output TEXT` | that text is in the pane's last 200 lines. Wait for something printed at the *end* of a command: a pane can out-produce that window between two polls |
+| `output TEXT` | that text is in the pane's recent output |
 | `bell` | the pane rang the bell |
 
 It prints the session state the wait ended with, plus `outcome`: `met`,
@@ -377,47 +377,25 @@ simply still going.
 run a command and wait for `quiet` in the next breath, and the shell has not
 read the line yet, so the wait is satisfied by the quiet *before* your
 command. The gate ignores the condition until the pane is seen doing
-something *since the wait began* - a pane that was already busy, as every
-agent is for its whole life, does not count as having started. Pass
-`--settle 0` when the pane is already working on the thing you are
-waiting for.
-
-### Start it and prompt it
-
-```bash
-zmux start "$S" -p "@$NEW" "ampere"
-zmux run "$S" -p "@$NEW" --paste --wait "review the current diff"
-```
-
-`start` waits until the pane reports something, so it returns when the agent
-is up rather than when the text was typed. It refuses a pane that is already
-running something.
-
-`run --wait` writes and waits in one request, which two commands cannot do:
-a separate wait can only look at the pane after the write, so one that
-reacted and settled in between looks like one that never heard. It refuses a
-pane that reported `blocked`, because a prompt would answer that pane's own
-question.
-
-Outcomes beyond `met`/`timeout`/`gone`: `stalled` means the pane never
-reacted, and `replaced` means the agent exited while you were waiting. Both
-still wrote the text, so do not simply send it again.
+something. Pass `--settle 0` when the pane is already working.
 
 ### Read the answer
 
 ```bash
-zmux capture "$S" -p "@$NEW" --source history -n 200
+zmux capture "$S" -p "@$NEW" --source unwrapped -n 120
 ```
 
-An agent draws on the *alternate screen*, which has no scrollback - so
-`--source recent` and `unwrapped` cannot see further back than what is on
-screen right now. `history` scrolls the agent itself, collects what it
-reveals and puts its view back where it was. It takes a second or two and it
-does move that pane briefly, so use it to read an answer rather than to poll.
+| `--source` | |
+| --- | --- |
+| `screen` | the rows on screen (the default) |
+| `recent` | recent output, reaching back into scrollback |
+| `unwrapped` | the same, with lines joined where the pane was too narrow to hold them |
 
-When it cannot be done safely it falls back to the ordinary read without
-complaining: a pane that is not a full-screen program, one that does not
-take the mouse, or one you are already scrolled back in.
+Use `unwrapped` for a transcript. A pane is only as wide as its share of the
+window, so a long answer comes back broken at that width — and those breaks
+are your layout, not the text. Reading history does **not** move the pane's
+scroll position, so it is safe to do while somebody is reading their own
+output.
 
 ### Teaching your agent to say what it is doing
 
@@ -515,23 +493,6 @@ running and holding the `.exe`. `zmux ls`, kill what it lists, then copy.
 namespace, so `a/b` and `a_b` collide. The client compares the name it asked
 for against the one the daemon reports and refuses the mismatch rather than
 silently joining the wrong session.
-
-**A pane disappears the moment it is made, or an existing one vanishes** —
-the machine may be out of consoles. Every pane is one, and Git Bash refuses to
-start once the *whole machine* has 128, counting every terminal, editor and
-`git.exe` that is holding one. The shell starts and immediately dies, so zmux
-sees an ordinary exit and closes the pane; the reason was on the pane's screen
-for the moment it existed.
-
-The daemon now keeps that reason. Start it with its stderr somewhere you can
-read — from Git Bash, `zmuxd.exe <session> 2> zmux.log` — and look for
-
-```
-[session] pane 3 never started: ... console device allocation failure - too many consoles in use
-```
-
-Closing some terminal windows is the cure. There is nothing zmux can do
-about the ceiling itself: it is shared with everything else running.
 
 **Arrow keys or function keys misbehaving in an app** — worth reporting; keys
 are encoded xterm-style, including application cursor mode, and anything that

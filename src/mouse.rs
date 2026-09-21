@@ -189,44 +189,6 @@ mod tests {
         );
     }
 
-    /// `?1005` exists to lift the 223-column ceiling, and here it does not.
-    ///
-    /// Pinned as a DECISION rather than left as an oversight. UTF-8 mode
-    /// encodes each field as a codepoint, so it could describe column 2015 -
-    /// but it is ambiguous by construction (a reader cannot tell a two-byte
-    /// sequence from two one-byte fields without knowing the mode in
-    /// advance), it is deprecated in xterm's own documentation, and the
-    /// programs that ask for a mouse at all ask for SGR. Emitting bytes a
-    /// confused reader turns into a click somewhere else is worse than
-    /// emitting none, which is the same rule `wanted()` follows. SGR, which
-    /// is unambiguous decimal text, has no ceiling and is what a wide pane
-    /// should be using.
-    #[test]
-    fn utf8_mode_encodes_as_codepoints_and_keeps_the_old_ceiling() {
-        // Below the ceiling it is the ordinary encoding, one byte per field.
-        let low = encode(Mode::Press, Enc::Utf8, ev(MouseKind::Press(0)), 4, 9);
-        assert_eq!(low.as_deref(), Some(&b"\x1b[M\x20\x25\x2a"[..]));
-
-        // Above 127 a field becomes a two-byte UTF-8 sequence, which is the
-        // whole difference from `Default`.
-        let high = encode(Mode::Press, Enc::Utf8, ev(MouseKind::Press(0)), 200, 0);
-        let default = encode(Mode::Press, Enc::Default, ev(MouseKind::Press(0)), 200, 0);
-        assert_ne!(high, default, "utf8 mode encoded a high column as a raw byte");
-        assert_eq!(
-            high.as_deref(),
-            Some("\x1b[M\u{20}\u{e9}\u{21}".as_bytes()),
-            "a field past 127 must be its codepoint, UTF-8 encoded"
-        );
-
-        // And the ceiling is the same as the old encoding's, on purpose.
-        assert!(encode(Mode::Press, Enc::Utf8, ev(MouseKind::Press(0)), 222, 0).is_some());
-        assert!(encode(Mode::Press, Enc::Utf8, ev(MouseKind::Press(0)), 223, 0).is_none());
-        assert!(
-            encode(Mode::Press, Enc::Sgr, ev(MouseKind::Press(0)), 999, 0).is_some(),
-            "a pane wider than the old ceiling needs SGR, which has none"
-        );
-    }
-
     /// The original encoding offsets every field by 32 into a single byte, so
     /// a pane wider than 223 columns has positions it cannot describe. xterm
     /// drops those reports rather than naming the wrong cell, and so do we -

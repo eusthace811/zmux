@@ -308,30 +308,13 @@ pub fn status_spans(st: &BarState, width: usize) -> Vec<Span> {
     }
     let short = join(vec![count, counted, alert()]);
 
-    // Below `short` there are two more rungs, because `short` still carries
-    // three sections and a crowded session blows past a narrow bar with them:
-    // five windows, four panes and SCROLL came to thirteen columns, which
-    // `draw_status` then clipped in the middle of the word. A bar that is
-    // silently cut is the one thing this ladder exists to prevent.
-    //
-    // SCROLL outranks the pane count down here. It is the only MODE the bar
-    // reports, and it answers the question a motionless pane raises - why is
-    // nothing happening - where a count answers nothing anyone is asking at
-    // eight columns.
-    let just_panes = join(vec![vec![vec![span(Role::Info, format!("{panes}p"))]]]);
-    let just_alert = join(vec![alert()]);
-
-    for rung in [full, without_name, without_labels, short, just_alert, just_panes.clone()] {
-        // An empty rung is not a bar. `just_alert` is empty whenever nothing
-        // is alerting, and returning it would blank the line rather than
-        // shorten it.
-        if !rung.is_empty() && width_of(&rung) <= width {
+    for rung in [full, without_name, without_labels, short] {
+        if width_of(&rung) <= width {
             return rung;
         }
     }
-    // Narrower than anything true can be written in. Clipped by `draw_status`,
-    // which is all that is left to do with it.
-    just_panes
+    // Nothing fits; this is the shortest thing that is still true.
+    join(vec![vec![vec![span(Role::Info, format!("{panes}p"))]], alert()])
 }
 
 fn label_of<'a>(label: &'a Option<String>, idle: &'a str) -> &'a str {
@@ -505,7 +488,7 @@ fn blit(dst: &mut Frame, src: &Frame, at: LRect) {
                 continue;
             }
             dst.cells[y as usize * dst.cols as usize + x as usize] =
-                src.cells[row as usize * src.cols as usize + col as usize];
+                src.cells[row as usize * src.cols as usize + col as usize].clone();
         }
     }
 }
@@ -848,72 +831,6 @@ mod tests {
             // Either the panes are listed, or they are counted. Never neither.
             assert!(s.contains("2*") || s.contains("2p"), "width {width}: {s}");
         }
-    }
-
-    /// The whole point of the ladder: the bar it returns FITS.
-    ///
-    /// Monotonicity and content are asserted above, but not the one promise
-    /// the rungs exist to keep. Only the last-resort line is exempt, and only
-    /// below `MIN_USABLE_COLS` - a width `clamp_size` will not let a session
-    /// reach, where there is nothing true left to say that is shorter.
-    /// `draw_status` clips, so an over-wide bar is a truncated word rather
-    /// than a panic, which is exactly the kind of quiet wrongness that
-    /// survives if nobody checks.
-    #[test]
-    fn every_rung_fits_the_width_it_was_given() {
-        for width in (crate::protocol::MIN_USABLE_COLS as usize)..200 {
-            let bar = at(width);
-            assert!(
-                bar.chars().count() <= width,
-                "width {width}: the bar is {} chars: {bar:?}",
-                bar.chars().count()
-            );
-        }
-        // And with everything turned on at once - more windows, more panes,
-        // a long name and the alert - there is still a rung that fits.
-        let b = B {
-            windows: lab(&["cargo", "vim", "ssh", "python", "node"]),
-            current: 3,
-            busy: vec![true, false, true, false],
-            focus: 2,
-            scrolled: true,
-        };
-        for width in (crate::protocol::MIN_USABLE_COLS as usize)..200 {
-            let bar = plain(&b.at(width));
-            assert!(
-                bar.chars().count() <= width,
-                "width {width}: a crowded bar is {} chars: {bar:?}",
-                bar.chars().count()
-            );
-        }
-    }
-
-    /// At the narrowest a session can be, the bar says the one thing that is
-    /// a MODE rather than a fact.
-    ///
-    /// Being scrolled explains a pane that has stopped moving; the pane count
-    /// explains nothing anyone is asking at eight columns. Before the two
-    /// short rungs existed, a crowded scrolled session produced thirteen
-    /// columns of bar for an eight-column screen and `draw_status` cut it in
-    /// the middle of SCROLL.
-    #[test]
-    fn the_narrowest_bar_reports_being_scrolled_rather_than_the_pane_count() {
-        let mut b = B {
-            windows: lab(&["cargo", "vim", "ssh", "python", "node"]),
-            current: 3,
-            busy: vec![true, false, true, false],
-            focus: 2,
-            scrolled: true,
-        };
-        let narrow = plain(&b.at(crate::protocol::MIN_USABLE_COLS as usize));
-        assert_eq!(narrow, " SCROLL ", "the narrowest rung lost the one mode it reports");
-
-        // Not scrolled, the same width falls through to the count - never to
-        // an empty line, which is what an unguarded empty rung would give.
-        b.scrolled = false;
-        let narrow = plain(&b.at(crate::protocol::MIN_USABLE_COLS as usize));
-        assert_eq!(narrow, " 4p ", "with nothing to alert about, say how many panes");
-        assert!(!narrow.trim().is_empty(), "the bar went blank instead of getting shorter");
     }
 
     /// A wider terminal must never produce a shorter line: if it did, the
