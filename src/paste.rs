@@ -53,6 +53,14 @@ pub fn wrap(data: &[u8], bracketed: bool, enter: bool) -> Vec<u8> {
 /// A loop-until-clean would also be correct and is quadratic on input a
 /// caller chooses.
 fn strip_end_marker(data: &[u8]) -> Vec<u8> {
+    // Text with no marker in it cannot be made to grow one: reassembly needs
+    // a removal, and there is nothing to remove. So the scan is still the
+    // right answer for the case that is almost always the case, and it is
+    // worth keeping - measured at 64KB, the byte-wise walk costs 238us
+    // against 22us for the scan, and a prompt can be that big.
+    if !data.windows(END.len()).any(|w| w == END) {
+        return data.to_vec();
+    }
     let mut out = Vec::with_capacity(data.len());
     for &b in data {
         out.push(b);

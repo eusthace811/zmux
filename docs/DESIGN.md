@@ -1230,6 +1230,12 @@ rule did not already remove. `no_payload_at_all_can_put_an_end_marker_in_the_bod
 pins the invariant rather than an example of it, assembling payloads out of
 marker fragments — uniform random bytes would never build one.
 
+Text with no marker in it is still handled by a plain scan, because
+reassembly needs a removal and there is nothing to remove. That is worth
+keeping rather than tidying away: at 64KB, which a prompt can be, the
+byte-wise walk costs 238µs against the scan's 22µs, and the marker-free
+case is almost always the case.
+
 The pipe's ACL is unchanged. `InputAt` reaches any pane in the session, but
 anyone who can open the pipe could already type into the focused one, so the
 trust boundary is where it was.
