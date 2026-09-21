@@ -922,3 +922,36 @@ fn without_a_settle_gate_a_wait_can_answer_about_the_wrong_moment() {
         "the gated wait still returned before the command finished"
     );
 }
+
+/// A TUI that stamps OSC 133 zone markers around its own messages must not
+/// lose the state it reported.
+///
+/// pi and ampere put `133;A` / `133;B` / `133;C` around every assistant and
+/// user message so a terminal can jump between them
+/// (`modes/interactive/components/assistant-message.ts`). zmux used to read
+/// `133;C` as "a new foreground command started" and clear the pane's claim,
+/// which threw away the agent's own report of itself once per message. Found
+/// by running two real agents, not by reading the code.
+#[test]
+fn a_tui_that_marks_its_own_message_zones_keeps_what_it_reported() {
+    let d = Daemon::start("zmux-test-zone-markers");
+    let mut c = Control::open(&d.session);
+
+    // Claim something, then stamp the zone markers a message-rendering TUI
+    // emits, then keep holding the foreground - exactly pi's shape.
+    let keys = "state=working;agent=ampere:some-model;name=reviewer";
+    let zones = r"printf '\033]133;A\007\033]133;B\007\033]133;C\007'";
+    let cmd = format!(r"printf '\033]1341;zmux;{keys}\033\\'; {zones}; read -r _");
+    c.input_at(Target::Focused, &cmd, true);
+
+    let p = wait_for_state(&mut c, PaneState::Working, 20).expect("the report never arrived");
+    assert_eq!(p.agent.as_deref(), Some("ampere:some-model"), "the zone markers ate the agent");
+    assert_eq!(p.name.as_deref(), Some("reviewer"), "the zone markers ate the name");
+
+    // And the thing that DOES mean the process is gone still works: let the
+    // `read` finish, and OSC 133;D clears everything it claimed.
+    c.input_at(Target::Focused, "", true);
+    let gone = wait_for_state(&mut c, PaneState::Unknown, 20).expect("the claim never cleared");
+    assert_eq!(gone.agent, None, "a claim outlived the process that made it");
+    assert_eq!(gone.name, None);
+}

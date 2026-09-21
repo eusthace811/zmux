@@ -332,14 +332,31 @@ impl vt100::Callbacks for Hooks {
                 let Ok(mut s) = self.signals.lock() else { return };
                 s.integrated = true;
                 match params[1] {
-                    b"C" => {
-                        s.busy = true;
-                        // A new foreground command: whatever the last one
-                        // said about itself is now about a dead process.
-                        s.forget_reports();
-                    }
+                    // `C` is NOT a place to forget what the pane claimed,
+                    // however much it reads like one.
+                    //
+                    // From a shell it means "a command's output starts
+                    // here", once per command. From a TUI it can mean
+                    // something else entirely: pi and ampere stamp
+                    // `133;A`/`133;B`/`133;C` around EVERY assistant and user
+                    // message, as zone markers so a terminal can jump
+                    // between them (`modes/interactive/components/
+                    // assistant-message.ts`). Clearing here wiped the
+                    // agent's own claim about itself once per message, which
+                    // is exactly when a caller is reading it. Measured, not
+                    // guessed - it is what the first live two-agent run did.
+                    //
+                    // `D` alone is enough anyway. Every `C` in a shell is
+                    // preceded by the `D` of the command before it, so the
+                    // claim is already gone; the only `C` without a preceding
+                    // `D` is the first command in the pane, when there is
+                    // nothing to forget.
+                    b"C" => s.busy = true,
                     b"D" => {
                         s.busy = false;
+                        // The command ended, so everything it said about
+                        // itself is now about a dead process. This is what
+                        // makes staleness exact instead of a timeout.
                         s.forget_reports();
                         s.last_exit = params
                             .get(2)
