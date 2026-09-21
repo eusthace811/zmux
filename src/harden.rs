@@ -157,6 +157,15 @@ mod tests {
     ///
     /// Two separate copies are used because a loaded module stays resident and
     /// the second call would otherwise just return the cached handle.
+    ///
+    /// NOTE for anyone adding a lib test: this one changes the PROCESS's
+    /// working directory, and the other ~130 unit tests run beside it on
+    /// other threads. It is safe today only because nothing else in the
+    /// library resolves a relative path - `persist` and `config` build theirs
+    /// from `%APPDATA%`, and `pty.rs:current_dir` is reached only from
+    /// `spawn_with`, which no unit test calls. A test that depends on the
+    /// working directory would fail here at random, and the reason would not
+    /// be anywhere near it.
     #[test]
     fn hardening_removes_the_local_directory_from_the_dll_search_path() {
         let sys = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or("C:\\Windows".into()))
