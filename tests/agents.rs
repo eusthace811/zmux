@@ -669,20 +669,57 @@ fn a_wait_for_output_matches_what_is_already_there() {
 
 /// The honest wait for a program that reports nothing: a measured length of
 /// silence, with the caller choosing how much of it to believe.
+///
+/// The noise is produced FROM HERE, on a cadence this test controls. An
+/// earlier version ran `echo; sleep 0.1` in the pane and assumed that meant
+/// output every 100ms. In Git Bash `sleep` is a separate process, and with
+/// the rest of the suite running its own daemons a spawn can take longer
+/// than the 800ms of silence being waited for - so the pane really did go
+/// quiet, the wait really was `Met`, and the test was the thing that was
+/// wrong. It failed about 45% of the time. Typing a character is one write
+/// with nothing to schedule.
 #[test]
 fn a_wait_for_silence_measures_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     let d = Daemon::start("zmux-test-wait-silence");
     let mut c = Control::open(&d.session);
     assert!(c.wait_at(20, Target::Focused, |t| t.contains('$')).is_some());
 
-    // A pane that is still talking cannot satisfy it.
-    c.input_at(Target::Focused, "for i in $(seq 1 40); do echo TICK_$i; sleep 0.1; done", true);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // A second connection, because `c` is about to block inside a wait.
+    let chatter = Control::open(&d.session);
+    let talking = Arc::new(AtomicBool::new(true));
+    let stop = talking.clone();
+
+    // One write BEFORE the wait starts. Leaving even the first character to
+    // the thread is a race: the pane has been silent at its prompt since the
+    // daemon came up, so a wait that polls before the thread's first write
+    // finds 800ms of silence already banked and returns `Met` at once.
+    c.input_at(Target::Focused, ".", false);
+
+    let noise = std::thread::spawn(move || {
+        let mut chatter = chatter;
+        // Echoed by the pane's line editor, so each one is real output. No
+        // Enter: nothing runs, the line just grows.
+        while stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+            chatter.input_at(Target::Focused, ".", false);
+        }
+    });
+
+    // A pane that is still talking cannot satisfy it. 100ms of cadence
+    // against 800ms of required silence leaves eight times the margin the
+    // scheduler needs to be slow in.
     assert_eq!(
         waited(&mut c, Target::Focused, Until::QuietFor(800), 1_500),
         WaitOutcome::Timeout,
         "a pane producing output was called quiet"
     );
+
+    talking.store(false, Ordering::Relaxed);
+    noise.join().expect("the chatter thread panicked");
 
     // Once it stops, it does.
     assert_eq!(
