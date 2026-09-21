@@ -1301,3 +1301,102 @@ fn splitting_the_enter_off_a_paste_still_submits_the_line() {
         "the prompt did not arrive whole:\n{screen}"
     );
 }
+
+/// Reading a full-screen program's OWN history, by scrolling it.
+///
+/// The thing §12 could not do. An agent draws on the alternate screen, which
+/// has no scrollback, so everything it has scrolled past is unreachable by
+/// any ordinary read - measured on a real one, 100 lines printed and 19
+/// readable. `tests/fake-tui.sh` is the smallest thing that behaves that
+/// way: alternate screen, mouse reporting, more lines than fit.
+#[test]
+fn a_full_screen_program_can_be_read_past_its_own_screen() {
+    let d = Daemon::start("zmux-test-history");
+    let mut c = Control::open(&d.session);
+    let p = &c.info().panes[0];
+    let (id, rows) = (p.id, p.rows);
+
+    c.input_at(
+        Target::Id(id),
+        &format!("bash tests/fake-tui.sh {rows} 60"),
+        true,
+    );
+    assert!(
+        c.wait_at(30, Target::Id(id), |t| t.contains("READY")).is_some(),
+        "the fake application never drew"
+    );
+
+    // What an ordinary read can see: the visible screen and nothing before
+    // it. This is the limitation, pinned, so the next assertion means
+    // something.
+    let plain = c.capture_source(Target::Id(id), 100, Source::RecentUnwrapped);
+    assert!(!plain.contains("L000"), "the plain read already saw the top:\n{plain}");
+
+    let history = c.capture_source(Target::Id(id), 300, Source::History);
+    assert!(
+        history.contains("L000"),
+        "scrolling the application did not reach its first line:\n{history}"
+    );
+    // In order, and each line once. Duplicates and gaps are what a wrong
+    // alignment produces, and both read as plausible text.
+    let seen: Vec<&str> = history
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| w.starts_with('L') && w.len() == 4)
+        .collect();
+    let want: Vec<String> = (0..=59).map(|i| format!("L{i:03}")).collect();
+    let got: Vec<String> = seen.iter().map(|s| (*s).to_string()).collect();
+    assert_eq!(got, want, "the history came back duplicated, gapped or out of order");
+}
+
+/// And the pane is left where the person using it had it.
+///
+/// The one outcome this must never produce: somebody's view dragged to the
+/// top of a transcript and abandoned there.
+#[test]
+fn reading_a_programs_history_puts_its_view_back() {
+    let d = Daemon::start("zmux-test-history-restore");
+    let mut c = Control::open(&d.session);
+    let p = &c.info().panes[0];
+    let (id, rows) = (p.id, p.rows);
+
+    c.input_at(Target::Id(id), &format!("bash tests/fake-tui.sh {rows} 60"), true);
+    assert!(
+        c.wait_at(30, Target::Id(id), |t| t.contains("READY")).is_some(),
+        "the fake application never drew"
+    );
+    // The LINES it is showing, not the raw screen. `READY` is written once
+    // after the first draw and cleared by every redraw after it, so a raw
+    // comparison reports a difference that belongs to the marker rather
+    // than to the viewport - which is exactly what it did.
+    let visible = |c: &mut Control| -> Vec<String> {
+        c.capture_at(Target::Id(id))
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|w| w.starts_with('L') && w.len() == 4)
+            .map(str::to_string)
+            .collect()
+    };
+    let before = visible(&mut c);
+    assert!(!before.is_empty(), "the pane is not showing the application");
+
+    let history = c.capture_source(Target::Id(id), 300, Source::History);
+    // Past the visible screen is enough to know it scrolled. Requiring the
+    // very top would make this a test of the time budget under whatever
+    // else the suite is running, which is not what it is for.
+    assert!(
+        history.contains("L005"),
+        "the harvest did not scroll at all, so this proves nothing:\n{history}"
+    );
+
+    // Same rows as before it was read. Polled rather than asserted once:
+    // the restore finishes inside the capture, but the frame carrying it is
+    // paced like any other.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut back = visible(&mut c);
+    while back != before && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        back = visible(&mut c);
+    }
+    assert_eq!(back, before, "the pane was left showing something else after being read");
+}

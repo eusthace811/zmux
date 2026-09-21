@@ -477,6 +477,17 @@ impl Pane {
         now_ms().saturating_sub(self.last_output.load(Ordering::Relaxed))
     }
 
+    /// WHEN this pane last produced output, on the process clock.
+    ///
+    /// `quiet_ms` answers "how long has it been silent"; this answers "was
+    /// that the same silence as a moment ago". A reader that has just poked
+    /// a pane needs the second question: the pane is still silent for the
+    /// moment before it reacts, so elapsed silence cannot tell the two
+    /// apart and this can.
+    pub fn last_output_ms(&self) -> u64 {
+        self.last_output.load(Ordering::Relaxed)
+    }
+
     /// Milliseconds since this pane was created.
     pub fn age_ms(&self) -> u64 {
         now_ms().saturating_sub(self.born)

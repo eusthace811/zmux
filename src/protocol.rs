@@ -477,6 +477,16 @@ pub enum Source {
     /// window, so a 60-column pane breaks every long line - and those breaks
     /// are an artefact of the layout, not of what was written.
     RecentUnwrapped,
+    // --- appended. Append-only. ---
+    /// The application's OWN history, read by scrolling the application.
+    ///
+    /// For a full-screen program - an agent, an editor - the rows that have
+    /// left the screen are not in any scrollback a terminal can reach, so
+    /// `Recent` cannot see them. This scrolls the program itself and puts
+    /// the viewport back (see `harvest`). Falls back to `RecentUnwrapped`
+    /// for a pane that is not on the alternate screen, or that will not take
+    /// the wheel, or that somebody is already scrolled back in.
+    History,
 }
 
 /// The answer to `Query::Info`, and to every control mutation - a caller sees

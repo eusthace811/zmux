@@ -286,6 +286,7 @@ zmux capture <session> -p @7 --source unwrapped -n 200    # a transcript
 | `screen` | the rows on screen (the default) |
 | `recent` | recent output, reaching back into scrollback |
 | `unwrapped` | the same, with lines joined where the pane was too narrow to hold them |
+| `history` | the **application's own** history, read by scrolling it |
 
 **Use `unwrapped` to read an answer.** A pane is only as wide as its share of
 the window, so long lines come back broken at that width, and those breaks are
@@ -294,10 +295,24 @@ the layout rather than the text.
 Nothing about `capture` changes what the user sees, including the scrollback
 sources: the pane's scroll position is put back before anyone can observe it.
 
-If a larger read still does not show the whole answer — an alternate-screen
-TUI keeps its own history that no terminal can recover — ask the agent to
-write the answer to a file and reply with the path, then read that file
-directly. Use this as a fallback, not in the first prompt.
+**To read a full-screen agent's answer, use `history`.** An agent draws on
+the alternate screen, which has no scrollback, so `recent` and `unwrapped`
+cannot see past what is on screen right now - measured on a real one, 100
+lines printed and 19 readable. `history` scrolls the agent itself, collects
+what it reveals, and puts its view back:
+
+```bash
+zmux capture <session> -p @7 --source history -n 200
+```
+
+It costs a second or two and it **moves that pane's view and returns it**, so
+use it to read an answer, not to poll. It quietly falls back to `unwrapped`
+when it cannot be done safely: a pane that is not a full-screen program, one
+that does not take the mouse, or one somebody is already scrolled back in.
+
+If even that does not show the whole answer, ask the agent to write it to a
+file and reply with the path, then read that file. Use this as a fallback,
+not in the first prompt.
 
 ## Agent state
 

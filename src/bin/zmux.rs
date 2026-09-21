@@ -127,10 +127,16 @@ Driving a session without attaching (for scripts and agents):
   zmux keys <session> [-p T] <text>      type text, no Enter
   zmux run  <session> [-p T] [--paste] <command>
                                            type it and press Enter
-  zmux capture <session> [-p T] [-n N] [--source screen|recent|unwrapped]
-                                           read a pane; `unwrapped` for a
+  zmux capture <session> [-p T] [-n N]
+             [--source screen|recent|unwrapped|history]
+                                           read a pane. `unwrapped` for a
                                            transcript, `screen` for what is
-                                           on screen (the default)
+                                           on screen (the default), `history`
+                                           to scroll a full-screen program
+                                           back through its OWN history -
+                                           the only way to read an agent's
+                                           answer, and it moves that pane's
+                                           view and puts it back
   zmux report [<session>] [-p T] --state idle|working|blocked|done
                                            say what this pane is doing
   zmux report --check                    prove the report channel works
@@ -220,7 +226,8 @@ fn take_pane(args: &[String]) -> Result<(Option<Target>, &[String])> {
 /// that an out-of-range position is refused to avoid.
 fn capture_args(args: &[String]) -> Result<(Option<Target>, u16, Source)> {
     const USAGE: &str =
-        "usage: zmux capture <session> [-p T] [-n LINES] [--source screen|recent|unwrapped]";
+        "usage: zmux capture <session> [-p T] [-n LINES] \
+                     [--source screen|recent|unwrapped|history]";
     let (mut pane, mut lines, mut source) = (None, 0u16, Source::Screen);
     let mut rest = args;
     while let Some(flag) = rest.first().map(String::as_str) {
@@ -237,6 +244,7 @@ fn capture_args(args: &[String]) -> Result<(Option<Target>, u16, Source)> {
                     "screen" => Source::Screen,
                     "recent" => Source::Recent,
                     "unwrapped" | "recent-unwrapped" => Source::RecentUnwrapped,
+                    "history" => Source::History,
                     other => bail!("'{other}' is not a source\n{USAGE}"),
                 }
             }

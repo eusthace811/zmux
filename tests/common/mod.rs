@@ -435,6 +435,20 @@ impl Control {
         }
     }
 
+    /// `capture_at` with a source and a line count.
+    pub fn capture_source(
+        &mut self,
+        target: zmux::protocol::Target,
+        lines: u16,
+        source: zmux::protocol::Source,
+    ) -> String {
+        let q = zmux::protocol::Query::CaptureAt { target, lines, source };
+        match self.ask(&ClientMsg::Query(q)) {
+            ServerMsg::Capture { text } => text,
+            other => panic!("expected Capture, got {other:?}"),
+        }
+    }
+
     /// Type into the pane `target` names, without moving anybody's focus.
     pub fn input_at(&mut self, target: zmux::protocol::Target, text: &str, enter: bool) {
         let msg = ClientMsg::InputAt {

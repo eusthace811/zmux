@@ -1223,6 +1223,60 @@ vt100 0.16.2 does not track the kitty keyboard protocol and there is nothing
 better to know here. herdr can encode through the pane's own key mode because
 its engine reports it.
 
+### Reading a full-screen program's own history
+
+The thing §12 could not do, and the reason the rest of it fell short of
+being usable: an agent draws on the **alternate screen**, which has no
+scrollback. Everything it has scrolled past is gone as far as the terminal
+is concerned. Measured on a real agent: 100 lines printed, **19 reachable**.
+`capture --source recent` cannot see an answer that is more than a screen
+long, which is most answers.
+
+The application still HAS those rows - it redraws them when scrolled. So the
+only way to read them is to be a user: send the wheel, photograph each
+screen, put the viewport back. `--source history` does that. herdr's version
+is `src/server/alt_screen_read.rs`, 996 lines, which is the honest measure of
+the care it takes.
+
+**This writes into somebody's live pane**, and everything in `harvest.rs` is
+shaped by that. It refuses rather than guesses; it bails to the ordinary read
+on anything it does not recognise; it spends its last budget putting the
+viewport back. The worst outcome it permits is a plain screen read. The
+outcome it must never produce is a pane left scrolled somewhere its owner did
+not put it - and when it cannot restore, it says so on the daemon's stderr,
+because nothing else could explain what happened to that screen.
+
+It declines, falling back to the ordinary read, for: a pane not on the
+alternate screen (it has real scrollback and needs none of this), one that
+never asked for the mouse (nothing sent can scroll it, and the bytes would
+arrive as TEXT), one **somebody is already scrolled back in** - probed for by
+scrolling DOWN first and checking nothing moved - and one already being
+harvested.
+
+**The step size is measured, not assumed.** How far one wheel event scrolls
+is the application's decision: three lines is common, one is usual, five
+exists. The first step sends ONE event, `merge_up` measures what it was
+worth, and the rest are sized to stay just inside a screen so consecutive
+screens always overlap. Without the overlap there is nothing to align on and
+no way to know what was skipped. An application that moves more than a whole
+screen on a single event cannot be read this way at all, and says so rather
+than inventing the gap.
+
+**Two bugs found building it, both the same bug.**
+
+`settle` waited for the pane to be QUIET after a wheel event. A pane that has
+been idle is still idle a millisecond after you poke it, so it returned
+immediately and photographed the screen from before its own event - every
+step read `Unchanged` and the harvest concluded it was already at the top.
+Quiet is not evidence of having reacted. It now waits for the redraw to
+**start** (a change in `Pane::last_output_ms`) and then to finish. This is
+the same mistake as the wait gate reading `busy` as a level, in the same
+session, in different code.
+
+And `-n` kept the wrong end. Collection runs backwards from the bottom and
+overshoots, so trimming the front threw away the newest output - the part
+somebody reading an answer came for.
+
 ### Reading history without the screen jumping
 
 `capture` could only ever return the visible rows, and the skill said so as a

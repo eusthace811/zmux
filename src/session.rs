@@ -144,6 +144,8 @@ pub struct Session {
     /// leaving the older layout on disk. The lock is taken before the capture,
     /// not just around the write.
     save: Mutex<()>,
+    /// Held for the length of one history harvest. See `read_history`.
+    harvesting: Mutex<()>,
     /// Serialises every geometry mutation.
     ///
     /// apply_size previously read the client list, released the lock, then
@@ -154,6 +156,85 @@ pub struct Session {
     /// Pane lifecycle events, tagged with which pane they came from.
     events_tx: SyncSender<(PaneId, PtyEvent)>,
     pub cfg: Config,
+}
+
+/// One live pane, as the harvester sees it.
+///
+/// `cols`/`rows` are the shape the harvest started with. A pane that changes
+/// size mid-harvest stops being the thing that was being read - every row
+/// collected was wrapped to the old width - so it reports itself unreadable
+/// rather than carrying on.
+struct PaneScreen<'a> {
+    session: &'a Session,
+    id: PaneId,
+    cols: u16,
+    rows: u16,
+}
+
+impl crate::harvest::Screen for PaneScreen<'_> {
+    fn rows(&self) -> Option<Vec<String>> {
+        let panes = lock(&self.session.panes);
+        let p = panes.get(&self.id)?;
+        let t = lock(&p.term);
+        let screen = t.parser.screen();
+        // Only the alternate screen. A normal-screen pane HAS scrollback,
+        // so scrolling it would be an elaborate way to read what
+        // `read_recent` already returns without touching anything.
+        if !screen.alternate_screen() {
+            return None;
+        }
+        let (r, c) = screen.size();
+        if (c, r) != (self.cols, self.rows) {
+            return None;
+        }
+        Some(screen.rows(0, c).collect())
+    }
+
+    fn wheel(&self, up: bool, n: usize) -> bool {
+        let kind = if up { MouseKind::WheelUp } else { MouseKind::WheelDown };
+        // The middle of the pane. A program with a scrollable region and
+        // something else beside it decides by where the pointer is, and the
+        // middle is the likeliest part of it to be the transcript.
+        let (x, y) = (self.cols / 2, self.rows / 2);
+        let out = {
+            let panes = lock(&self.session.panes);
+            let Some(p) = panes.get(&self.id) else { return false };
+            let pty = Arc::clone(&p.pty);
+            let t = lock(&p.term);
+            let screen = t.parser.screen();
+            // No mouse reporting means the program never asked, so nothing
+            // we send can scroll it. This is the guard that keeps a harvest
+            // off a program that would receive the bytes as TEXT.
+            crate::mouse::encode(
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+                MouseIn { x, y, kind, mods: 0 },
+                x,
+                y,
+            )
+            .map(|bytes| (pty, bytes))
+        };
+        let Some((pty, bytes)) = out else { return false };
+        let mut all = Vec::with_capacity(bytes.len() * n);
+        for _ in 0..n {
+            all.extend_from_slice(&bytes);
+        }
+        pty.write_input(&all).is_ok()
+    }
+
+    fn quiet_ms(&self) -> u64 {
+        let panes = lock(&self.session.panes);
+        panes.get(&self.id).map_or(u64::MAX, |p| p.pty.quiet_ms())
+    }
+
+    fn output_mark(&self) -> u64 {
+        let panes = lock(&self.session.panes);
+        panes.get(&self.id).map_or(0, |p| p.pty.last_output_ms())
+    }
+
+    fn pause(&self) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Restore the pane arrangement from disk, if there is a usable one.
@@ -199,6 +280,7 @@ impl Session {
             running: Arc::new(AtomicBool::new(true)),
             revision: Arc::new(AtomicU64::new(0)),
             size: Mutex::new((cols, rows)),
+            harvesting: Mutex::new(()),
             last_published: Mutex::new(None),
             size_dirty: std::sync::atomic::AtomicBool::new(false),
             save: Mutex::new(()),
@@ -551,6 +633,52 @@ impl Session {
         Ok(true)
     }
 
+    /// Read a pane's OWN history, by scrolling the application.
+    ///
+    /// Falls back to the ordinary scrollback read for every pane this cannot
+    /// safely be done to, which is most of them: one that is not on the
+    /// alternate screen has real scrollback and needs none of this, and one
+    /// that will not take the wheel, or that somebody is reading scrolled
+    /// back, must not be poked at.
+    ///
+    /// Takes NO lock for the duration. It cannot: the pane has to process
+    /// the wheel events, which happens on the reader thread, which needs the
+    /// same `Term`. Each step takes the lock, looks, and lets go.
+    pub fn read_history(&self, id: PaneId, lines: u16) -> Option<String> {
+        let plain = || self.capture_from(id, lines, Source::RecentUnwrapped);
+        // One at a time. Two harvests scrolling the same pane would each
+        // read the other's movements as the application's own and align on
+        // nonsense; two on different panes is merely pointless contention.
+        // A harvest is rare and bounded, so a caller that arrives during one
+        // gets the ordinary read rather than a queue.
+        let Ok(_busy) = self.harvesting.try_lock() else { return plain() };
+        let (cols, rows) = {
+            let panes = lock(&self.panes);
+            let p = panes.get(&id)?;
+            let t = lock(&p.term);
+            let (r, c) = t.parser.screen().size();
+            (c, r)
+        };
+        let screen = PaneScreen { session: self, id, cols, rows };
+        let want = if lines == 0 { RECENT_LINES_DEFAULT } else { lines as usize };
+        let limits = crate::harvest::Limits { lines: want, ..Default::default() };
+        match crate::harvest::harvest(&screen, limits) {
+            Some(h) => {
+                if !h.restored {
+                    // Worth saying out loud: somebody is now looking at a
+                    // screen they did not choose, and the only thing that
+                    // can explain it is this.
+                    eprintln!(
+                        "[session] pane {} could not be scrolled back to where it was",
+                        id.0
+                    );
+                }
+                Some(h.rows.join("\n"))
+            }
+            None => plain(),
+        }
+    }
+
     /// Everything a wait condition needs from one pane, in one lock.
     ///
     /// `info()` would answer the same questions, but it walks every pane in
@@ -632,6 +760,14 @@ impl Session {
     pub fn capture_from(&self, id: PaneId, lines: u16, source: Source) -> Option<String> {
         let panes = lock(&self.panes);
         let mut term = lock(&panes.get(&id)?.term);
+        // The application's own history is not a read at all - it is a
+        // conversation with the program - so it cannot happen under these
+        // locks. Handled before either is taken.
+        if source == Source::History {
+            drop(term);
+            drop(panes);
+            return self.read_history(id, lines);
+        }
         if source != Source::Screen {
             // 0 means "as much as you have" for the screen; for history it
             // has to mean something bounded, or a caller that omitted the

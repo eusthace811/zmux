@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete, plus agent coordination (DESIGN §12). 275 tests
+Phases 0–6 complete, plus agent coordination (DESIGN §12). 293 tests
 passing, clippy clean.
 
 | | |
@@ -96,6 +96,7 @@ synonym for finished. DESIGN §12 has the argument, and
 | `src/help.rs` | The shortcut list. `--help` and `C-b ?` are both generated from it. |
 | `src/mouse.rs` | One mouse event → the bytes the program in that pane asked for. |
 | `src/paste.rs` | Submitting a prompt as one block, and why an end marker in it cannot break out. |
+| `src/harvest.rs` | Reading a full-screen program's own history by scrolling it, and putting its view back. |
 | `src/windows.rs` | Several layouts per session. A window **is** a `Layout`. |
 | `src/render.rs` | vt100 cells → composited `Frame` → ratatui `Buffer`. |
 | `src/session.rs` | Owns panes, layout and clients. Outlives any connection. |

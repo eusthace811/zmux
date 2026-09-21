@@ -406,20 +406,18 @@ still wrote the text, so do not simply send it again.
 ### Read the answer
 
 ```bash
-zmux capture "$S" -p "@$NEW" --source unwrapped -n 120
+zmux capture "$S" -p "@$NEW" --source history -n 200
 ```
 
-| `--source` | |
-| --- | --- |
-| `screen` | the rows on screen (the default) |
-| `recent` | recent output, reaching back into scrollback |
-| `unwrapped` | the same, with lines joined where the pane was too narrow to hold them |
+An agent draws on the *alternate screen*, which has no scrollback - so
+`--source recent` and `unwrapped` cannot see further back than what is on
+screen right now. `history` scrolls the agent itself, collects what it
+reveals and puts its view back where it was. It takes a second or two and it
+does move that pane briefly, so use it to read an answer rather than to poll.
 
-Use `unwrapped` for a transcript. A pane is only as wide as its share of the
-window, so a long answer comes back broken at that width — and those breaks
-are your layout, not the text. Reading history does **not** move the pane's
-scroll position, so it is safe to do while somebody is reading their own
-output.
+When it cannot be done safely it falls back to the ordinary read without
+complaining: a pane that is not a full-screen program, one that does not
+take the mouse, or one you are already scrolled back in.
 
 ### Teaching your agent to say what it is doing
 
