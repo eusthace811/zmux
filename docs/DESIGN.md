@@ -1111,6 +1111,16 @@ waits out its entire timeout on the one case that actually needed a person.
 direct dependency (§6.1) on a binary this project has reasons to keep small,
 and `capture | grep` already covers what a substring cannot express.
 
+It searches the last `RECENT_LINES_DEFAULT` lines, not the whole scrollback,
+and that bound is documented rather than raised. Reading further is linear -
+measured at 80x24: 200 lines cost 68us per poll, 1000 cost 314us, 5000 cost
+1.6ms - so a larger window moves the threshold at a cost in Term-lock time
+twenty times a second, and any fast enough burst still beats it. Closing it
+properly would mean matching incrementally as output arrives, which is the
+per-pane subscriber registry this section already declined. A caller waits
+for something printed at the END of a command, which is what "it finished"
+looks like anyway.
+
 ### Reading history without the screen jumping
 
 `capture` could only ever return the visible rows, and the skill said so as a

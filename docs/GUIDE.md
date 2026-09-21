@@ -365,7 +365,7 @@ zmux wait "$S" -p "@$NEW" --until settled --timeout 120000
 | `idle` `working` `blocked` `done` | one specific reported state |
 | `quiet` | no shell command running. Right for `cargo test`; useless for an agent, which *is* one long command |
 | `quiet-for MS` | the pane has produced no output for that long |
-| `output TEXT` | that text is in the pane's recent output |
+| `output TEXT` | that text is in the pane's last 200 lines. Wait for something printed at the *end* of a command: a pane can out-produce that window between two polls |
 | `bell` | the pane rang the bell |
 
 It prints the session state the wait ended with, plus `outcome`: `met`,
@@ -493,6 +493,23 @@ running and holding the `.exe`. `zmux ls`, kill what it lists, then copy.
 namespace, so `a/b` and `a_b` collide. The client compares the name it asked
 for against the one the daemon reports and refuses the mismatch rather than
 silently joining the wrong session.
+
+**A pane disappears the moment it is made, or an existing one vanishes** —
+the machine may be out of consoles. Every pane is one, and Git Bash refuses to
+start once the *whole machine* has 128, counting every terminal, editor and
+`git.exe` that is holding one. The shell starts and immediately dies, so zmux
+sees an ordinary exit and closes the pane; the reason was on the pane's screen
+for the moment it existed.
+
+The daemon now keeps that reason. Start it with its stderr somewhere you can
+read — from Git Bash, `zmuxd.exe <session> 2> zmux.log` — and look for
+
+```
+[session] pane 3 never started: ... console device allocation failure - too many consoles in use
+```
+
+Closing some terminal windows is the cure. There is nothing zmux can do
+about the ceiling itself: it is shared with everything else running.
 
 **Arrow keys or function keys misbehaving in an app** — worth reporting; keys
 are encoded xterm-style, including application cursor mode, and anything that

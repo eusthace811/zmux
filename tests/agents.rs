@@ -419,6 +419,36 @@ fn a_report_that_arrives_out_of_order_is_dropped() {
     assert_eq!(state_of(&mut c, id), PaneState::Working, "the seq counter stopped moving");
 }
 
+/// The rule is "at or below the last one ACCEPTED", and before the first
+/// report there is no last one.
+///
+/// The counter used to be a plain `u64` starting at zero, which made zero
+/// read as already-accepted: an agent numbering its reports from 0 lost its
+/// first one silently, and lost another after every command boundary, because
+/// a `133;C`/`133;D` puts the counter back.
+#[test]
+fn the_first_report_is_heard_even_when_it_is_numbered_zero() {
+    let d = Daemon::start("zmux-test-report-zero");
+    let mut c = Control::open(&d.session);
+    let id = c.info().panes[0].id;
+    let send = |c: &mut Control, state, seq| {
+        let report = Report { state: Some(state), seq: Some(seq), ..Default::default() };
+        c.ask(&ClientMsg::Report { target: Target::Id(id), report })
+    };
+
+    send(&mut c, PaneState::Working, 0);
+    assert_eq!(
+        state_of(&mut c, id),
+        PaneState::Working,
+        "a first report numbered zero was dropped"
+    );
+    // And zero is then a used number like any other.
+    send(&mut c, PaneState::Idle, 0);
+    assert_eq!(state_of(&mut c, id), PaneState::Working, "seq 0 was accepted twice");
+    send(&mut c, PaneState::Idle, 1);
+    assert_eq!(state_of(&mut c, id), PaneState::Idle);
+}
+
 /// Staleness is solved exactly rather than with a timeout: OSC 133 brackets
 /// the foreground command, so when the command ends the agent is gone and so
 /// is everything it said about itself.

@@ -187,6 +187,14 @@ pub struct Pane {
     /// itself rather than a map the pump would have to lock hundreds of times
     /// a second.
     last_output: Arc<AtomicU64>,
+    /// When this pane was created, on the same process clock.
+    ///
+    /// Only one thing asks: whether a shell that has just died had been alive
+    /// long enough to have run anything. A pane that dies in its first moments
+    /// never got a prompt, so what is on its screen is its own startup error -
+    /// which is the one case where quoting a pane's screen into a log says
+    /// something about zmux rather than about the person using it.
+    born: u64,
 }
 
 /// Process start, for a clock that cannot go backwards.
@@ -397,6 +405,7 @@ impl Pane {
             closing,
             threads: Mutex::new(vec![reader, waiter]),
             last_output,
+            born: now_ms(),
         };
         Ok((pane, events))
     }
@@ -466,6 +475,11 @@ impl Pane {
     /// wrapping to something enormous.
     pub fn quiet_ms(&self) -> u64 {
         now_ms().saturating_sub(self.last_output.load(Ordering::Relaxed))
+    }
+
+    /// Milliseconds since this pane was created.
+    pub fn age_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.born)
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<()> {

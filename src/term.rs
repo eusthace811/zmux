@@ -144,9 +144,15 @@ pub struct Signals {
     pub state: crate::protocol::PaneState,
     /// What the pane says is running in it.
     pub agent: Option<String>,
-    /// Highest `seq` accepted so far. Reset with the rest when a new
-    /// foreground command starts, so an agent restarting at 1 is not ignored.
-    pub report_seq: u64,
+    /// Highest `seq` accepted so far, or `None` when none has been.
+    ///
+    /// An `Option` rather than a counter starting at zero, because the rule is
+    /// "at or below the last one ACCEPTED" and before the first report there
+    /// is no last one. A plain `u64` made zero behave as though it had already
+    /// been accepted, so an agent numbering its reports from 0 lost its first
+    /// one - and lost one again after every command boundary, since
+    /// `forget_reports` puts the counter back.
+    pub report_seq: Option<u64>,
 }
 
 impl Signals {
@@ -158,10 +164,10 @@ impl Signals {
     /// which is the exact lie a caller waiting on that pane cannot survive.
     pub fn record(&mut self, r: &crate::protocol::Report) -> bool {
         if let Some(seq) = r.seq {
-            if seq <= self.report_seq {
+            if self.report_seq.is_some_and(|last| seq <= last) {
                 return false;
             }
-            self.report_seq = seq;
+            self.report_seq = Some(seq);
         }
         let mut changed = false;
         if let Some(state) = r.state {
@@ -191,8 +197,9 @@ impl Signals {
         self.state = crate::protocol::PaneState::Unknown;
         self.agent = None;
         self.name = None;
-        // So an agent that restarts and counts from 1 again is heard.
-        self.report_seq = 0;
+        // So an agent that restarts and counts from the beginning is heard,
+        // whichever number it starts from.
+        self.report_seq = None;
     }
 }
 
@@ -612,5 +619,31 @@ mod tests {
     fn answers_primary_device_attributes() {
         let mut r = QueryResponder::default();
         assert_eq!(r.scan(b"\x1b[c", (0, 0)), b"\x1b[?6c".to_vec());
+    }
+
+    /// A history read sees back exactly as far as it was told to, and no
+    /// further.
+    ///
+    /// This is the bound `Until::Output` inherits, so it is a fact about what
+    /// a wait can notice rather than a detail of `capture`. The comment on
+    /// the wait used to claim a match could not scroll past between two
+    /// polls; it can, and the only honest thing to do is say how far.
+    #[test]
+    fn a_history_read_sees_back_as_far_as_it_was_asked_and_no_further() {
+        let mut t = Term::new(80, 24, 10_000);
+        t.parser.process(b"MARK_EARLY\r\n");
+        for i in 0..1_000 {
+            t.parser.process(format!("filler {i}\r\n").as_bytes());
+        }
+        assert!(
+            !t.read_recent(crate::protocol::RECENT_LINES_DEFAULT, true).contains("MARK_EARLY"),
+            "a bounded read returned something a thousand lines back"
+        );
+        assert!(
+            t.read_recent(2_000, true).contains("MARK_EARLY"),
+            "a read long enough to reach it did not"
+        );
+        // And it is still where the user left it.
+        assert_eq!(t.scroll_offset(), 0, "reading history moved the pane");
     }
 }
