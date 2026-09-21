@@ -1314,4 +1314,76 @@ mod tests {
         // `select-window` needs its index; without one it is not a command.
         assert!(parse_cmd("select-window", None).is_none());
     }
+
+    /// And the other direction, which nothing checked: every command the
+    /// protocol HAS must be advertised and must parse back to itself.
+    ///
+    /// The match is exhaustive on purpose. Adding a `Cmd` variant stops this
+    /// file COMPILING until the variant is given a name here, which is the
+    /// only way to notice that a new command is unreachable from the CLI or
+    /// reachable but undiscoverable. `every_advertised_command_name_parses`
+    /// only ever caught a name with no command behind it; this catches a
+    /// command with no name in front of it, which is how `split-h-bg` could
+    /// have shipped invisible.
+    #[test]
+    fn every_command_the_protocol_has_is_advertised() {
+        fn name_of(c: Cmd) -> &'static str {
+            match c {
+                Cmd::SplitHorizontal => "split-h",
+                Cmd::SplitVertical => "split-v",
+                Cmd::SplitHorizontalBackground => "split-h-bg",
+                Cmd::SplitVerticalBackground => "split-v-bg",
+                Cmd::ClosePane => "close",
+                Cmd::FocusLeft => "focus-left",
+                Cmd::FocusRight => "focus-right",
+                Cmd::FocusUp => "focus-up",
+                Cmd::FocusDown => "focus-down",
+                Cmd::ResizeLeft => "resize-left",
+                Cmd::ResizeRight => "resize-right",
+                Cmd::ResizeUp => "resize-up",
+                Cmd::ResizeDown => "resize-down",
+                Cmd::NewWindow => "new-window",
+                Cmd::NextWindow => "next-window",
+                Cmd::PrevWindow => "prev-window",
+                Cmd::SelectWindow(_) => "select-window",
+                Cmd::ScrollUp => "scroll-up",
+                Cmd::ScrollDown => "scroll-down",
+                Cmd::ScrollPageUp => "page-up",
+                Cmd::ScrollPageDown => "page-down",
+                Cmd::ScrollToBottom => "scroll-bottom",
+            }
+        }
+        let all = [
+            Cmd::SplitHorizontal,
+            Cmd::SplitVertical,
+            Cmd::SplitHorizontalBackground,
+            Cmd::SplitVerticalBackground,
+            Cmd::ClosePane,
+            Cmd::FocusLeft,
+            Cmd::FocusRight,
+            Cmd::FocusUp,
+            Cmd::FocusDown,
+            Cmd::ResizeLeft,
+            Cmd::ResizeRight,
+            Cmd::ResizeUp,
+            Cmd::ResizeDown,
+            Cmd::NewWindow,
+            Cmd::NextWindow,
+            Cmd::PrevWindow,
+            Cmd::SelectWindow(0),
+            Cmd::ScrollUp,
+            Cmd::ScrollDown,
+            Cmd::ScrollPageUp,
+            Cmd::ScrollPageDown,
+            Cmd::ScrollToBottom,
+        ];
+        // Whole words: `contains("split-h")` is also true of `split-h-bg`,
+        // so a missing name could hide inside a longer one.
+        let advertised: Vec<&str> = CMD_NAMES.split_whitespace().collect();
+        for c in all {
+            let n = name_of(c);
+            assert!(advertised.contains(&n), "`{n}` is a command but `send` never lists it");
+            assert_eq!(parse_cmd(n, Some("0")), Some(c), "`{n}` does not parse back to itself");
+        }
+    }
 }
