@@ -525,6 +525,87 @@ impl Pane {
 mod tests {
     use super::*;
 
+    /// Build a tree that looks exactly like a Git for Windows install.
+    fn fake_git(root: &std::path::Path, msys: bool, git: bool) {
+        std::fs::create_dir_all(root.join("bin")).expect("bin");
+        std::fs::write(root.join("bin").join("bash.exe"), b"").expect("bash");
+        std::fs::create_dir_all(root.join("usr").join("bin")).expect("usr/bin");
+        std::fs::write(root.join("usr").join("bin").join("bash.exe"), b"").expect("usr bash");
+        if msys {
+            std::fs::write(root.join("usr").join("bin").join("msys-2.0.dll"), b"").expect("msys");
+        }
+        if git {
+            std::fs::create_dir_all(root.join("cmd")).expect("cmd");
+            std::fs::write(root.join("cmd").join("git.exe"), b"").expect("git");
+        }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("zmux-gitbash-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// The shell fingerprint, which nothing covered.
+    ///
+    /// This decides what the daemon executes, and herdr's rule - which this
+    /// follows - is DO NOT TRUST THE NAME. Anything called `bash.exe` on a
+    /// machine would otherwise be launched as the user's shell; the check is
+    /// that the MSYS runtime and `git.exe` sit where a real Git for Windows
+    /// install puts them. Every rejection below is a path that would have
+    /// spawned the wrong program.
+    #[test]
+    fn a_shell_is_only_git_bash_when_the_whole_install_is_there() {
+        let root = scratch("ok");
+        fake_git(&root, true, true);
+
+        let bash = root.join("bin").join("bash.exe");
+        assert!(is_git_bash(&bash), "a complete install was rejected: {}", bash.display());
+        // The `usr/bin` layout, which the function steps past on purpose.
+        assert!(is_git_bash(&root.join("usr").join("bin").join("bash.exe")));
+
+        // The name is not enough, in either direction.
+        std::fs::write(root.join("bin").join("notbash.exe"), b"").expect("write");
+        assert!(!is_git_bash(&root.join("bin").join("notbash.exe")), "any .exe passed as a shell");
+        assert!(
+            is_git_bash(&root.join("bin").join("BASH.EXE")),
+            "Windows filenames are case-insensitive and so must this be"
+        );
+
+        // A directory called bash.exe is not a shell.
+        std::fs::create_dir_all(root.join("bin").join("dir.exe")).expect("dir");
+        assert!(!is_git_bash(&root.join("bin").join("dir.exe")));
+
+        // Right name, wrong place: not under a `bin`.
+        std::fs::write(root.join("bash.exe"), b"").expect("write");
+        assert!(!is_git_bash(&root.join("bash.exe")), "a bash.exe outside bin/ was accepted");
+
+        // A relative path can be resolved against anything, so it is refused
+        // before the filesystem is touched at all.
+        assert!(!is_git_bash(std::path::Path::new("bin/bash.exe")));
+        assert!(!is_git_bash(std::path::Path::new("bash.exe")));
+
+        // And something that simply is not there.
+        assert!(!is_git_bash(&root.join("bin").join("absent.exe")));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The two halves of the fingerprint are both load-bearing.
+    #[test]
+    fn a_lookalike_install_missing_either_half_is_refused() {
+        for (tag, msys, git) in [("nomsys", false, true), ("nogit", true, false)] {
+            let root = scratch(tag);
+            fake_git(&root, msys, git);
+            let bash = root.join("bin").join("bash.exe");
+            assert!(
+                !is_git_bash(&bash),
+                "{tag}: a tree with a bash.exe but no {} was taken for Git Bash",
+                if msys { "git.exe" } else { "msys-2.0.dll" }
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
     /// `portable-pty` merges the Windows `Environment` registry keys over the
     /// process environment, and a value that arrives with an embedded NUL
     /// truncates the whole `CreateProcessW` block. `pane_command` must hand a

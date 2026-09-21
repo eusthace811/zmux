@@ -141,6 +141,102 @@ fn many_splits_then_closing_them_all_ends_with_one_working_pane() {
     );
 }
 
+/// Adding and removing panes must not break the delta chain either.
+///
+/// `a_burst_of_commands_does_not_break_the_delta_chain` covers scrolling, and
+/// `switching_windows_resends_the_whole_screen` covers a window switch. A
+/// SPLIT and a CLOSE go through the same `reflow_locked` - which bumps the
+/// revision and clears the delta base so the next publish is a whole frame -
+/// but nothing asserted it, and they are the two layout changes a person
+/// makes constantly.
+///
+/// The failure this catches is not a wrong pixel, it is a FROZEN one: a delta
+/// derived against a base the client never had is refused, nothing asks for a
+/// resync, and the screen stops moving while the session carries on. So the
+/// assertion is that output keeps ARRIVING after each change, not that any
+/// particular frame was full.
+#[test]
+fn adding_and_removing_panes_does_not_break_the_delta_chain() {
+    let d = Daemon::start("zmux-test-layout-chain");
+    let mut c = d.attach_ready(100, 30);
+
+    for round in 0..4 {
+        c.cmd(Cmd::SplitVertical);
+        assert!(d.wait_for_panes(2, 20), "round {round}: the split never appeared");
+        // Focus follows a plain split, so this lands in the NEW pane.
+        c.input(&format!("echo SPLIT_{round}\r"));
+        assert!(
+            c.wait_for(25, |t| t.contains(&format!("SPLIT_{round}"))).is_some(),
+            "round {round}: the screen stopped updating after a split"
+        );
+
+        c.cmd(Cmd::ClosePane);
+        assert!(d.wait_for_panes(1, 20), "round {round}: the pane never closed");
+        c.input(&format!("echo CLOSED_{round}\r"));
+        assert!(
+            c.wait_for(25, |t| t.contains(&format!("CLOSED_{round}"))).is_some(),
+            "round {round}: the screen stopped updating after a close"
+        );
+    }
+
+    // Still tracking live output after eight layout changes, which is what
+    // says the chain is intact rather than merely having recovered once.
+    c.input("echo CHAIN_STILL_GOOD\r");
+    assert!(
+        c.wait_for(25, |t| t.contains("CHAIN_STILL_GOOD")).is_some(),
+        "the client stopped tracking output after repeated layout changes"
+    );
+}
+
+/// A pane flooding output with NOBODY ATTACHED must not wedge the daemon.
+///
+/// Every other test here attaches a client first, which is the wrong shape
+/// for the thing this is actually built for: a session driven entirely over
+/// control connections has no viewport at all, and the pump takes a different
+/// path for it - it drains pane events and skips compositing, because there
+/// is nothing to composite for.
+///
+/// That path has its own backpressure. Each pane's reader hands output to a
+/// 256-slot queue and the session forwards it into a 512-slot one; the
+/// forwarding send BLOCKS when the pump is behind. If the pump ever stopped
+/// draining while panes kept producing, those sends would pile up and the
+/// session would stop answering - and with no client attached there would be
+/// nothing on screen to show it had.
+#[test]
+fn a_headless_session_survives_a_pane_that_floods_it() {
+    use zmux::protocol::{Query, Source, Target};
+
+    let d = Daemon::start("zmux-test-headless-flood");
+    let mut c = common::Control::open(&d.session);
+    let id = c.info().panes[0].id;
+
+    // Far more than either queue holds, and more than the scrollback keeps.
+    c.input_at(Target::Id(id), "for i in $(seq 1 20000); do echo GUSH_$i; done", true);
+    assert!(
+        c.wait_at(90, Target::Id(id), |t| t.contains("GUSH_20000")).is_some(),
+        "the flood never finished with nobody attached"
+    );
+
+    // The daemon still answers, and the pane is still a working shell.
+    let info = c.info();
+    assert_eq!(info.panes.len(), 1, "the session lost a pane to the flood");
+    c.input_at(Target::Id(id), "echo AFTER_THE_FLOOD", true);
+    assert!(
+        c.wait_at(30, Target::Id(id), |t| t.matches("AFTER_THE_FLOOD").count() >= 2).is_some(),
+        "the pane stopped accepting input after flooding a headless session"
+    );
+
+    // And a history read still works, which is the thing a caller does next.
+    let q = Query::CaptureAt { target: Target::Id(id), lines: 50, source: Source::RecentUnwrapped };
+    match c.ask(&ClientMsg::Query(q)) {
+        ServerMsg::Capture { text } => {
+            assert!(text.contains("AFTER_THE_FLOOD"), "the read missed the newest output")
+        }
+        other => panic!("capture failed after a flood: {other:?}"),
+    }
+    assert!(ipc::is_running(&d.session));
+}
+
 /// A peer sending garbage must be refused without disturbing the session.
 #[test]
 fn a_hostile_peer_cannot_disturb_a_healthy_session() {

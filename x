@@ -148,23 +148,31 @@ case "${1:-test}" in
            export RUST_TEST_THREADS="${RUST_TEST_THREADS:-4}"
            # Collect each daemon's stderr, which is the only place a lost pane
            # explains itself. Without this the cause is unreachable.
+           # A directory the daemons can write to, and a unix path to read it
+           # back through. When the caller supplied one, keep it - but keep
+           # READING it too: an earlier version dropped the diagnosis
+           # entirely in that case, which is exactly when someone is already
+           # trying to work out what went wrong.
            if [ -z "${ZMUX_TEST_LOG:-}" ]; then
              logs="$(mktemp -d)"
-             if [ "$HOST" = wsl ]; then
-               export ZMUX_TEST_LOG="$(wslpath -w "$logs")"
-             else
-               export ZMUX_TEST_LOG="$(cygpath -w "$logs")"
-             fi
              trap 'rm -rf "$logs"' EXIT
+           elif [ "$HOST" = wsl ]; then
+             logs="$(wslpath -u "$ZMUX_TEST_LOG")"
            else
-             logs=""
+             logs="$(cygpath -u "$ZMUX_TEST_LOG")"
+           fi
+           mkdir -p "$logs"
+           if [ "$HOST" = wsl ]; then
+             export ZMUX_TEST_LOG="$(wslpath -w "$logs")"
+           else
+             export ZMUX_TEST_LOG="$(cygpath -w "$logs")"
            fi
            status=0
            run_cargo test "$@" || status=$?
            # Say WHY, not just that. A run that failed because the machine ran
            # out of consoles is not a failing test suite, and reading it as
            # one costs an afternoon.
-           if [ "$status" -ne 0 ] && [ -n "$logs" ]; then
+           if [ "$status" -ne 0 ]; then
              if grep -qs 'too many consoles' "$logs"/*.log; then
                echo "" >&2
                echo "x: the shells in these tests could not start - Windows is out of consoles." >&2
