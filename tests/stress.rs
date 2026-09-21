@@ -315,3 +315,86 @@ fn a_burst_of_commands_does_not_break_the_delta_chain() {
         "client stopped tracking output after the burst"
     );
 }
+
+/// Window churn while a pane is producing output.
+///
+/// WHAT THIS DOES NOT DO, stated first because the comment it sits next to
+/// invites the assumption: it does NOT pin the backwards-delta race that
+/// `publish()` describes. That race - two publishers composing concurrently
+/// and committing in the opposite order, so the loser derives a delta from a
+/// base the winner has moved past, and the screen freezes - was found live
+/// and fixed by holding `last_published` across compose-derive-send. I could
+/// not reproduce it from a test. Moving the compose back outside the lock
+/// leaves this GREEN, so it is not the guard for that line.
+///
+/// Three shapes were tried against the reintroduced bug. A flood masks it:
+/// the client's slot stays occupied, `coalescing` forces a full frame, and a
+/// full frame repairs the very chain the race breaks. Paced output is the
+/// right shape but `sleep` on MSYS is a process - ~7ms each - so a loop long
+/// enough to race across is minutes long, and a short one did not hit the
+/// window. The race needs two publishes to overlap inside a few tens of
+/// microseconds, which nothing here can arrange on purpose.
+///
+/// What it IS worth: window switching from a SECOND connection while a pane
+/// talks, which is two threads publishing concurrently, and the only
+/// question that matters afterwards - does the display still move, and does
+/// the pane still take input. That is a real shape with real coverage, and
+/// it is the shape under which the delta chain is most likely to be broken
+/// by a future change. It is named for what it checks rather than for the
+/// bug it cannot catch.
+#[test]
+fn switching_windows_under_load_does_not_freeze_the_display() {
+    let d = Daemon::start("zmux-test-switch-under-load");
+    let mut c = d.attach_ready(120, 30);
+    let mut ctl = common::Control::open(&d.session);
+
+    c.cmd(Cmd::NewWindow);
+    assert!(d.wait_for_window(1, 2, 25), "the second window never appeared");
+    c.cmd(Cmd::SelectWindow(0));
+    assert!(d.wait_for_window(0, 2, 10), "never got to the busy window");
+
+    // Flat out, so the pump is publishing as often as pacing allows and a
+    // switch is very likely to land mid-compose.
+    // PACED, and short. Both halves are load-bearing.
+    //
+    // Paced, because a flood MASKS the bug: the client's slot stays
+    // occupied, `coalescing` forces a full frame, and a full frame repairs
+    // the very chain this is trying to break. The race needs a client that
+    // keeps up, so deltas are actually being used.
+    //
+    // Short, because on MSYS `sleep` is a PROCESS - ~7ms each (DESIGN §12) -
+    // so 200 iterations is already several seconds of spawning. An earlier
+    // draft used 3000 and ran for minutes.
+    c.input("for i in $(seq 1 200); do echo LOAD_$i; sleep 0.02; done\r");
+    assert!(c.wait_for(25, |t| t.contains("LOAD_1")).is_some(), "the producer never started");
+
+    // From the OTHER connection, so the switch and the pump are on different
+    // threads and can interleave.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut switches = 0u32;
+    while Instant::now() < deadline {
+        ctl.ask(&ClientMsg::Command(Cmd::SelectWindow(1)));
+        ctl.ask(&ClientMsg::Command(Cmd::SelectWindow(0)));
+        switches += 2;
+    }
+    assert!(switches > 100, "only {switches} switches - too few to race anything");
+
+    // The display must still be live. A frozen delta chain shows the last
+    // frame that applied and never moves again, so output the client has NOT
+    // yet seen is the proof. The loop's own tail serves: frames are
+    // coalesced, so the intermediate values were never rendered anyway, and
+    // only the end of it is guaranteed to land and stay.
+    assert!(d.wait_for_window(0, 2, 10), "not on the busy window");
+    assert!(
+        c.wait_for(60, |t| t.contains("LOAD_200")).is_some(),
+        "the display froze after switching windows under load"
+    );
+
+    // And the pane still takes input, rather than merely having finished
+    // painting what it already had.
+    c.input("echo AFTER_THE_STORM\r");
+    assert!(
+        c.wait_for(30, |t| t.contains("AFTER_THE_STORM")).is_some(),
+        "the pane stopped accepting input after the storm"
+    );
+}

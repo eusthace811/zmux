@@ -1255,6 +1255,36 @@ through the `Serialize` impl, so a skipped field is skipped *on the wire*, and
 the decoder then reads the next field's bytes as this one. `SessionInfo::created`
 is a plain `Option` and shows as `null` in JSON for that reason.
 
+### A known gap: the backwards-delta race has no regression test
+
+`publish()` holds `last_published` across compose-derive-send because two
+publishers composing concurrently could commit in the opposite order: the
+loser derives a delta from a base the winner has already moved past, the
+client refuses it, nothing repairs the base, and the screen freezes on the
+last frame that applied. It was found live, by switching windows while a
+pane was producing output.
+
+**Nothing in the suite would catch it coming back.** That is worth writing
+down rather than leaving for someone to discover by assuming otherwise.
+Moving the compose back outside the lock leaves every test green, including
+`switching_windows_under_load_does_not_freeze_the_display`, which is named
+for what it does check rather than for this.
+
+Three shapes were tried. A **flood masks it**: the client's slot stays
+occupied, so `coalescing` forces a full frame, and a full frame repairs the
+very chain the race breaks — the bug needs a client that is keeping up and
+genuinely taking deltas. **Paced output** is the right shape, but `sleep` on
+MSYS is a process at ~7ms a call, so a loop long enough to race across runs
+for minutes, and a short one never hit the window. The window is the few tens
+of microseconds between `snapshot()` returning and the lock being taken, and
+no arrangement of shell commands can aim at it.
+
+Closing it properly would mean a seam in `publish()` that a test can block
+on — injecting a pause between compose and commit — which is production code
+existing for a test. Worth doing if this area is ever touched again; not
+worth doing speculatively. Until then the guard is the comment, and the
+comment is why it is three paragraphs long.
+
 ### What a frame costs, and what was not done about it
 
 Measured on the target machine, release build, dense screens, four panes —
