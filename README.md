@@ -5,7 +5,7 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete, plus agent coordination (DESIGN §12). 255 tests
+Phases 0–6 complete, plus agent coordination (DESIGN §12). 257 tests
 passing, clippy clean.
 
 | | |
