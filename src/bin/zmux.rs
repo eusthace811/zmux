@@ -498,7 +498,10 @@ const WAIT_USAGE: &str = "\
 usage: zmux wait <session> [-p T] --until <what> [--timeout MS] [--settle MS]
 
   --until settled     the pane reports idle, done OR blocked - the usual one
-          idle | working | blocked | done
+          idle | working | blocked | done | unknown
+                       `unknown` is what 133;D leaves behind when the agent
+                       exits, so it waits for one to LEAVE. A pane that never
+                       reported is already there - it does not mean finished
           quiet        no shell command is running (an ordinary command, not
                        an agent, which is one long command)
           quiet-for MS the pane has produced no output for that long; the
@@ -642,7 +645,9 @@ usage: zmux report [<session>] [-p T] [--state S] [--agent A] [--name N] [--seq 
        zmux report --check      check the channel, without changing anything
        zmux report --osc ...    print the escape instead of sending it
 
-  --state   idle | working | blocked | done
+  --state   idle | working | blocked | done | unknown
+            `unknown` clears the claim, for a reporter that has stopped
+            knowing rather than learnt something
   --agent   what is running, in its own words
   --name    a handle for this pane: a-z, then a-z 0-9 _ -
   --seq     monotonic; a report at or below the last one is dropped
@@ -1313,6 +1318,83 @@ mod tests {
         assert!(parse_cmd("no-such-command", None).is_none());
         // `select-window` needs its index; without one it is not a command.
         assert!(parse_cmd("select-window", None).is_none());
+    }
+
+    /// The same drift guard for the other two vocabularies a caller types.
+    ///
+    /// This is the THIRD time a list and its parser have been able to
+    /// disagree here - `C-b [` went undocumented for months, `send` grew a
+    /// list test after the same thing, and the background splits could have
+    /// shipped unnamed. The fix generalises: if the user types a word, the
+    /// help that lists it and the code that reads it are pinned together.
+    ///
+    /// Both matches are exhaustive, so adding a `PaneState` or an `Until`
+    /// stops this file compiling until it is spelled and listed.
+    #[test]
+    fn every_state_and_wait_word_is_both_listed_and_understood() {
+        fn state_word(s: PaneState) -> &'static str {
+            match s {
+                PaneState::Unknown => "unknown",
+                PaneState::Idle => "idle",
+                PaneState::Working => "working",
+                PaneState::Blocked => "blocked",
+                PaneState::Done => "done",
+            }
+        }
+        // The ALTERNATIVES LINE, not the whole text. `contains` was
+        // satisfied by the prose underneath, so a state could go missing
+        // from the list and the test would still pass - which it did, on
+        // the first mutation run.
+        fn alternatives(usage: &str) -> Vec<&str> {
+            let line = usage
+                .lines()
+                .find(|l| l.contains(" | "))
+                .expect("a usage that lists alternatives");
+            line.rsplit("  ")
+                .next()
+                .expect("the alternatives are the last run of the line")
+                .split('|')
+                .map(str::trim)
+                .collect()
+        }
+        let wait_words = alternatives(WAIT_USAGE);
+        let report_words = alternatives(REPORT_USAGE);
+        for st in [
+            PaneState::Unknown,
+            PaneState::Idle,
+            PaneState::Working,
+            PaneState::Blocked,
+            PaneState::Done,
+        ] {
+            let w = state_word(st);
+            assert_eq!(PaneState::parse(w), Some(st), "`{w}` does not parse back to itself");
+            assert!(report_words.contains(&w), "`report` takes `{w}` but lists {report_words:?}");
+            assert!(wait_words.contains(&w), "`wait` takes `{w}` but lists {wait_words:?}");
+        }
+
+        // `Until` by the word that produces it. `State` is covered above, so
+        // it stands for all five at once.
+        fn until_word(u: &Until) -> &'static str {
+            match u {
+                Until::Settled => "settled",
+                Until::Quiet => "quiet",
+                Until::Bell => "bell",
+                Until::QuietFor(_) => "quiet-for",
+                Until::Output(_) => "output",
+                Until::State(_) => "idle",
+            }
+        }
+        for u in [
+            Until::Settled,
+            Until::Quiet,
+            Until::Bell,
+            Until::QuietFor(0),
+            Until::Output(String::new()),
+            Until::State(PaneState::Idle),
+        ] {
+            let w = until_word(&u);
+            assert!(WAIT_USAGE.contains(w), "`--until {w}` works but the help never lists it");
+        }
     }
 
     /// And the other direction, which nothing checked: every command the
