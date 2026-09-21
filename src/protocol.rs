@@ -791,3 +791,187 @@ impl Frame {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer on a local pipe is not automatically trusted, and this is the
+    /// only thing standing between `Hello { cols: 65535, rows: 65535 }` and
+    /// `vt100::Screen::set_size` being asked for four billion cells.
+    ///
+    /// Untested until now, which is the wrong state for a bound whose whole
+    /// job is to survive a hostile number.
+    #[test]
+    fn client_geometry_is_clamped_into_something_we_will_allocate() {
+        assert_eq!(clamp_size(u16::MAX, u16::MAX), (MAX_COLS, MAX_ROWS));
+        assert_eq!(clamp_size(0, 0), (MIN_USABLE_COLS, MIN_USABLE_ROWS));
+        // A minimised client reporting nothing must not shrink the session to
+        // zero; `apply_size` filters those out, and this is the backstop.
+        assert_eq!(clamp_size(1, 1), (MIN_USABLE_COLS, MIN_USABLE_ROWS));
+        // An ordinary size passes through untouched.
+        assert_eq!(clamp_size(120, 40), (120, 40));
+        let (c, r) = clamp_size(u16::MAX, u16::MAX);
+        assert!(
+            (c as usize) * (r as usize) < 1_000_000,
+            "the clamped grid is still too large to allocate per pane"
+        );
+    }
+
+    /// A name becomes a `Target`, so it has to be unambiguous against a
+    /// position and safe as a shell argument.
+    #[test]
+    fn a_pane_name_is_typeable_unambiguous_and_bounded() {
+        for good in ["reviewer", "a", "build-2", "x_y", &"a".repeat(MAX_NAME_CHARS)] {
+            assert!(is_valid_name(good), "{good:?} should be a legal name");
+        }
+        for bad in [
+            "",                              // nothing to address
+            "2nd",                           // a leading digit is a position
+            "Reviewer",                      // capitals: a typo, not a pane
+            "my pane",                       // spaces need quoting
+            "rm -rf /",                      // and so does everything here
+            "père",                          // non-ASCII
+            "current",                       // reserved for `-p current`
+            &"a".repeat(MAX_NAME_CHARS + 1), // unbounded on the wire
+        ] {
+            assert!(!is_valid_name(bad), "{bad:?} should be refused");
+        }
+    }
+
+    /// `zmux report --state done` and `zmux wait --until done` have to
+    /// mean the same thing, and they meet only through these two functions.
+    #[test]
+    fn every_state_survives_the_round_trip_through_its_own_name() {
+        for state in [
+            PaneState::Unknown,
+            PaneState::Idle,
+            PaneState::Working,
+            PaneState::Blocked,
+            PaneState::Done,
+        ] {
+            assert_eq!(PaneState::parse(state.as_str()), Some(state), "{state:?}");
+        }
+        // Anything else is refused rather than read as `Unknown` - a typo in
+        // somebody's hook must not erase a state that was true.
+        for junk in ["", "IDLE", "idle ", "finished", "0"] {
+            assert_eq!(PaneState::parse(junk), None, "{junk:?} was accepted");
+        }
+        // What a caller waiting on `settled` is told to expect.
+        for settled in [PaneState::Idle, PaneState::Done, PaneState::Blocked] {
+            assert!(settled.is_settled(), "{settled:?}");
+        }
+        for going in [PaneState::Unknown, PaneState::Working] {
+            assert!(!going.is_settled(), "{going:?} is not a pane that has stopped");
+        }
+    }
+
+    /// A frame is peer-supplied data and the client indexes into it.
+    #[test]
+    fn a_frame_that_does_not_match_its_own_geometry_is_not_well_formed() {
+        let good = Frame::blank(10, 3);
+        assert!(good.is_well_formed());
+
+        let mut short = Frame::blank(10, 3);
+        short.cells.pop();
+        assert!(!short.is_well_formed(), "a short cell vector would index out of bounds");
+
+        let mut huge = Frame::blank(10, 3);
+        huge.cols = MAX_COLS + 1;
+        assert!(!huge.is_well_formed(), "geometry past the clamp was accepted");
+    }
+
+    fn delta_of(prev: &Frame, next: &Frame) -> FrameDelta {
+        next.delta_from(prev).expect("same geometry")
+    }
+
+    /// A delta carries the rows that CHANGED, and only those. That is the
+    /// entire reason it exists.
+    #[test]
+    fn a_delta_carries_only_the_rows_that_moved() {
+        let base = Frame::blank(10, 4);
+        let mut next = base.clone();
+        next.revision = 1;
+        assert!(
+            delta_of(&base, &next).rows_changed.is_empty(),
+            "an unchanged screen produced a delta with rows in it"
+        );
+
+        next.cells[2 * 10 + 5].ch = 'x';
+        let d = delta_of(&base, &next);
+        assert_eq!(d.rows_changed.len(), 1, "one changed cell touched more than its row");
+        assert_eq!(d.rows_changed[0].0, 2);
+
+        // And it applies.
+        let mut client = base.clone();
+        assert!(client.apply_delta(&d));
+        assert_eq!(client.cells[2 * 10 + 5].ch, 'x');
+        assert_eq!(client.revision, 1);
+    }
+
+    /// The guard that exists because it actually happened: two publishers can
+    /// snapshot at N, pause, and emit a delta claiming base N+1 -> revision N.
+    ///
+    /// Checking the base alone accepts it and walks the client's revision
+    /// BACKWARDS, after which every later delta is refused and nothing asks
+    /// for a resync - the frozen display DESIGN.md §4 describes.
+    #[test]
+    fn a_delta_that_would_move_the_revision_backwards_is_refused() {
+        let mut client = Frame::blank(10, 3);
+        client.revision = 5;
+        let backwards = FrameDelta {
+            base_revision: 5,
+            revision: 4, // older than the base it claims
+            cols: 10,
+            rows: 3,
+            rows_changed: vec![(0, vec![Cell::default(); 10])],
+            cursor: None,
+            app_cursor: false,
+            mouse: false,
+        };
+        assert!(!client.apply_delta(&backwards), "a backwards delta was applied");
+        assert_eq!(client.revision, 5, "the client's revision moved anyway");
+    }
+
+    /// Rows are validated BEFORE any of them is written.
+    ///
+    /// Checking as it goes would leave the frame half-updated when a later
+    /// row is malformed - a corrupted screen, which is the thing the base
+    /// check exists to prevent in the first place.
+    #[test]
+    fn a_delta_with_one_bad_row_changes_nothing_at_all() {
+        let mut client = Frame::blank(4, 3);
+        let before = client.cells.clone();
+        for bad in [
+            // A good row first, then one that is too short: if it applied as
+            // it went, row 0 would already be written.
+            vec![(0u16, vec![Cell { ch: 'a', ..Cell::default() }; 4]), (1, vec![Cell::default(); 3])],
+            // A row index past the end of the frame.
+            vec![(0, vec![Cell { ch: 'b', ..Cell::default() }; 4]), (99, vec![Cell::default(); 4])],
+        ] {
+            let d = FrameDelta {
+                base_revision: 0,
+                revision: 1,
+                cols: 4,
+                rows: 3,
+                rows_changed: bad,
+                cursor: None,
+                app_cursor: false,
+                mouse: false,
+            };
+            assert!(!client.apply_delta(&d), "a malformed delta was accepted");
+            assert_eq!(client.cells, before, "a refused delta wrote part of itself anyway");
+            assert_eq!(client.revision, 0);
+        }
+    }
+
+    /// Geometry changing means no delta can describe the transition, so one
+    /// is not offered at all.
+    #[test]
+    fn no_delta_is_offered_across_a_resize() {
+        let small = Frame::blank(10, 3);
+        let big = Frame::blank(20, 3);
+        assert!(big.delta_from(&small).is_none());
+        assert!(small.delta_from(&big).is_none());
+    }
+}
