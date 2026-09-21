@@ -486,8 +486,19 @@ fn wait_for(
         }
         // The pane has started doing something, so the condition is now
         // about THIS command rather than the state before it.
-        active |= now.busy
-            || now.state == PaneState::Working
+        //
+        // Every signal is measured AGAINST `start`, never as a level. An
+        // agent is one long foreground command, so `133;C` set `busy` when
+        // it started and it stays set for the agent's whole life: read as a
+        // level, `busy` opened the gate on the first poll for precisely the
+        // pane this gate exists to protect, and the wait was answered by the
+        // state from before the prompt. Having been busy since before the
+        // wait began is not something that has happened since.
+        //
+        // `bells` was already compared this way, which is why it was the one
+        // signal that behaved. The other two now match it.
+        active |= (now.busy && !start.busy)
+            || (now.state == PaneState::Working && start.state != PaneState::Working)
             || now.bells > start.bells
             || std::time::Instant::now() >= gate;
         let met = active

@@ -955,3 +955,42 @@ fn a_tui_that_marks_its_own_message_zones_keeps_what_it_reported() {
     assert_eq!(gone.agent, None, "a claim outlived the process that made it");
     assert_eq!(gone.name, None);
 }
+
+/// The settle gate must hold for a pane that was ALREADY busy.
+///
+/// An agent is one long foreground command: OSC 133;C set `busy` when it
+/// started and it stays set for as long as the agent lives. The gate tested
+/// `now.busy` as a LEVEL, so for the one pane it exists to protect - an agent
+/// being prompted - it opened on the very first poll, and the wait was
+/// answered by the state the pane was in BEFORE the prompt. `--settle` says
+/// it waits "until the pane has been seen doing something"; having been busy
+/// since before the wait began is not something that happened since.
+///
+/// `start` is already read up front so `Until::Bell` can mean "from here on".
+/// This is the same rule applied to the other two signals the gate watches.
+#[test]
+fn a_settle_gate_holds_for_a_pane_that_was_already_busy() {
+    let d = Daemon::start("zmux-test-settle-busy");
+    let mut c = Control::open(&d.session);
+    assert!(c.wait_at(20, Target::Focused, |t| t.contains('$')).is_some());
+
+    // An agent's shape: claim a settled state, then hold the foreground.
+    let keys = "state=idle;agent=ampere";
+    let cmd = format!(r"printf '\033]1341;zmux;{keys}\033\\'; read -r _");
+    c.input_at(Target::Focused, &cmd, true);
+    let p = wait_for_state(&mut c, PaneState::Idle, 20).expect("the report never arrived");
+    assert!(p.busy, "the pane is not busy, so this test would prove nothing");
+
+    // Nothing has happened since that report. The gate must hold its full
+    // time rather than handing back the state that was already there.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        waited_settling(&mut c, Target::Focused, Until::Settled, 30_000, 1_500),
+        WaitOutcome::Met
+    );
+    let held = started.elapsed();
+    assert!(
+        held.as_millis() >= 1_400,
+        "the gate opened at once for a pane that was busy before the wait began: {held:?}"
+    );
+}

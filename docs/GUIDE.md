@@ -377,7 +377,10 @@ simply still going.
 run a command and wait for `quiet` in the next breath, and the shell has not
 read the line yet, so the wait is satisfied by the quiet *before* your
 command. The gate ignores the condition until the pane is seen doing
-something. Pass `--settle 0` when the pane is already working.
+something *since the wait began* - a pane that was already busy, as every
+agent is for its whole life, does not count as having started. Pass
+`--settle 0` when the pane is already working on the thing you are
+waiting for.
 
 ### Read the answer
 
