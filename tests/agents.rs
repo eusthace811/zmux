@@ -994,3 +994,53 @@ fn a_settle_gate_holds_for_a_pane_that_was_already_busy() {
         "the gate opened at once for a pane that was busy before the wait began: {held:?}"
     );
 }
+
+/// Two panes claiming the same name must not silently pick one.
+///
+/// `Target::Name` took the FIRST pane whose claim matched, in window-then-
+/// position order. Nothing anywhere enforces the "unique among live panes"
+/// rule DESIGN §12 states: `record` is per-pane, and the report arrives on
+/// the pty reader path, which holds the `Term` lock and cannot go looking at
+/// its neighbours without inverting the lock order.
+///
+/// So an accidental duplicate - two agents started from the same script -
+/// routed a prompt into whichever pane sorted first. That is the silent
+/// wrong answer `a_target_that_does_not_resolve_is_refused_not_redirected`
+/// refuses for every other kind of target.
+#[test]
+fn a_name_two_panes_claim_reaches_neither() {
+    let d = Daemon::start("zmux-test-duplicate-name");
+    let mut c = Control::open(&d.session);
+    assert!(matches!(c.ask(&ClientMsg::Command(Cmd::SplitVertical)), ServerMsg::Info(_)));
+    assert!(d.wait_for_panes(2, 10), "the split never appeared");
+
+    // Both panes claim `reviewer`, which is exactly what starting the same
+    // agent script twice does.
+    let ids: Vec<u32> = c.info().panes.iter().map(|p| p.id).collect();
+    for id in &ids {
+        c.input_at(Target::Id(*id), &agent_like("state=idle;name=reviewer"), true);
+    }
+    let claimed = |c: &mut Control| {
+        c.info().panes.iter().filter(|p| p.name.as_deref() == Some("reviewer")).count()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while claimed(&mut c) < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(claimed(&mut c), 2, "both panes never claimed the name");
+
+    // The name is now ambiguous, so it addresses nothing.
+    let reply = c.ask(&ClientMsg::InputAt {
+        target: Target::Name("reviewer".into()),
+        data: b"echo AMBIGUOUS".to_vec(),
+        paste: false,
+        enter: true,
+    });
+    let ServerMsg::Refused { reason } = reply else {
+        panic!("an ambiguous name was delivered somewhere instead of refused: {reply:?}");
+    };
+    assert!(
+        reason.contains("2") && reason.contains("reviewer"),
+        "the refusal must say the name is claimed twice, not that it is unknown: {reason}"
+    );
+}

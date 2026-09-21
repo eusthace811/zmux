@@ -174,10 +174,17 @@ pane. It takes four things:
 | --- | --- |
 | `3` | position in the current window |
 | `@3` | pane id — the stable one, and the only one that reaches a background window |
-| `reviewer` | a name the pane claimed for itself |
+| `reviewer` | a name the pane claimed for itself — see below |
 | `current` | the pane you are running in (`$ZMUX_PANE`) |
 
 Use `@id` for anything that outlives a single command.
+
+A name is only as good as its uniqueness. Nothing stops two panes
+claiming the same one — starting the same agent script twice is enough —
+and a name two panes answer to addresses **neither**: the command is
+refused, and the refusal tells you how many claimed it. That is
+deliberate; picking one would put your prompt in the wrong agent's pane.
+It clears itself when one of them exits. `@id` cannot be claimed twice.
 
 **`--paste` for a prompt.** Anything with a text box — an agent, an editor —
 treats every newline as a submit, so a three-line prompt without `--paste`
