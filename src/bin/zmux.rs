@@ -1,20 +1,22 @@
 //! zmux - the client. Draws frames and forwards keystrokes. Owns no state,
 //! so detaching loses nothing. DESIGN.md §3.
 
+use std::collections::VecDeque;
 use std::io::{stdout, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::{execute, terminal};
 use interprocess::TryClone as _;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use zmux::input::Token;
 use zmux::ipc;
+use zmux::keys::{Key, Stroke};
 use zmux::protocol::{
     Cmd, ClientMsg, Frame, PaneState, Query, Report, ServerMsg, Source, Target, Until, WaitOutcome,
-    PROTOCOL_VERSION,
+    MAX_INPUT_BYTES, MAX_PASTE_BYTES, PROTOCOL_VERSION,
 };
 use zmux::render::{paint, paint_cursor, paint_overlay};
 
@@ -29,24 +31,42 @@ use zmux::render::{paint, paint_cursor, paint_overlay};
 const CLEAR_HOST_MOUSE: &[u8] =
     b"\x1b[?1006l\x1b[?1016l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l";
 
+/// What asks the host to report the mouse: presses, drags, all motion, in
+/// SGR encoding. herdr's list for Windows (`terminal_modes.rs:7`).
+const CAPTURE_HOST_MOUSE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+
+/// Ask the host to bracket pastes, and stop asking.
+const HOST_PASTE_ON: &[u8] = b"\x1b[?2004h";
+const HOST_PASTE_OFF: &[u8] = b"\x1b[?2004l";
+
 /// Hand the mouse to zmux, or give it back to the terminal.
 ///
 /// Only one of them can have it: while these modes are set the terminal
 /// forwards clicks and drags to us instead of acting on them itself, which is
 /// why selecting text does nothing until they are cleared.
+///
+/// Two audiences. The host terminal is told with VT, and reports in SGR,
+/// which `input.rs` decodes. conhost is told with its console mode, and may
+/// deliver records instead, which `console.rs` translates. This used to be
+/// crossterm's `EnableMouseCapture`, which on Windows REPLACES the console
+/// mode outright - it would have switched VT input, and with it pastes, off.
 fn set_mouse_capture(on: bool) -> Result<()> {
     let mut out = stdout();
+    // Clear first either way: whatever the last program in this window left
+    // behind is not our state.
+    out.write_all(CLEAR_HOST_MOUSE)?;
     if on {
-        execute!(out, crossterm::event::EnableMouseCapture)?;
-    } else {
-        out.write_all(CLEAR_HOST_MOUSE)?;
-        out.flush()?;
+        out.write_all(CAPTURE_HOST_MOUSE)?;
     }
-    Ok(())
+    out.flush()?;
+    zmux::console::set_mouse_input(on)
 }
 
 /// Restores terminal state even on panic or early return.
-struct TermGuard;
+struct TermGuard {
+    /// Dropped in `drop`, before raw mode is disabled - see `VtInput`.
+    vt: Option<zmux::console::VtInput>,
+}
 
 impl TermGuard {
     fn enter(mouse: bool) -> Result<Self> {
@@ -56,21 +76,25 @@ impl TermGuard {
         // (render_ansi.rs:986, terminal_setup.rs:114). DESIGN.md §0.4.
         execute!(stdout(), terminal::EnterAlternateScreen, terminal::DisableLineWrap,
                  crossterm::cursor::Hide)?;
-        // Clear before setting, even when we are about to capture: whatever
-        // the last program in this window left behind is not our state.
-        set_mouse_capture(false)?;
-        if mouse {
-            set_mouse_capture(true)?;
-        }
-        Ok(Self)
+        // Built before anything else below can fail, so those error paths
+        // restore the console too.
+        let mut guard = Self { vt: None };
+        // The console mode zmux reads keys in. Without it there is no way
+        // to see a paste at all - see console.rs.
+        guard.vt = Some(zmux::console::VtInput::enable()?);
+        stdout().write_all(HOST_PASTE_ON)?;
+        set_mouse_capture(mouse)?;
+        Ok(guard)
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = set_mouse_capture(false);
+        let _ = stdout().write_all(HOST_PASTE_OFF);
         let _ = execute!(stdout(), crossterm::cursor::Show, terminal::EnableLineWrap,
                          terminal::LeaveAlternateScreen);
+        self.vt = None;
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -792,6 +816,99 @@ fn check_report_channel(session: &str, target: Target) -> Result<()> {
     Ok(())
 }
 
+/// How long a lone ESC waits to become the start of a sequence before it is
+/// taken as the Escape key. A host sends a sequence in one write, so the rest
+/// of one arrives in well under this; a person pressing Escape then `[` does
+/// not.
+const ESC_WAIT: Duration = Duration::from_millis(30);
+
+enum HostEvent {
+    Token(Token),
+    Resize,
+}
+
+/// The host's input, decoded - with the one thing a byte stream cannot say
+/// by itself, which is when a lone ESC is finished.
+struct HostKeys {
+    reader: zmux::console::Reader,
+    decoder: zmux::input::Decoder,
+    ready: VecDeque<HostEvent>,
+}
+
+impl HostKeys {
+    fn open() -> Result<Self> {
+        Ok(Self {
+            reader: zmux::console::Reader::spawn()?,
+            decoder: Default::default(),
+            ready: VecDeque::new(),
+        })
+    }
+
+    /// The next event, waiting up to `wait` for one. `Ok(None)` on timeout.
+    fn next(&mut self, wait: Duration) -> Result<Option<HostEvent>> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(ev) = self.ready.pop_front() {
+                return Ok(Some(ev));
+            }
+            // Half a sequence waits ESC_WAIT for the rest. A paste waits for
+            // its end marker however long that takes.
+            let escape_pending = self.decoder.pending() && !self.decoder.waiting_for_paste();
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.reader.rx.recv_timeout(if escape_pending { ESC_WAIT } else { left }) {
+                Ok(input) => self.take(input),
+                Err(RecvTimeoutError::Timeout) if escape_pending => {
+                    let flushed = self.decoder.flush();
+                    self.ready.extend(flushed.into_iter().map(HostEvent::Token));
+                }
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Disconnected) => bail!("the console stopped delivering input"),
+            }
+        }
+    }
+
+    /// The next keystroke if one has ALREADY arrived and is not the prefix.
+    /// Lets a burst of typing go to the daemon as one message, not one per
+    /// key, without waiting for anything.
+    fn next_typed_now(&mut self, prefix: u8) -> Option<Vec<u8>> {
+        while let Ok(input) = self.reader.rx.try_recv() {
+            self.take(input);
+        }
+        match self.ready.front() {
+            Some(HostEvent::Token(Token::Key(k))) if k.as_slice() != [prefix] => {
+                let Some(HostEvent::Token(Token::Key(k))) = self.ready.pop_front() else {
+                    unreachable!()
+                };
+                Some(k)
+            }
+            _ => None,
+        }
+    }
+
+    fn take(&mut self, input: zmux::console::HostInput) {
+        use zmux::console::HostInput;
+        match input {
+            HostInput::Bytes(b) => {
+                let tokens = self.decoder.push(&b);
+                self.ready.extend(tokens.into_iter().map(HostEvent::Token));
+            }
+            HostInput::Mouse(m) => self.ready.push_back(HostEvent::Token(Token::Mouse(m))),
+            HostInput::Resize => self.ready.push_back(HostEvent::Resize),
+        }
+    }
+
+    /// Put an event back, to be the next one read.
+    fn unread(&mut self, ev: HostEvent) {
+        self.ready.push_front(ev);
+    }
+}
+
+fn send_resize(stream: &mut interprocess::local_socket::Stream) -> Result<()> {
+    let (cols, rows) = terminal::size()?;
+    ipc::write_msg(stream, &ClientMsg::Resize { cols, rows })
+}
+
 fn attach(session: String) -> Result<()> {
     let cfg = zmux::config::Config::load();
 
@@ -833,6 +950,7 @@ fn attach(session: String) -> Result<()> {
     // starts off and turns itself on with the first frame that wants it.
     let mut capturing = mouse.captures(false);
     let _guard = TermGuard::enter(capturing)?;
+    let mut keys = HostKeys::open()?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     // Frames arrive on their own thread; the main loop owns input and drawing.
@@ -858,24 +976,22 @@ fn attach(session: String) -> Result<()> {
     let mut help = false;
     loop {
         // Input. Ctrl-b is the prefix, as in tmux.
-        if event::poll(Duration::from_millis(8))? {
-            match event::read()? {
-                // Drop releases FIRST. Windows reports press and release, and
-                // prefix handling used to run before the encoder's release
-                // filter - so the Ctrl-b RELEASE was read as a doubled prefix
-                // and sent a literal Ctrl-b to the pane.
-                Event::Key(k) if matches!(k.kind, event::KeyEventKind::Release) => {}
-                // Any key closes the shortcut list, and is SWALLOWED closing
-                // it - otherwise whatever you pressed to get rid of it turns
-                // up in your shell.
-                Event::Key(_) if help => help = false,
-                Event::Key(k) if is_prefix(&k, &cfg) => match read_prefix_command(&cfg)? {
+        match keys.next(Duration::from_millis(8))? {
+            None => {}
+            Some(HostEvent::Resize) => send_resize(&mut stream)?,
+            // Any key closes the shortcut list, and is SWALLOWED closing
+            // it - otherwise whatever you pressed to get rid of it turns
+            // up in your shell. A paste closes it too, and is swallowed with
+            // it: it was meant for a pane you could not see.
+            Some(HostEvent::Token(Token::Key(_) | Token::Paste(_))) if help => help = false,
+            Some(HostEvent::Token(Token::Key(k))) if k.as_slice() == [cfg.prefix_byte()] => {
+                match read_prefix_command(&mut keys, &cfg)? {
                     Prefix::Detach => {
                         ipc::write_msg(&mut stream, &ClientMsg::Detach)?;
                         break;
                     }
                     Prefix::Scroll => {
-                        if !scroll_mode(&mut stream, capturing)? {
+                        if !scroll_mode(&mut stream, &mut keys, capturing)? {
                             drop(_guard);
                             eprintln!("lost connection to the daemon");
                             return Ok(());
@@ -895,26 +1011,38 @@ fn attach(session: String) -> Result<()> {
                             &ClientMsg::Input { data: vec![cfg.prefix_byte()] })?;
                     }
                     Prefix::Ignore => {}
-                },
-                Event::Key(k) => {
-                    let app_cursor = latest.as_ref().is_some_and(|f| f.app_cursor);
-                    if let Some(bytes) = zmux::keys::encode(k, app_cursor) {
-                        ipc::write_msg(&mut stream, &ClientMsg::Input { data: bytes })?;
-                    }
                 }
-                // Every mouse event goes to the daemon as it happened. Only
-                // the daemon knows which pane the pointer is over and what
-                // the program there asked for, so it - not the client -
-                // decides between feeding that program and focusing a pane.
-                Event::Mouse(m) => {
-                    if let Some(ev) = mouse_event(m) {
-                        ipc::write_msg(&mut stream, &ClientMsg::Mouse(ev))?;
-                    }
+            }
+            // Typing goes as it arrived: the host already encoded it. Whatever
+            // else has already arrived goes in the same message - a host that
+            // does not bracket pastes delivers one as a burst of keystrokes,
+            // and one message per key is what made that stream in letter by
+            // letter. Bounded, because the daemon refuses an oversized Input
+            // by dropping the connection.
+            Some(HostEvent::Token(Token::Key(k))) => {
+                let app_cursor = latest.as_ref().is_some_and(|f| f.app_cursor);
+                let mut data = zmux::keys::for_pane(&k, app_cursor).into_owned();
+                while data.len() < MAX_INPUT_BYTES / 2 {
+                    let Some(more) = keys.next_typed_now(cfg.prefix_byte()) else { break };
+                    data.extend_from_slice(&zmux::keys::for_pane(&more, app_cursor));
                 }
-                Event::Resize(c, r) => {
-                    ipc::write_msg(&mut stream, &ClientMsg::Resize { cols: c, rows: r })?;
+                ipc::write_msg(&mut stream, &ClientMsg::Input { data })?;
+            }
+            // One block, and the daemon decides whether to bracket it - only
+            // it knows whether the pane's program asked for pastes. Too big
+            // for one message is too big to paste as one block at all, so it
+            // is dropped whole rather than delivered as several.
+            Some(HostEvent::Token(Token::Paste(data))) => {
+                if data.len() <= MAX_PASTE_BYTES {
+                    ipc::write_msg(&mut stream, &ClientMsg::Paste { data })?;
                 }
-                _ => {}
+            }
+            // Every mouse event goes to the daemon as it happened. Only
+            // the daemon knows which pane the pointer is over and what
+            // the program there asked for, so it - not the client -
+            // decides between feeding that program and focusing a pane.
+            Some(HostEvent::Token(Token::Mouse(m))) => {
+                ipc::write_msg(&mut stream, &ClientMsg::Mouse(m))?;
             }
         }
 
@@ -997,41 +1125,6 @@ fn attach(session: String) -> Result<()> {
     Ok(())
 }
 
-fn is_prefix(k: &KeyEvent, cfg: &zmux::config::Config) -> bool {
-    k.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(k.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&cfg.prefix))
-}
-
-/// Turn a crossterm mouse event into the wire form.
-///
-/// `None` for the ones nothing downstream can use - horizontal scrolling has
-/// no xterm button number, so there is nothing to forward and nothing zmux
-/// does with it either.
-fn mouse_event(m: event::MouseEvent) -> Option<zmux::protocol::MouseIn> {
-    use zmux::protocol::{MouseKind, MOUSE_ALT, MOUSE_CTRL, MOUSE_SHIFT};
-    // xterm's numbering, which is what these end up as on the way to a
-    // program: left 0, middle 1, right 2.
-    let button = |b| match b {
-        event::MouseButton::Left => 0,
-        event::MouseButton::Middle => 1,
-        event::MouseButton::Right => 2,
-    };
-    let kind = match m.kind {
-        event::MouseEventKind::Down(b) => MouseKind::Press(button(b)),
-        event::MouseEventKind::Up(b) => MouseKind::Release(button(b)),
-        event::MouseEventKind::Drag(b) => MouseKind::Drag(button(b)),
-        event::MouseEventKind::Moved => MouseKind::Move,
-        event::MouseEventKind::ScrollUp => MouseKind::WheelUp,
-        event::MouseEventKind::ScrollDown => MouseKind::WheelDown,
-        event::MouseEventKind::ScrollLeft | event::MouseEventKind::ScrollRight => return None,
-    };
-    let mut mods = 0;
-    if m.modifiers.contains(KeyModifiers::SHIFT) { mods |= MOUSE_SHIFT }
-    if m.modifiers.contains(KeyModifiers::ALT) { mods |= MOUSE_ALT }
-    if m.modifiers.contains(KeyModifiers::CONTROL) { mods |= MOUSE_CTRL }
-    Some(zmux::protocol::MouseIn { x: m.column, y: m.row, kind, mods })
-}
-
 enum Prefix {
     Detach,
     Command(Cmd),
@@ -1048,43 +1141,45 @@ enum Prefix {
 /// Read the key following the prefix and map it to an action.
 ///
 /// Bindings follow tmux so muscle memory transfers.
-fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
+fn read_prefix_command(keys: &mut HostKeys, cfg: &zmux::config::Config) -> Result<Prefix> {
     // Bounded wait: a prefix followed by nothing must not wedge the client.
-    if !event::poll(Duration::from_millis(2000))? {
-        return Ok(Prefix::Ignore);
+    let k = match keys.next(Duration::from_millis(2000))? {
+        Some(HostEvent::Token(Token::Key(k))) => k,
+        // Not a key. It still happened - a resize must still reach the
+        // daemon - so it goes back to be handled as if no prefix came first.
+        Some(other) => {
+            keys.unread(other);
+            return Ok(Prefix::Ignore);
+        }
+        None => return Ok(Prefix::Ignore),
+    };
+    if k.as_slice() == [cfg.prefix_byte()] {
+        return Ok(Prefix::Literal);
     }
-    let Event::Key(k) = event::read()? else { return Ok(Prefix::Ignore) };
-    if matches!(k.kind, event::KeyEventKind::Release) {
-        // The release of the prefix key itself; wait for a real press.
-        return read_prefix_command(cfg);
-    }
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    Ok(match k.code {
-        KeyCode::Char('d') => Prefix::Detach,
-        KeyCode::Char(c) if ctrl && c.eq_ignore_ascii_case(&cfg.prefix) => Prefix::Literal,
-        KeyCode::Char('%') => Prefix::Command(Cmd::SplitHorizontal),
-        KeyCode::Char('"') => Prefix::Command(Cmd::SplitVertical),
-        KeyCode::Char('x') => Prefix::Command(Cmd::ClosePane),
-        KeyCode::Char('c') => Prefix::Command(Cmd::NewWindow),
-        KeyCode::Char('n') => Prefix::Command(Cmd::NextWindow),
-        KeyCode::Char('p') => Prefix::Command(Cmd::PrevWindow),
+    let Stroke { key, ctrl } = zmux::keys::decode(&k);
+    Ok(match key {
+        Key::Char('d') => Prefix::Detach,
+        Key::Char('%') => Prefix::Command(Cmd::SplitHorizontal),
+        Key::Char('"') => Prefix::Command(Cmd::SplitVertical),
+        Key::Char('x') => Prefix::Command(Cmd::ClosePane),
+        Key::Char('c') => Prefix::Command(Cmd::NewWindow),
+        Key::Char('n') => Prefix::Command(Cmd::NextWindow),
+        Key::Char('p') => Prefix::Command(Cmd::PrevWindow),
         // Digits jump to a window by the index the status bar shows. Only one
         // digit, as in tmux: beyond nine windows, `C-b n` is the way.
-        KeyCode::Char(c @ '0'..='9') => {
-            Prefix::Command(Cmd::SelectWindow(c as u8 - b'0'))
-        }
-        KeyCode::Char('[') => Prefix::Scroll,
-        KeyCode::Char('m') => Prefix::MouseToggle,
-        KeyCode::Char('?') => Prefix::Help,
-        KeyCode::PageUp => Prefix::Command(Cmd::ScrollPageUp),
-        KeyCode::Left if ctrl => Prefix::Command(Cmd::ResizeLeft),
-        KeyCode::Right if ctrl => Prefix::Command(Cmd::ResizeRight),
-        KeyCode::Up if ctrl => Prefix::Command(Cmd::ResizeUp),
-        KeyCode::Down if ctrl => Prefix::Command(Cmd::ResizeDown),
-        KeyCode::Left => Prefix::Command(Cmd::FocusLeft),
-        KeyCode::Right => Prefix::Command(Cmd::FocusRight),
-        KeyCode::Up => Prefix::Command(Cmd::FocusUp),
-        KeyCode::Down => Prefix::Command(Cmd::FocusDown),
+        Key::Char(c @ '0'..='9') => Prefix::Command(Cmd::SelectWindow(c as u8 - b'0')),
+        Key::Char('[') => Prefix::Scroll,
+        Key::Char('m') => Prefix::MouseToggle,
+        Key::Char('?') => Prefix::Help,
+        Key::PageUp => Prefix::Command(Cmd::ScrollPageUp),
+        Key::Left if ctrl => Prefix::Command(Cmd::ResizeLeft),
+        Key::Right if ctrl => Prefix::Command(Cmd::ResizeRight),
+        Key::Up if ctrl => Prefix::Command(Cmd::ResizeUp),
+        Key::Down if ctrl => Prefix::Command(Cmd::ResizeDown),
+        Key::Left => Prefix::Command(Cmd::FocusLeft),
+        Key::Right => Prefix::Command(Cmd::FocusRight),
+        Key::Up => Prefix::Command(Cmd::FocusUp),
+        Key::Down => Prefix::Command(Cmd::FocusDown),
         _ => Prefix::Ignore,
     })
 }
@@ -1098,56 +1193,53 @@ fn read_prefix_command(cfg: &zmux::config::Config) -> Result<Prefix> {
 /// Returns false if the connection died while we were in scroll mode - the
 /// main loop watches the frame channel, but this one has its own input loop
 /// and would otherwise spin forever in raw alternate-screen mode.
-fn scroll_mode(stream: &mut interprocess::local_socket::Stream, had_mouse: bool) -> Result<bool> {
+fn scroll_mode(
+    stream: &mut interprocess::local_socket::Stream,
+    keys: &mut HostKeys,
+    had_mouse: bool,
+) -> Result<bool> {
     // Scroll mode is zmux's own, so zmux takes the mouse for the duration
     // whatever `mouse` says: a wheel is the obvious way to move through
     // history, and under `auto` there is no program asking for it here.
     if !had_mouse {
         set_mouse_capture(true)?;
     }
-    let out = scroll_keys(stream);
+    let out = scroll_keys(stream, keys);
     if !had_mouse {
         set_mouse_capture(false)?;
     }
     out
 }
 
-fn scroll_keys(stream: &mut interprocess::local_socket::Stream) -> Result<bool> {
+fn scroll_keys(stream: &mut interprocess::local_socket::Stream, keys: &mut HostKeys) -> Result<bool> {
+    use zmux::protocol::MouseKind;
+    let bottom = |stream: &mut interprocess::local_socket::Stream| {
+        ipc::write_msg(stream, &ClientMsg::Command(Cmd::ScrollToBottom)).is_ok()
+    };
     loop {
-        if !event::poll(Duration::from_millis(200))? {
-            continue;
-        }
-        let cmd = match event::read()? {
-            // Releases would scroll twice per keypress.
-            Event::Key(k) if matches!(k.kind, event::KeyEventKind::Release) => continue,
-            Event::Key(k) => match k.code {
-                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
-                    return Ok(ipc::write_msg(stream,
-                        &ClientMsg::Command(Cmd::ScrollToBottom)).is_ok());
-                }
-                KeyCode::Up | KeyCode::Char('k') => Cmd::ScrollUp,
-                KeyCode::Down | KeyCode::Char('j') => Cmd::ScrollDown,
-                KeyCode::PageUp | KeyCode::Char(' ') => Cmd::ScrollPageUp,
-                KeyCode::PageDown => Cmd::ScrollPageDown,
-                KeyCode::Home => Cmd::ScrollPageUp,
-                KeyCode::End => {
-                    return Ok(ipc::write_msg(stream,
-                        &ClientMsg::Command(Cmd::ScrollToBottom)).is_ok());
-                }
+        let cmd = match keys.next(Duration::from_millis(200))? {
+            None => continue,
+            Some(HostEvent::Token(Token::Key(k))) => match zmux::keys::decode(&k).key {
+                Key::Char('q') | Key::Esc | Key::Enter | Key::End => return Ok(bottom(stream)),
+                Key::Up | Key::Char('k') => Cmd::ScrollUp,
+                Key::Down | Key::Char('j') => Cmd::ScrollDown,
+                Key::PageUp | Key::Char(' ') | Key::Home => Cmd::ScrollPageUp,
+                Key::PageDown => Cmd::ScrollPageDown,
                 _ => continue,
             },
-            Event::Mouse(m) => match m.kind {
-                event::MouseEventKind::ScrollUp => Cmd::ScrollUp,
-                event::MouseEventKind::ScrollDown => Cmd::ScrollDown,
+            Some(HostEvent::Token(Token::Mouse(m))) => match m.kind {
+                MouseKind::WheelUp => Cmd::ScrollUp,
+                MouseKind::WheelDown => Cmd::ScrollDown,
                 _ => continue,
             },
-            Event::Resize(c, r) => {
-                if ipc::write_msg(stream, &ClientMsg::Resize { cols: c, rows: r }).is_err() {
+            // Nowhere to put a paste while reading history.
+            Some(HostEvent::Token(Token::Paste(_))) => continue,
+            Some(HostEvent::Resize) => {
+                if send_resize(stream).is_err() {
                     return Ok(false);
                 }
                 continue;
             }
-            _ => continue,
         };
         // A failed write is how we notice the daemon has gone.
         if ipc::write_msg(stream, &ClientMsg::Command(cmd)).is_err() {

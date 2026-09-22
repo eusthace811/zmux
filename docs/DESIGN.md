@@ -100,6 +100,9 @@ We set it via `SetConsoleMode`, as herdr does at `client/terminal_setup.rs:259`.
 
 Windows Terminal stays supported, tested second.
 
+> **This was planned and then not done**, and it cost the paste. The client
+> shipped reading keys through crossterm with the bit never set, so a paste
+> reached every pane as keystrokes. §13 is the correction.
 
 ### 0.2 No WMI. ✅ PASS here — ⚠️ must be re-confirmed on the work laptop
 
@@ -1264,3 +1267,87 @@ is a plain `Option` and shows as `null` in JSON for that reason.
 - **No event subscription stream.** `Wait` covers the agent case.
 - **No regex matching**, **no remote**, **no automatic editing of anyone's
   agent configuration**, and **no pane creation inside a background window**.
+
+---
+
+## 13. Reading the console: VT input, not key records
+
+### The bug
+
+Pasting into a pane ran the text in letter by letter. An agent that shows
+`[Pasted N lines]` when run directly in the terminal showed the whole text
+streaming into its prompt, with each newline a potential submit.
+
+Two causes, stacked. The client read its keyboard through crossterm, which on
+Windows reads the console as **key records** (`ReadConsoleInputW`). A key
+record has no way to say "this was pasted", so crossterm never produces
+`Event::Paste` on Windows, whatever it is asked to enable. And every
+keystroke then went to the daemon as its own `Input` message, which became
+its own pty write and its own redraw: the streaming you could watch.
+
+The daemon already knew how to paste. `InputAt { paste: true }` wraps text in
+`ESC[200~ … ESC[201~` when, and only when, the pane's program asked for it
+(§12, Trust). Nothing on the attached path could reach it.
+
+### The fix, which is herdr's
+
+herdr met this first and solved it by not asking crossterm
+(`client/terminal_setup.rs`, `client/input/windows_vti.rs`, `raw_input.rs`):
+
+1. **`ENABLE_VIRTUAL_TERMINAL_INPUT` on the client's console.** The key
+   records now carry the characters a terminal would have sent - escape
+   sequences included - and the client reads them as a byte stream
+   (`console.rs`). The bit is read back after setting: herdr found it can be
+   accepted and not stick.
+2. **`ESC[?2004h` to the host.** mintty and Windows Terminal then bracket a
+   paste. ConPTY passes the request out and the markers back in;
+   `tests/host_input.rs` proves both through a real ConPTY, which is what
+   both terminals put in front of a native program.
+3. **A decoder** (`input.rs`) cuts the stream into keystrokes, pastes and SGR
+   mouse reports.
+4. **`ClientMsg::Paste`** carries a paste to the daemon, which applies the
+   same rule as `InputAt`: bracketed for a program that asked, typed for one
+   that did not.
+
+What zmux took from herdr is a small part of it. herdr's Windows input
+layer is ~4,000 lines, most of it win32-input-mode (`?9001h`) framing, which
+recovers key distinctions VT loses (Ctrl+Enter, key releases). zmux never
+used those, so it does not enable that mode and carries none of the
+framing.
+
+### Consequences worth knowing
+
+- **Keys are forwarded as the host encoded them.** There is no longer an
+  encoder from key events to xterm bytes: the terminal already did it. One
+  exception: application cursor mode (DECCKM) belongs to the pane's program,
+  which the host never heard from, so `keys::for_pane` swaps `CSI A` for
+  `SS3 A` on the unmodified arrows and Home/End.
+- **A lone ESC is decided by a timeout** (30 ms, `ESC_WAIT`). It is the
+  Escape key, or the first byte of a sequence whose rest has not arrived. A
+  host writes a whole sequence at once, so the wait is never felt.
+- **An unfinished paste is never timed out.** It ends at its end marker.
+  Timing it out like an ESC would split a slow paste in two and type the
+  second half with no start marker. It is bounded by size instead
+  (`MAX_PENDING_PASTE`), so a start marker whose end never comes cannot
+  swallow the keyboard.
+- **Typing is batched.** Every keystroke already received goes in one
+  `Input`, capped well under `MAX_INPUT_BYTES`. A host that does not bracket
+  pastes still delivers one as typing, but no longer as one message per
+  character.
+- **The mouse is asked for with VT** (`?1000h ?1002h ?1003h ?1006h`), as herdr
+  does on Windows, and arrives as SGR reports. conhost may still translate it
+  to mouse records instead, so `console.rs` handles those too. crossterm's
+  `EnableMouseCapture` must not come back: on Windows it *replaces* the
+  console mode, which switches VT input, and with it pastes, back off.
+- **A paste has its own cap**, `MAX_PASTE_BYTES` (1 MiB), because it cannot be
+  split the way typing is: two bracketed pastes are two blocks to whatever
+  receives them. Over the cap it is dropped whole. A refused paste costs only
+  the paste. A refused `Input` still ends the connection, as before.
+
+### Wire
+
+v9: `ClientMsg::Paste` is an appended variant. Appended variants are free in
+one direction only. A new daemon reads an old client fine, but an old daemon
+cannot decode a new client's paste and drops the connection mid-session,
+on the first paste. The version moves so the handshake refuses the pair
+first.

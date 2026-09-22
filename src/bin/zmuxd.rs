@@ -701,6 +701,15 @@ fn serve(session: Arc<Session>, mut stream: interprocess::local_socket::Stream) 
                             return Ok(());
                         }
                     }
+                    // Unlike `Input`, a refused paste costs only the paste.
+                    // It is one oversized block the user chose to paste, not
+                    // a peer misbehaving, and throwing them out of the session
+                    // for it would lose far more than the paste.
+                    ClientMsg::Paste { data } => {
+                        if let Err(e) = session.paste_focused(&data) {
+                            eprintln!("[zmuxd] dropping a paste from client {id}: {e}");
+                        }
+                    }
                     // Commands publish to EVERY client rather than writing a
                     // frame to this one stream. Two reasons: a split or a
                     // focus change is session state that other attached

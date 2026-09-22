@@ -19,7 +19,7 @@ use crate::layout::{Dir, Layout, Nav, PaneId, Rect};
 use crate::windows::{Closed, Windows};
 use crate::protocol::{
     clamp_size, Frame, MouseIn, MouseKind, PaneInfo, PaneState, ServerMsg, SessionInfo, Source,
-    Target, MAX_INPUT_BYTES, MAX_PANES, RECENT_LINES_DEFAULT,
+    Target, MAX_INPUT_BYTES, MAX_PANES, MAX_PASTE_BYTES, RECENT_LINES_DEFAULT,
 };
 
 use crate::pty::{Pane, PtyEvent};
@@ -492,6 +492,34 @@ impl Session {
         if data.len() > MAX_INPUT_BYTES {
             bail!("input of {} bytes exceeds MAX_INPUT_BYTES", data.len());
         }
+        self.write_wrapped(id, data, paste, enter, MAX_INPUT_BYTES)
+    }
+
+    /// Paste into the focused pane, from an attached terminal.
+    ///
+    /// Bracketed only if the pane's program asked, exactly as `write_to`
+    /// decides it. Bounded by `MAX_PASTE_BYTES` rather than `MAX_INPUT_BYTES`:
+    /// the client cannot split a paste the way it splits typing, because two
+    /// bracketed pastes are two blocks to whatever receives them. Snaps the
+    /// pane back to live output, as typing does.
+    pub fn paste_focused(&self, data: &[u8]) -> Result<bool> {
+        if data.len() > MAX_PASTE_BYTES {
+            bail!("paste of {} bytes exceeds MAX_PASTE_BYTES", data.len());
+        }
+        self.follow_focused();
+        // Room for the two markers: a paste AT the limit must still go in.
+        self.write_wrapped(self.focus(), data, true, false, MAX_PASTE_BYTES + 16)
+    }
+
+    /// `limit` bounds the payload once wrapped, which is what reaches the pty.
+    fn write_wrapped(
+        &self,
+        id: PaneId,
+        data: &[u8],
+        paste: bool,
+        enter: bool,
+        limit: usize,
+    ) -> Result<bool> {
         let (pty, bracketed) = {
             let panes = lock(&self.panes);
             match panes.get(&id) {
@@ -503,8 +531,8 @@ impl Session {
             }
         };
         let payload = crate::paste::wrap(data, paste && bracketed, enter);
-        if payload.len() > MAX_INPUT_BYTES {
-            bail!("input of {} bytes exceeds MAX_INPUT_BYTES once wrapped", payload.len());
+        if payload.len() > limit {
+            bail!("input of {} bytes exceeds its limit of {limit} once wrapped", payload.len());
         }
         // Lock released before writing: a blocked write must not stall the
         // whole session.

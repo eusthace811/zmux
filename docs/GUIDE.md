@@ -166,6 +166,24 @@ Useful in a prompt, in a script that should behave differently under zmux,
 or for a coding agent working out where it is. `ZMUX` is unset in an
 ordinary Git Bash window.
 
+### Pasting
+
+Paste as you normally would (right-click in mintty, `Ctrl+V` or right-click in
+Windows Terminal). The pane receives it the way it would outside zmux:
+
+- A program that asked for **bracketed paste** gets the text as one block.
+  An agent's prompt box shows `[Pasted N lines]`, and none of the newlines
+  in the text submits anything. Most shells, editors and agents ask.
+- A program that did not ask gets the text typed, exactly as a terminal would
+  type it. In a plain shell, each line runs as you paste it.
+
+zmux decides this per pane, from what the program in *that* pane asked
+for. The focused pane gets the paste, and it snaps back to live output if you
+were scrolled up.
+
+A paste over 1 MiB is dropped rather than split: split into pieces, it would
+reach an agent as several separate pastes.
+
 ---
 
 ## Reading the status bar
@@ -514,6 +532,17 @@ read — from Git Bash, `zmuxd.exe <session> 2> zmux.log` — and look for
 Closing some terminal windows is the cure. There is nothing zmux can do
 about the ceiling itself: it is shared with everything else running.
 
-**Arrow keys or function keys misbehaving in an app** — worth reporting; keys
-are encoded xterm-style, including application cursor mode, and anything that
-still goes wrong is a bug rather than a limitation.
+**Arrow keys or function keys misbehaving in an app** — worth reporting. Keys
+reach the pane exactly as your terminal encodes them, except the arrows and
+Home/End, which zmux rewrites for a program in application cursor mode.
+Anything that still goes wrong is a bug rather than a limitation.
+
+**A paste arrives letter by letter, or an agent submits the first line of
+it** — the program in that pane did not ask for bracketed paste, so it was
+typed at, as any terminal would. If the program *does* ask outside zmux,
+this is a bug: check you are running a matching client and daemon (`zmux
+kill <session>` after upgrading).
+
+**"this console does not support VT input"** — the client reads the keyboard
+in VT input mode, which needs Windows 10 1809 or later. mintty (Git Bash) and
+Windows Terminal both provide it; a very old `conhost` does not.

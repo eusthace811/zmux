@@ -3,9 +3,12 @@
 //! Windows only by design (DESIGN.md §3): no `cfg(unix)` branches anywhere.
 
 pub mod config;
+#[cfg(windows)]
+pub mod console;
 pub mod cwd;
 pub mod harden;
 pub mod help;
+pub mod input;
 pub mod ipc;
 pub mod keys;
 pub mod layout;

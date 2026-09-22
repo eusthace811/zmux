@@ -5,8 +5,8 @@ Panes run Git Bash. Built to run on a locked-down corporate laptop.
 
 ## Status
 
-Phases 0–6 complete, plus agent coordination (DESIGN §12). 264 tests
-passing, clippy clean.
+Phases 0–6 complete, plus agent coordination (DESIGN §12) and VT console
+input (DESIGN §13). 288 tests passing, clippy clean.
 
 | | |
 | --- | --- |
@@ -17,7 +17,8 @@ passing, clippy clean.
 | cwd tracking | OSC 7; new panes inherit the focused pane's directory |
 | Multi-client | several clients on one session, sized to the smallest |
 | Config | `%APPDATA%\zmux\config.toml`, all optional |
-| Keys | xterm encoding: Alt, F1–F12, modified navigation, application cursor mode |
+| Keys | read as the terminal encodes them (VT input), with application cursor mode honoured per pane |
+| Paste | a paste reaches the pane as one bracketed block when its program asked for one - `[Pasted N lines]` in an agent's prompt, not a keystroke per character |
 | Activity | the bar names each window after what is running in it, and marks panes that are busy |
 | Wire | row deltas, not a full grid per frame |
 
@@ -95,14 +96,16 @@ synonym for finished. DESIGN §12 has the argument, and
 | `src/layout.rs` | BSP tiling tree. |
 | `src/help.rs` | The shortcut list. `--help` and `C-b ?` are both generated from it. |
 | `src/mouse.rs` | One mouse event → the bytes the program in that pane asked for. |
-| `src/paste.rs` | Submitting a prompt as one block, and why an end marker in it cannot break out. |
+| `src/paste.rs` | Wrapping text as one bracketed paste - for `--paste` and for a paste from the terminal - and why an end marker in it cannot break out. |
 | `src/windows.rs` | Several layouts per session. A window **is** a `Layout`. |
 | `src/render.rs` | vt100 cells → composited `Frame` → ratatui `Buffer`. |
 | `src/session.rs` | Owns panes, layout and clients. Outlives any connection. |
 | `src/persist.rs` | Layout + cwd to `%APPDATA%`. |
 | `src/cwd.rs` | OSC 7 parsing and the bash integration snippet, which also reports what is running. |
 | `src/config.rs` | `config.toml`. |
-| `src/keys.rs` | Key events → xterm byte sequences, including application cursor mode. |
+| `src/console.rs` | The client's console in VT input mode, read on its own thread. Why crossterm could never see a paste. |
+| `src/input.rs` | The host's bytes cut into keystrokes, pastes and SGR mouse reports. |
+| `src/keys.rs` | The few keys zmux acts on itself (prefix commands, scroll mode), and the application-cursor rewrite. |
 | `src/harden.rs` | `SetDefaultDllDirectories`, before anything can `LoadLibrary`; and the job-object check behind the daemon-survival warning. |
 
 Everything outside `src/`:
@@ -252,6 +255,12 @@ sustained output, attach/detach churn, many splits, and malformed input.
   counting every other program's. The limit zmux enforces is its own; the
   one that actually binds is shared, and zmux can only report it.
 - **Queues are bounded by message count, not bytes.**
+- **A paste over 1 MiB (`MAX_PASTE_BYTES`) is dropped whole**, not delivered
+  in pieces - several bracketed pastes would reach an agent as several blocks.
+  The client drops it before sending, and nothing on screen says so.
+- **The client needs a console that accepts VT input** (Windows 10 1809 or
+  later, which mintty and Windows Terminal both provide). On one that refuses
+  `ENABLE_VIRTUAL_TERMINAL_INPUT` it will not attach, and says why.
 - **A client that stops reading is contained, not dropped.** Frames coalesce,
   so it costs no memory, and its wedged writer thread takes nothing else with
   it. But a blocking write on a Windows pipe never times out and the serve
@@ -285,7 +294,20 @@ sustained output, attach/detach churn, many splits, and malformed input.
   move the focus in between. `panes[].id` survives that; `focus` is only as
   fresh as when it was read.
 
-## One more thing that will bite you
+## Two more things that will bite you
+
+**The client reads its console in VT input mode, not through crossterm.** A
+Windows key record cannot say "this was pasted", so crossterm delivers a paste
+as one keystroke per character: it streamed into the pane letter by letter,
+every newline a submit, and no program ever saw a paste. `console::VtInput`
+sets `ENABLE_VIRTUAL_TERMINAL_INPUT`, the client asks the host for bracketed
+paste (`?2004h`), and `input::Decoder` finds `ESC[200~ … ESC[201~` in the
+stream. Two ways to break it quietly: calling crossterm's
+`EnableMouseCapture`, which on Windows *replaces* the console mode and turns
+VT input off; and timing out an unfinished paste the way a lone ESC is timed
+out, which splits a slow paste in two and types the second half.
+`tests/host_input.rs` runs the real client inside a ConPTY and fails for
+either. DESIGN §13.
 
 **Coalescing and deltas interact.** Frames are coalesced per client: a burst
 replaces an undelivered frame rather than queueing. A delta based on a frame

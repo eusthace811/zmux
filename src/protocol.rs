@@ -25,7 +25,11 @@ use serde::{Deserialize, Serialize};
 /// v8 is the agent-coordination surface (DESIGN.md §12). `PaneInfo` gained
 /// `window`, and `SessionInfo` gained `focus_id` - struct fields again, so
 /// again a version. `Target`, `InputAt` and `Query::CaptureAt` are appended.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9 added `ClientMsg::Paste`. Only an appended variant, which is free for a
+/// NEW daemon reading an old client and fatal the other way: an old daemon
+/// cannot decode it and drops the connection mid-session, on the first paste.
+/// The handshake has to catch that before anyone pastes.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Refuse to allocate for a frame larger than this. Checked BEFORE allocating.
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -40,9 +44,15 @@ pub const MAX_ROWS: u16 = 500;
 pub const MIN_USABLE_COLS: u16 = 8;
 pub const MIN_USABLE_ROWS: u16 = 3;
 
-/// Cap a single `Input` payload. Keystrokes and pastes are small; anything
-/// larger is a bug or an attack.
+/// Cap a single `Input` payload. Typing is small, and the client splits
+/// anything larger - a paste from a host that does not bracket pastes comes
+/// through as typing. Past this, `Input` is a bug or an attack.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// Cap one `Paste`. Separate from `MAX_INPUT_BYTES` because a paste cannot be
+/// split: two bracketed pastes are two blocks to the program receiving them.
+/// A megabyte is a very long prompt, and well inside `MAX_FRAME_BYTES`.
+pub const MAX_PASTE_BYTES: usize = 1024 * 1024;
 
 /// How far back a history read goes when the caller named no line count.
 ///
@@ -164,6 +174,14 @@ pub enum ClientMsg {
     /// the terminal - a hook run as a subprocess, or a script on another
     /// machine's behalf.
     Report { target: Target, report: Report },
+    // --- appended. Append-only. ---
+    /// Text the host terminal says was pasted, for the focused pane.
+    ///
+    /// Not `Input`, because only the daemon knows whether the program in that
+    /// pane asked for bracketed paste. It wraps the text in the markers when
+    /// the program did, and types it plainly when it did not - the same rule
+    /// as `InputAt { paste: true }`, reached from an attached terminal.
+    Paste { data: Vec<u8> },
 }
 
 /// Which pane a control command means.
